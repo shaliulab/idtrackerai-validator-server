@@ -1,4 +1,5 @@
 import os.path
+import datetime
 import time
 import logging
 import glob
@@ -40,11 +41,18 @@ cap = None
 DEFAULT_EXPERIMENT = "FlyHostel1/5X/2023-05-23_14-00-00"
 SELECTED_EXPERIMENT=DEFAULT_EXPERIMENT
 
+def filter_by_date(experiment):
+    date_time = os.path.basename(experiment)[:10]
+    print(date_time)
+    dt = datetime.datetime.strptime(date_time, "%Y-%m-%d")
+    return dt >= datetime.datetime.strptime("2023-05-23", "%Y-%m-%d")
+
 def list_experiments():
     experiments = [DEFAULT_EXPERIMENT]
     with open(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), "r") as filehandle:
         experiments = [experiment.strip() for experiment in filehandle.readlines()]
         experiments = [os.path.sep.join(experiment.split(os.path.sep)[-4:-1]) for experiment in experiments]
+        experiments = [experiment for experiment in experiments if filter_by_date(experiment)]
     return {"experiments": experiments}
 
 EXPERIMENTS=list_experiments()["experiments"]
