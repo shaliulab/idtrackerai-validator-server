@@ -1,6 +1,8 @@
 import os.path
 import time
 import logging
+import glob
+import shutil
 
 from flask import request
 from flask import Flask, jsonify, send_from_directory
@@ -10,16 +12,15 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 
 import cv2
-import numpy as np
-import pandas as pd
-import glob
-
-from database import make_templates
-
-start_time = time.time()
 
 from imgstore.interface import VideoCapture
 
+from database import make_templates
+
+FRAMES_DIR="frames"
+
+start_time = time.time()
+shutil.rmtree(FRAMES_DIR)
 app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
@@ -115,21 +116,19 @@ def get_frame(frame_number):
 
     global last_time
     global cap
-    print(frame_number)
 
     logging.debug(f"Fetching frame {frame_number}")
 
     now = time.time() - start_time
-    # if ((now - last_time) < .5):
-    #     print(f"Too quick: {now-last_time}")
-    #     return jsonify({"error": "Wait"})
 
     frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
     last_time=time.time()-start_time
     filename=f"{frame_number}.jpg"
-    print(cap._basedir)
-
-    cv2.imwrite(os.path.join("frames", filename), frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    img_path = os.path.join(FRAMES_DIR, filename)
+    os.makedirs(os.path.dirname(img_path), exist_ok=True)
+    cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    assert os.path.exists(img_path), f"Could not save {img_path}"
+    logging.debug(f"{cap._basedir} -> {img_path}")
 
     if frame is None:
         return jsonify({'error': 'Frame not found'}), 404
