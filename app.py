@@ -20,7 +20,9 @@ from database import make_templates
 FRAMES_DIR="frames"
 
 start_time = time.time()
-shutil.rmtree(FRAMES_DIR)
+
+if os.path.exists(FRAMES_DIR):
+    shutil.rmtree(FRAMES_DIR)
 app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
