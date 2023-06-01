@@ -16,8 +16,18 @@ import cv2
 
 
 from database import make_templates
-from backend import load_experiment, generate_database_filename, list_experiments, filter_by_date
-from constants import DEFAULT_EXPERIMENT, first_chunk, FRAMES_DIR, database_pattern
+from backend import (
+    load_experiment,
+    generate_database_filename,
+    list_experiments,
+)
+from constants import (
+    SELECTED_EXPERIMENT,
+    DEFAULT_EXPERIMENT,
+    first_chunk,
+    FRAMES_DIR,
+    database_pattern,
+) 
 
 
 start_time = time.time()
@@ -38,8 +48,7 @@ CORS(app, resources={
     }
 })
 
-# Load default dataset
-out, cap = load_experiment(DEFAULT_EXPERIMENT, first_chunk)
+
 basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], DEFAULT_EXPERIMENT)
 database_file = glob.glob(os.path.join(basedir, database_pattern))[0]
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{database_file}'
@@ -57,6 +66,10 @@ for experiment in EXPERIMENTS:
     db, tables = make_templates(db, experiment)
     TABLES[experiment]=tables
 
+# Load default dataset
+with app.app_context():
+    out, cap, (offset, CHUNKSIZE, FRAMERATE) = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+
 
 @app.route("/api/list", methods=["GET"])
 def list():
@@ -69,18 +82,21 @@ def load():
     Reload the VideoCapture
     """
     global cap
+    global offset
     global SELECTED_EXPERIMENT
+    global CHUNKSIZE
+    global FRAMERATE
 
     experiment_folder = request.json.get('experiment', None)
     
     if cap is not None:
             cap.release()
 
-    out, cap = load_experiment(experiment_folder, first_chunk)
+    out, cap, (offset, CHUNKSIZE, FRAMERATE) = load_experiment(experiment_folder, first_chunk, TABLES)
     if cap is not None:
         SELECTED_EXPERIMENT=experiment_folder
-
     return jsonify(out)
+
 
 def row2dict(row):
     d = {}
@@ -110,6 +126,9 @@ def get_frame(frame_number):
     
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
+
+    global FRAMERATE
+
     output=TABLES[SELECTED_EXPERIMENT]["ROI_0"].query.filter_by(frame_number=frame_number)
     out=[]
     identity_table=TABLES[SELECTED_EXPERIMENT]["IDENTITY"].query.filter_by(frame_number=frame_number)
@@ -125,7 +144,7 @@ def get_tracking(frame_number):
         if not hit:
             identity = None
         
-        data={"frame_number": frame_number, "x": row.x, "y": row.y, "in_frame_index": row.in_frame_index, "identity": identity, "modified": row.modified}
+        data={"frame_number": frame_number, "t": frame_number/FRAMERATE + offset, "x": row.x, "y": row.y, "in_frame_index": row.in_frame_index, "identity": identity, "modified": row.modified}
         out.append(data)
 
     return jsonify(out)
