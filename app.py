@@ -14,69 +14,45 @@ from sqlalchemy import func, and_
 
 import cv2
 
-from imgstore.interface import VideoCapture
 
 from database import make_templates
+from backend import load_experiment, generate_database_filename, list_experiments, filter_by_date
+from constants import DEFAULT_EXPERIMENT, first_chunk, FRAMES_DIR, database_pattern
 
-FRAMES_DIR="frames"
 
 start_time = time.time()
 
+# Clean up previous frames
 if os.path.exists(FRAMES_DIR):
     shutil.rmtree(FRAMES_DIR)
+
+
+# Initialize application
+# with wight CORS settings
 app = Flask(__name__)
 CORS(app, resources={
     r"/*": {
-        "origins": [
-            "*",
-            # "https://yourdomain.com"
-        ],
+        "origins": ["*"],
         "allow_headers": "Content-Type",
         "methods": ["OPTIONS", "GET", "POST"],
     }
 })
 
-first_chunk = 50
-cap = None
-DEFAULT_EXPERIMENT = "FlyHostel1/5X/2023-05-23_14-00-00"
-SELECTED_EXPERIMENT=DEFAULT_EXPERIMENT
-
-def filter_by_date(experiment):
-    date_time = os.path.basename(experiment)[:10]
-    print(date_time)
-    dt = datetime.datetime.strptime(date_time, "%Y-%m-%d")
-    return dt >= datetime.datetime.strptime("2023-05-23", "%Y-%m-%d")
-
-def list_experiments():
-    experiments = [DEFAULT_EXPERIMENT]
-    with open(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), "r") as filehandle:
-        experiments = [experiment.strip() for experiment in filehandle.readlines()]
-        experiments = [os.path.sep.join(experiment.split(os.path.sep)[-4:-1]) for experiment in experiments]
-        experiments = sorted([experiment for experiment in experiments if filter_by_date(experiment)])
-    return {"experiments": experiments}
-
-EXPERIMENTS=list_experiments()["experiments"]
-
-def generate_database_filename(experiment):
-    return glob.glob(os.path.join(
-        os.environ["FLYHOSTEL_VIDEOS"], experiment, database_pattern
-    ))[0]
-
+# Load default dataset
+out, cap = load_experiment(DEFAULT_EXPERIMENT, first_chunk)
 basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], DEFAULT_EXPERIMENT)
-# database_pattern="database.db"
-database_pattern="FlyHostel*.db"
 database_file = glob.glob(os.path.join(basedir, database_pattern))[0]
-store_path = os.path.join(basedir, "metadata.yaml")
-cap = VideoCapture(store_path, first_chunk)  # Replace with your video file
-
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{database_file}'
+
+
+# Load database connection to all experiments
+TABLES={}
+EXPERIMENTS=list_experiments()["experiments"]
 SQLALCHEMY_BINDS = {
     experiment: f'sqlite:///{generate_database_filename(experiment)}' for experiment in EXPERIMENTS
 }
 app.config['SQLALCHEMY_BINDS'] = SQLALCHEMY_BINDS
 db = SQLAlchemy(app)
-TABLES={}
-
 for experiment in EXPERIMENTS:
     db, tables = make_templates(db, experiment)
     TABLES[experiment]=tables
@@ -98,21 +74,13 @@ def load():
     experiment_folder = request.json.get('experiment', None)
     
     if cap is not None:
-        cap.release()
+            cap.release()
 
-    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment_folder)
-    if not os.path.exists(basedir):
-        return jsonify({"message": f"{basedir} does not exist"})
+    out, cap = load_experiment(experiment_folder, first_chunk)
+    if cap is not None:
+        SELECTED_EXPERIMENT=experiment_folder
 
-    store_path = os.path.join(basedir, "metadata.yaml")
-    cap = VideoCapture(store_path, first_chunk)  # Replace with your video file
-    
-    frame_number = 45000 * 100
-    frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
-    last_time = time.time() - start_time
-    print(last_time, frame_number, frame.shape)
-    SELECTED_EXPERIMENT=experiment_folder
-    return jsonify({"message": "success"})
+    return jsonify(out)
 
 def row2dict(row):
     d = {}
@@ -124,15 +92,10 @@ def row2dict(row):
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
 def get_frame(frame_number):
 
-    global last_time
     global cap
 
     logging.debug(f"Fetching frame {frame_number}")
-
-    now = time.time() - start_time
-
     frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
-    last_time=time.time()-start_time
     filename=f"{frame_number}.jpg"
     img_path = os.path.join(FRAMES_DIR, filename)
     os.makedirs(os.path.dirname(img_path), exist_ok=True)
