@@ -52,7 +52,7 @@ def list_experiments():
     with open(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), "r") as filehandle:
         experiments = [experiment.strip() for experiment in filehandle.readlines()]
         experiments = [os.path.sep.join(experiment.split(os.path.sep)[-4:-1]) for experiment in experiments]
-        experiments = [experiment for experiment in experiments if filter_by_date(experiment)]
+        experiments = sorted([experiment for experiment in experiments if filter_by_date(experiment)])
     return {"experiments": experiments}
 
 EXPERIMENTS=list_experiments()["experiments"]
