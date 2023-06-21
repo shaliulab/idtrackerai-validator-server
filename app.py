@@ -2,6 +2,7 @@ import os.path
 import datetime
 import time
 import logging
+logging.basicConfig(level=logging.INFO)
 import glob
 import shutil
 
@@ -20,6 +21,7 @@ from backend import (
     load_experiment,
     generate_database_filename,
     list_experiments,
+    process_frame,
 )
 from constants import (
     SELECTED_EXPERIMENT,
@@ -68,8 +70,9 @@ for experiment in EXPERIMENTS:
 
 # Load default dataset
 with app.app_context():
-    out, cap, (offset, CHUNKSIZE, FRAMERATE) = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
-
+    out, cap, (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    frame = None
+    contours=None
 
 @app.route("/api/list", methods=["GET"])
 def list():
@@ -86,13 +89,15 @@ def load():
     global SELECTED_EXPERIMENT
     global CHUNKSIZE
     global FRAMERATE
+    global idtrackerai_config
 
     experiment_folder = request.json.get('experiment', None)
     
     if cap is not None:
             cap.release()
 
-    out, cap, (offset, CHUNKSIZE, FRAMERATE) = load_experiment(experiment_folder, first_chunk, TABLES)
+    out, cap, (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(experiment_folder, first_chunk, TABLES)
+
     if cap is not None:
         SELECTED_EXPERIMENT=experiment_folder
     return jsonify(out)
@@ -109,6 +114,9 @@ def row2dict(row):
 def get_frame(frame_number):
 
     global cap
+    global frame
+    global idtrackerai_config
+    global contours
 
     logging.debug(f"Fetching frame {frame_number}")
     frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
@@ -119,27 +127,37 @@ def get_frame(frame_number):
     assert os.path.exists(img_path), f"Could not save {img_path}"
     logging.debug(f"{cap._basedir} -> {img_path}")
 
+    contours=process_frame(frame, idtrackerai_config)
+
     if frame is None:
         return jsonify({'error': 'Frame not found'}), 404
     else:
         return send_from_directory('frames', filename)
+
+@app.route('/api/preprocess/<int:frame_number>', methods=['GET'])
+def get_preprocess(frame_number):
+
+    global contours
+    return jsonify({"contours": contours})
+
     
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
 
     global FRAMERATE
 
-    output=TABLES[SELECTED_EXPERIMENT]["ROI_0"].query.filter_by(frame_number=frame_number)
-    out=[]
-    identity_table=TABLES[SELECTED_EXPERIMENT]["IDENTITY"].query.filter_by(frame_number=frame_number)
+    try:
+        output=TABLES[SELECTED_EXPERIMENT]["ROI_0"].query.filter_by(frame_number=frame_number)
+        out=[]
+        identity_table=TABLES[SELECTED_EXPERIMENT]["IDENTITY"].query.filter_by(frame_number=frame_number)
 
-    for row in output.all():
-        identity=None
-        hit=False
-        for id_row in identity_table:
-            if row.in_frame_index == id_row.in_frame_index:
-                identity = id_row.identity
-                hit=True
+        for row in output.all():
+            identity=None
+            hit=False
+            for id_row in identity_table:
+                if row.in_frame_index == id_row.in_frame_index:
+                    identity = id_row.identity
+                    hit=True
 
             if not hit:
                 identity = None
