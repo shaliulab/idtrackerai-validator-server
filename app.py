@@ -141,11 +141,24 @@ def get_tracking(frame_number):
                 identity = id_row.identity
                 hit=True
 
-        if not hit:
-            identity = None
-        
-        data={"frame_number": frame_number, "t": frame_number/FRAMERATE + offset, "x": row.x, "y": row.y, "in_frame_index": row.in_frame_index, "identity": identity, "modified": row.modified}
-        out.append(data)
+            if not hit:
+                identity = None
+            
+            data={
+                "frame_number": frame_number,
+                "t": frame_number/FRAMERATE + offset,
+                "x": row.x,
+                "y": row.y,
+                "in_frame_index": row.in_frame_index,
+                "fragment": row.fragment,
+                "area": row.area,
+                "identity": identity,
+                "modified": row.modified
+            }
+
+            out.append(data)
+    except:
+        out= []
 
     return jsonify(out)
 

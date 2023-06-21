@@ -8,6 +8,7 @@ def make_templates(db, key=None):
         x = db.Column(db.Integer)
         y = db.Column(db.Integer)
         modified = db.Column(db.String(80))
+        fragment = db.Column(db.String(80))
         area = db.Column(db.Integer)
 
     class METADATA(db.Model):
