@@ -1,18 +1,24 @@
 import os.path
 import glob
+import traceback
 import json
 import datetime
 import tempfile
 import logging
+import sqlite3
 import math
+import re
 
 import cv2
 import numpy as np
 import pandas as pd
 from imgstore.interface import VideoCapture
 
-from constants import database_pattern
+from idtrackerai_validator_server.constants import database_pattern
 from idtrackerai.animals_detection.segmentation import _process_frame
+
+
+from idtrackerai_validator_server.pose_reader import GroupBehaviorReader
 
 def process_config(config):
 
@@ -77,10 +83,9 @@ def list_experiments():
     
     with open(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), "r") as filehandle:
         experiments = [experiment.strip() for experiment in filehandle.readlines()]
+        experiments = [path for path in experiments if re.search(r"FlyHostel\d_\d{1,2}X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}.db", os.path.basename(path))]
         experiments = [os.path.sep.join(experiment.split(os.path.sep)[-4:-1]) for experiment in experiments]
         experiments = sorted([experiment for experiment in experiments if filter_by_date(experiment)])
-    
-    experiments.append("FlyHostel1/1X/2023-06-16_14-00-00")
     return {"experiments": experiments}
 
 
@@ -92,25 +97,28 @@ def generate_database_filename(experiment):
 
 
 def load_experiment(experiment, chunk, TABLES):
-    
+    print(experiment, chunk)
     basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment)
     if not os.path.exists(basedir):
-        return {"message": f"{basedir} does not exist"}, None
+        logging.error(f"{basedir} not found")
+        return {"message": f"{basedir} does not exist"}, None, None, None
 
     store_path = os.path.join(basedir, "metadata.yaml")
-    idtrackerai_config_file = os.path.join(basedir, os.path.basename(basedir) + ".conf")
-    
-    if os.path.exists(idtrackerai_config_file):
-        logging.info(f"Loading {idtrackerai_config_file}")
-        with open(idtrackerai_config_file, "r") as fh:
-            idtrackerai_config = json.load(fh)
-    else:
-        idtrackerai_config=None
 
+    dbfile = os.path.join(basedir, "_".join(basedir.split(os.path.sep)[-3:]) + ".db")
+    with sqlite3.connect(dbfile) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM METADATA WHERE field = 'idtrackerai_conf';")
+        config_str = cursor.fetchone()
+    
+    idtrackerai_config = json.loads(config_str[0].rstrip('\n'))
     cap = VideoCapture(store_path, chunk)  # Replace with your video file
 
+    caps=GroupBehaviorReader.from_basedir(basedir)
+
     if cap is None:
-        metadata=[None, None]
+        logging.error(f"Could not load VideoCapture {store_path}")
+        metadata=(None, None, None)
     else:
         metadata_table=TABLES[experiment]["METADATA"]
         try:
@@ -120,9 +128,13 @@ def load_experiment(experiment, chunk, TABLES):
             frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
         
         except Exception as error:
+            logging.error(error)
+            logging.error(traceback.print_exc())
+            print(store_path)
+            import ipdb; ipdb.set_trace()
             metadata = (None, None, None)
 
-    return {"message": "success"}, cap , metadata, idtrackerai_config
+    return {"message": "success"}, (cap, caps) , metadata, idtrackerai_config
 
 
 def load_experiment_metadata(table):
@@ -132,6 +144,7 @@ def load_experiment_metadata(table):
 
     ethoscope_metadata=out.all()[0].value
     ethoscope_metadata=str2pandas(ethoscope_metadata)
+    assert ethoscope_metadata.shape[0] > 0, f"Ethoscope metadata has no data in"
     reference_hour=ethoscope_metadata["reference_hour"].values
     assert np.all(np.diff(reference_hour) == 0)
     reference_hour=reference_hour[0].item()
@@ -142,6 +155,7 @@ def load_experiment_metadata(table):
 
     out = table.query.filter_by(field="framerate")
     framerate=int(float(out.all()[0].value))
+
     return offset, chunksize, framerate
 
 

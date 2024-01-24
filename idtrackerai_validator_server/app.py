@@ -1,5 +1,4 @@
 import os.path
-import datetime
 import time
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -11,26 +10,25 @@ from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func
 
 import cv2
 
 
-from database import make_templates
-from backend import (
+from idtrackerai_validator_server.database import make_templates
+from idtrackerai_validator_server.backend import (
     load_experiment,
     generate_database_filename,
     list_experiments,
     process_frame,
 )
-from constants import (
+from idtrackerai_validator_server.constants import (
     SELECTED_EXPERIMENT,
     DEFAULT_EXPERIMENT,
     first_chunk,
     FRAMES_DIR,
     database_pattern,
 ) 
-
 
 start_time = time.time()
 
@@ -70,7 +68,7 @@ for experiment in EXPERIMENTS:
 
 # Load default dataset
 with app.app_context():
-    out, cap, (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    out, (cap, caps), (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
     frame = None
     contours=None
 
@@ -96,7 +94,8 @@ def load():
     if cap is not None:
             cap.release()
 
-    out, cap, (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(experiment_folder, first_chunk, TABLES)
+    out, (cap, caps), (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(experiment_folder, first_chunk, TABLES)
+    assert idtrackerai_config is not None
 
     if cap is not None:
         SELECTED_EXPERIMENT=experiment_folder
@@ -118,6 +117,7 @@ def get_frame(frame_number):
     global idtrackerai_config
     global contours
 
+
     logging.debug(f"Fetching frame {frame_number}")
     frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
     filename=f"{frame_number}.jpg"
@@ -126,13 +126,37 @@ def get_frame(frame_number):
     cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
     assert os.path.exists(img_path), f"Could not save {img_path}"
     logging.debug(f"{cap._basedir} -> {img_path}")
+    contours=process_frame(frame, idtrackerai_config)
 
+    if frame is None:
+        return jsonify({'error': 'Frame not found'}), 404
+    else:
+        return send_from_directory(os.path.realpath(FRAMES_DIR), filename)
+
+
+@app.route('/api/behavior/<int:identity>/<int:frame_number>', methods=['GET'])
+def get_behavior_frame(identity, frame_number):
+    raise NotImplementedError()
+
+    global caps
+    global frame
+    global idtrackerai_config
+    global contours
+
+    logging.debug(f"Fetching frame {frame_number}")
+    frame, (frame_number, frame_timestamp) = caps[identity].get_image(frame_number)
+    filename=f"{identity}_{frame_number}_pose.jpg"
+    img_path = os.path.join(FRAMES_DIR, filename)
+    os.makedirs(os.path.dirname(img_path), exist_ok=True)
+    cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    assert os.path.exists(img_path), f"Could not save {img_path}"
     contours=process_frame(frame, idtrackerai_config)
 
     if frame is None:
         return jsonify({'error': 'Frame not found'}), 404
     else:
         return send_from_directory('frames', filename)
+    
 
 @app.route('/api/preprocess/<int:frame_number>', methods=['GET'])
 def get_preprocess(frame_number):
@@ -157,6 +181,7 @@ def get_tracking(frame_number):
             for id_row in identity_table:
                 if row.in_frame_index == id_row.in_frame_index:
                     identity = id_row.identity
+                    local_identity = id_row.local_identity
                     hit=True
 
             if not hit:
@@ -168,14 +193,18 @@ def get_tracking(frame_number):
                 "x": row.x,
                 "y": row.y,
                 "in_frame_index": row.in_frame_index,
-                "fragment": row.fragment,
+                "fragment": getattr(row, "fragment", -1),
                 "area": row.area,
                 "identity": identity,
-                "modified": row.modified
+                "local_identity": local_identity,
+                "modified": row.modified,
             }
 
+            logging.warning(data)
+
             out.append(data)
-    except:
+    except Exception as error:
+        logging.error(error)
         out= []
 
     return jsonify(out)
@@ -247,8 +276,6 @@ def get_first_non_zero_frame(session: Session, frame_number: int, direction=True
     return result.frame_number if result else None
 
 
-
-
 @app.route('/shutdown', methods=['POST'])
 def shutdown():
     shutdown_server()
@@ -307,3 +334,7 @@ def get_ai(frame_number, direction):
         ai=None
 
     return jsonify({"frame_number": frame_number, "ai": ai})
+
+
+if __name__ == "__main__":
+    app.run(port=5000, host="0.0.0.0", debug=True)  # or set debug=False for production

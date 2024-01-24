@@ -1,15 +1,28 @@
-def make_templates(db, key=None):
 
-    class ROI_0(db.Model):
-        __bind_key__ = key
-        id = db.Column(db.Integer, primary_key=True)
-        frame_number = db.Column(db.Integer)
-        in_frame_index = db.Column(db.Integer)
-        x = db.Column(db.Integer)
-        y = db.Column(db.Integer)
-        modified = db.Column(db.String(80))
-        fragment = db.Column(db.String(80))
-        area = db.Column(db.Integer)
+def make_templates(db, key=None, fragments=False):
+
+    if fragments:
+
+        class ROI_0(db.Model):
+            __bind_key__ = key
+            id = db.Column(db.Integer, primary_key=True)
+            frame_number = db.Column(db.Integer)
+            in_frame_index = db.Column(db.Integer)
+            x = db.Column(db.Integer)
+            y = db.Column(db.Integer)
+            modified = db.Column(db.String(80))
+            fragment = db.Column(db.String(80))
+            area = db.Column(db.Integer)
+    else:
+        class ROI_0(db.Model):
+            __bind_key__ = key
+            id = db.Column(db.Integer, primary_key=True)
+            frame_number = db.Column(db.Integer)
+            in_frame_index = db.Column(db.Integer)
+            x = db.Column(db.Integer)
+            y = db.Column(db.Integer)
+            modified = db.Column(db.String(80))
+            area = db.Column(db.Integer)        
 
     class METADATA(db.Model):
         __bind_key__ = key
