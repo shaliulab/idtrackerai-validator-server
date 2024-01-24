@@ -1,0 +1,3 @@
+[submodule "idtrackerai-validator-client"]
+	path = idtrackerai-validator-client
+	url = git@github.com:shaliulab/idtrackerai-validator-client
