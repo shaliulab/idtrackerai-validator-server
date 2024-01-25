@@ -96,9 +96,9 @@ def generate_database_filename(experiment):
     return sqlite_file
 
 
-def load_experiment(experiment, chunk, TABLES):
-    print(experiment, chunk)
-    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment)
+def load_experiment(basedir_suffix, chunk, TABLES):
+    print(basedir_suffix, chunk)
+    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], basedir_suffix)
     if not os.path.exists(basedir):
         logging.error(f"{basedir} not found")
         return {"message": f"{basedir} does not exist"}, None, None, None
@@ -120,7 +120,7 @@ def load_experiment(experiment, chunk, TABLES):
         logging.error(f"Could not load VideoCapture {store_path}")
         metadata=(None, None, None)
     else:
-        metadata_table=TABLES[experiment]["METADATA"]
+        metadata_table=TABLES[basedir_suffix]["METADATA"]
         try:
             metadata=load_experiment_metadata(metadata_table)
             chunksize=metadata[2]
