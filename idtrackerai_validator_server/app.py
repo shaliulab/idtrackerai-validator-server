@@ -3,15 +3,18 @@ import time
 import logging
 import glob
 import shutil
-
+import threading
 from flask import request
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy import create_engine, MetaData
 
 import cv2
+mutex = threading.Lock()
+
 
 
 from idtrackerai_validator_server.constants import WITH_FRAGMENTS
@@ -31,6 +34,7 @@ from idtrackerai_validator_server.constants import (
 ) 
 
 logger=logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 start_time = time.time()
 
@@ -42,14 +46,23 @@ if os.path.exists(FRAMES_DIR):
 # Initialize application
 # with wight CORS settings
 app = Flask(__name__)
-# CORS(app, resources={
-#     r"/*": {
-#         "origins": ["*"],
-#         "allow_headers": "Content-Type",
-#         "methods": ["OPTIONS", "GET", "POST"],
-#     }
-# })
 CORS(app)
+app.logger.setLevel(logging.DEBUG)
+
+# Configure StreamHandler to output to stdout
+handler = logging.StreamHandler()
+handler.setLevel(logging.DEBUG)
+
+# Set a formatter if you want to format the logs
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+handler.setFormatter(formatter)
+
+# Add the handler to the Flask app's logger
+app.logger.addHandler(handler)
+
+
 
 basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], DEFAULT_EXPERIMENT)
 database_file = glob.glob(os.path.join(basedir, database_pattern))[0]
@@ -65,12 +78,28 @@ SQLALCHEMY_BINDS = {
 app.config['SQLALCHEMY_BINDS'] = SQLALCHEMY_BINDS
 db = SQLAlchemy(app)
 for basedir_suffix in EXPERIMENTS:
-    db, tables = make_templates(db, basedir_suffix, fragments=WITH_FRAGMENTS)
+
+    # engine = create_engine(SQLALCHEMY_BINDS[basedir_suffix])
+    # metadata = MetaData()
+    # metadata.reflect(bind=engine)
+    # table_name = 'ROI_0'
+    # column_name = 'fragment'
+    # table = metadata.tables.get(table_name)
+    # try:
+    #     with_fragments = column_name in table.columns
+    # except:
+    #     with_fragments=False
+
+    # if not with_fragments:
+    #     app.logger.warning("%s is missing fragment information", basedir_suffix)
+
+    db, tables = make_templates(db, basedir_suffix, fragments=False)
     TABLES[basedir_suffix]=tables
 
 # Load default dataset
 with app.app_context():
-    out, (cap, caps), (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    out, cap, experiment_metadata, idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    offset, CHUNKSIZE, FRAMERATE=experiment_metadata
     frame = None
     contours=None
 
@@ -91,21 +120,28 @@ def get(experiment):
     global FRAMERATE
     global idtrackerai_config
 
+
     tokens=experiment.split("_")
     basedir_suffix="/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
+
+    if basedir_suffix==SELECTED_EXPERIMENT:
+        app.logger.debug("Requested experiment is already loaded")
+        return jsonify({"message": "success"})
    
     if cap is not None:
             cap.release()
         
-    logger.warning("Loading %s", basedir_suffix)
+    app.logger.info("Loading %s", basedir_suffix)
 
-    out, (cap, caps), (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(basedir_suffix, first_chunk, TABLES)
+    out, cap, experiment_metadata, idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    
+    offset, CHUNKSIZE, FRAMERATE=experiment_metadata
     assert idtrackerai_config is not None
 
     if cap is not None:
         SELECTED_EXPERIMENT=basedir_suffix
 
-    logger.debug("Selected experiment = %s", basedir_suffix)
+    app.logger.debug("Selected experiment = %s", basedir_suffix)
     return jsonify(out)
 
 @app.route("/api/load", methods=['POST'])
@@ -125,7 +161,8 @@ def load():
     if cap is not None:
             cap.release()
 
-    out, (cap, caps), (offset, CHUNKSIZE, FRAMERATE), idtrackerai_config = load_experiment(basedir_suffix, first_chunk, TABLES)
+    out, cap, experiment_metadata, idtrackerai_config = load_experiment(basedir_suffix, first_chunk, TABLES)
+    (offset, CHUNKSIZE, FRAMERATE)=experiment_metadata
     assert idtrackerai_config is not None
 
     if cap is not None:
@@ -149,14 +186,17 @@ def get_frame(frame_number):
     global contours
 
 
-    logger.debug(f"Fetching frame {frame_number}")
+    app.logger.debug(f"Fetching frame {frame_number}")
+    mutex.acquire()
     frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
+    mutex.release()
+
     filename=f"{frame_number}.jpg"
     img_path = os.path.join(FRAMES_DIR, filename)
     os.makedirs(os.path.dirname(img_path), exist_ok=True)
     cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
     assert os.path.exists(img_path), f"Could not save {img_path}"
-    logger.debug(f"{cap._basedir} -> {img_path}")
+    app.logger.debug(f"{cap._basedir} -> {img_path}")
     contours=process_frame(frame, idtrackerai_config)
 
     if frame is None:
@@ -165,29 +205,6 @@ def get_frame(frame_number):
         return send_from_directory(os.path.realpath(FRAMES_DIR), filename)
 
 
-@app.route('/api/behavior/<int:identity>/<int:frame_number>', methods=['GET'])
-def get_behavior_frame(identity, frame_number):
-    raise NotImplementedError()
-
-    global caps
-    global frame
-    global idtrackerai_config
-    global contours
-
-    logger.debug(f"Fetching frame {frame_number}")
-    frame, (frame_number, frame_timestamp) = caps[identity].get_image(frame_number)
-    filename=f"{identity}_{frame_number}_pose.jpg"
-    img_path = os.path.join(FRAMES_DIR, filename)
-    os.makedirs(os.path.dirname(img_path), exist_ok=True)
-    cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-    assert os.path.exists(img_path), f"Could not save {img_path}"
-    contours=process_frame(frame, idtrackerai_config)
-
-    if frame is None:
-        return jsonify({'error': 'Frame not found'}), 404
-    else:
-        return send_from_directory('frames', filename)
-    
 
 @app.route('/api/preprocess/<int:frame_number>', methods=['GET'])
 def get_preprocess(frame_number):
@@ -231,11 +248,11 @@ def get_tracking(frame_number):
                 "modified": row.modified,
             }
 
-            logger.debug("Sending %s", data)
+            app.logger.debug("Sending %s", data)
 
             out.append(data)
     except Exception as error:
-        logger.error(error)
+        app.logger.error(error)
         out= []
 
     return jsonify(out)
