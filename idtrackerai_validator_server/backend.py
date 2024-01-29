@@ -14,11 +14,9 @@ import numpy as np
 import pandas as pd
 from imgstore.interface import VideoCapture
 
-from idtrackerai_validator_server.constants import database_pattern
 from idtrackerai.animals_detection.segmentation import _process_frame
 
-
-from idtrackerai_validator_server.pose_reader import GroupBehaviorReader
+logger=logging.getLogger(__name__)
 
 def process_config(config):
 
@@ -96,45 +94,54 @@ def generate_database_filename(experiment):
     return sqlite_file
 
 
-def load_experiment(basedir_suffix, chunk, TABLES):
-    print(basedir_suffix, chunk)
-    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], basedir_suffix)
-    if not os.path.exists(basedir):
-        logging.error(f"{basedir} not found")
-        return {"message": f"{basedir} does not exist"}, None, None, None
-
-    store_path = os.path.join(basedir, "metadata.yaml")
-
+def load_idtrackerai_config(basedir):
     dbfile = os.path.join(basedir, "_".join(basedir.split(os.path.sep)[-3:]) + ".db")
     with sqlite3.connect(dbfile) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM METADATA WHERE field = 'idtrackerai_conf';")
         config_str = cursor.fetchone()
-    
+
     idtrackerai_config = json.loads(config_str[0].rstrip('\n'))
+    return idtrackerai_config
+
+def load_flyhostel_metadata(basedir_suffix, db_manager):
+    metadata_table=db_manager.get_tables(basedir_suffix)["METADATA"]
+    try:
+        metadata=load_experiment_metadata(metadata_table)
+    except Exception as error:
+        logger.error(error)
+        logger.error(traceback.print_exc())
+        print(basedir_suffix)
+        import ipdb; ipdb.set_trace()
+        metadata = (None, None, None)
+
+    return metadata
+
+def load_experiment(basedir_suffix, chunk, db_manager):
+
+    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], basedir_suffix)
+    if not os.path.exists(basedir):
+        logger.error(f"{basedir} not found")
+        return {"message": f"{basedir} does not exist"}, None, None, None
+
+    # load idtrackerai_config
+    idtrackerai_config=load_idtrackerai_config(basedir)
+
+    # load videocapture object
+    store_path = os.path.join(basedir, "metadata.yaml")
+    logger.debug("Initializing %s - chunk %s", store_path, chunk)
     cap = VideoCapture(store_path, chunk)  # Replace with your video file
 
-    caps=GroupBehaviorReader.from_basedir(basedir)
-
     if cap is None:
-        logging.error(f"Could not load VideoCapture {store_path}")
+        logger.error(f"Could not load VideoCapture {store_path}")
         metadata=(None, None, None)
     else:
-        metadata_table=TABLES[basedir_suffix]["METADATA"]
-        try:
-            metadata=load_experiment_metadata(metadata_table)
-            chunksize=metadata[2]
-            frame_number = chunksize * chunk
-            frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
-        
-        except Exception as error:
-            logging.error(error)
-            logging.error(traceback.print_exc())
-            print(store_path)
-            import ipdb; ipdb.set_trace()
-            metadata = (None, None, None)
+        metadata=load_flyhostel_metadata(basedir_suffix, db_manager)
+        chunksize=metadata[1]
+        frame_number = chunksize * chunk
+        frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
 
-    return {"message": "success"}, (cap, caps) , metadata, idtrackerai_config
+    return {"message": "success"}, cap , metadata, idtrackerai_config
 
 
 def load_experiment_metadata(table):

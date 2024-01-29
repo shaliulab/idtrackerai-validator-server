@@ -1,107 +1,67 @@
-import os.path
-import time
-import logging
+import os
 import glob
 import shutil
-import threading
-from flask import request
-from flask import Flask, jsonify, send_from_directory
+import time
+from threading import Lock
+import logging
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from flask import g
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from sqlalchemy import create_engine, MetaData
-
 import cv2
-mutex = threading.Lock()
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+from flask import session
 
-
-
-from idtrackerai_validator_server.constants import WITH_FRAGMENTS
-from idtrackerai_validator_server.database import make_templates
-from idtrackerai_validator_server.backend import (
-    load_experiment,
-    generate_database_filename,
-    list_experiments,
-    process_frame,
-)
 from idtrackerai_validator_server.constants import (
-    SELECTED_EXPERIMENT,
-    DEFAULT_EXPERIMENT,
-    first_chunk,
-    FRAMES_DIR,
-    database_pattern,
-) 
+    WITH_FRAGMENTS, DEFAULT_EXPERIMENT, first_chunk, FRAMES_DIR, database_pattern
+)
+from idtrackerai_validator_server.database import DatabaseManager
+from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, list_experiments, process_frame
 
+# Initialize logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger=logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logging.getLogger("idtrackerai_validator_server.backend").setLevel(logging.DEBUG)
+logging.getLogger("imgstore").setLevel(logging.WARNING)
+logging.getLogger("watchdog.observers").setLevel(logging.WARNING)
 
-start_time = time.time()
+lock=Lock()
+
+# Initialize application with CORS settings
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
+CORS(app)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
     shutil.rmtree(FRAMES_DIR)
 
-
-# Initialize application
-# with wight CORS settings
-app = Flask(__name__)
-CORS(app)
-app.logger.setLevel(logging.DEBUG)
-
-# Configure StreamHandler to output to stdout
-handler = logging.StreamHandler()
-handler.setLevel(logging.DEBUG)
-
-# Set a formatter if you want to format the logs
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-handler.setFormatter(formatter)
-
-# Add the handler to the Flask app's logger
-app.logger.addHandler(handler)
-
-
-
+# Database configuration
 basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], DEFAULT_EXPERIMENT)
 database_file = glob.glob(os.path.join(basedir, database_pattern))[0]
-app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{database_file}'
 
+EXPERIMENTS = list_experiments()["experiments"]
 
-# Load database connection to all experiments
-TABLES={}
-EXPERIMENTS=list_experiments()["experiments"]
-SQLALCHEMY_BINDS = {
-    basedir_suffix: f'sqlite:///{generate_database_filename(basedir_suffix)}' for basedir_suffix in EXPERIMENTS
+app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{database_file}"
+app.config['SQLALCHEMY_BINDS'] = {
+    basedir_suffix: f'sqlite:///{generate_database_filename(basedir_suffix)}'
+    for basedir_suffix in EXPERIMENTS
 }
-app.config['SQLALCHEMY_BINDS'] = SQLALCHEMY_BINDS
-db = SQLAlchemy(app)
-for basedir_suffix in EXPERIMENTS:
+print(app.config['PERMANENT_SESSION_LIFETIME'])
 
-    # engine = create_engine(SQLALCHEMY_BINDS[basedir_suffix])
-    # metadata = MetaData()
-    # metadata.reflect(bind=engine)
-    # table_name = 'ROI_0'
-    # column_name = 'fragment'
-    # table = metadata.tables.get(table_name)
-    # try:
-    #     with_fragments = column_name in table.columns
-    # except:
-    #     with_fragments=False
-
-    # if not with_fragments:
-    #     app.logger.warning("%s is missing fragment information", basedir_suffix)
-
-    db, tables = make_templates(db, basedir_suffix, fragments=False)
-    TABLES[basedir_suffix]=tables
+db=SQLAlchemy(app)
+db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS)
 
 # Load default dataset
 with app.app_context():
-    out, cap, experiment_metadata, idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(DEFAULT_EXPERIMENT, first_chunk, db_manager)
     offset, CHUNKSIZE, FRAMERATE=experiment_metadata
+    SELECTED_EXPERIMENT=DEFAULT_EXPERIMENT
     frame = None
     contours=None
+
+
 
 @app.route("/api/list", methods=["GET"])
 def list():
@@ -116,9 +76,6 @@ def get(experiment):
     global cap
     global offset
     global SELECTED_EXPERIMENT
-    global CHUNKSIZE
-    global FRAMERATE
-    global idtrackerai_config
 
 
     tokens=experiment.split("_")
@@ -130,19 +87,24 @@ def get(experiment):
    
     if cap is not None:
             cap.release()
+            time.sleep(1)
         
     app.logger.info("Loading %s", basedir_suffix)
 
-    out, cap, experiment_metadata, idtrackerai_config = load_experiment(DEFAULT_EXPERIMENT, first_chunk, TABLES)
+    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(basedir_suffix, first_chunk, db_manager)
     
-    offset, CHUNKSIZE, FRAMERATE=experiment_metadata
-    assert idtrackerai_config is not None
+    offset, session["chunksize"], session["framerate"]=experiment_metadata
+    assert IDTRACKERAI_CONFIG is not None
 
     if cap is not None:
         SELECTED_EXPERIMENT=basedir_suffix
+        logger.debug("Setting active experiment to %s", basedir_suffix)
+    else:
+        logger.error("Could not load %s", basedir_suffix)
 
     app.logger.debug("Selected experiment = %s", basedir_suffix)
     return jsonify(out)
+
 
 @app.route("/api/load", methods=['POST'])
 def load():
@@ -152,21 +114,22 @@ def load():
     global cap
     global offset
     global SELECTED_EXPERIMENT
-    global CHUNKSIZE
-    global FRAMERATE
-    global idtrackerai_config
 
     basedir_suffix = request.json.get('experiment', None)
     
     if cap is not None:
             cap.release()
 
-    out, cap, experiment_metadata, idtrackerai_config = load_experiment(basedir_suffix, first_chunk, TABLES)
-    (offset, CHUNKSIZE, FRAMERATE)=experiment_metadata
-    assert idtrackerai_config is not None
+    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(basedir_suffix, first_chunk, db_manager)
+    (offset, session["chunksize"], session["framerate"])=experiment_metadata
+    assert IDTRACKERAI_CONFIG is not None
 
-    if cap is not None:
+    if cap is None:
+        logger.warning("VideoCapture object for experiment %s could not be initialized", basedir_suffix)
+    else:
         SELECTED_EXPERIMENT=basedir_suffix
+        logger.debug("Setting active experiment to %s", basedir_suffix)
+
     return jsonify(out)
 
 
@@ -182,22 +145,23 @@ def get_frame(frame_number):
 
     global cap
     global frame
-    global idtrackerai_config
     global contours
 
+    if cap is None:
+        return jsonify({'error': 'Cap could not be loaded'}), 404 
 
     app.logger.debug(f"Fetching frame {frame_number}")
-    mutex.acquire()
+    lock.acquire()
     frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
-    mutex.release()
-
+    lock.release()
+    app.logger.debug(f"Fetching frame {frame_number} done")
     filename=f"{frame_number}.jpg"
     img_path = os.path.join(FRAMES_DIR, filename)
     os.makedirs(os.path.dirname(img_path), exist_ok=True)
     cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
     assert os.path.exists(img_path), f"Could not save {img_path}"
     app.logger.debug(f"{cap._basedir} -> {img_path}")
-    contours=process_frame(frame, idtrackerai_config)
+    contours=process_frame(frame, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
 
     if frame is None:
         return jsonify({'error': 'Frame not found'}), 404
@@ -215,13 +179,16 @@ def get_preprocess(frame_number):
     
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
+    global SELECTED_EXPERIMENT
+    basedir_suffix=SELECTED_EXPERIMENT
+    logger.debug("Loading tracking data for %s", basedir_suffix)
 
-    global FRAMERATE
+    tables = db_manager.get_tables(basedir_suffix)
 
     try:
-        output=TABLES[SELECTED_EXPERIMENT]["ROI_0"].query.filter_by(frame_number=frame_number)
+        output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
         out=[]
-        identity_table=TABLES[SELECTED_EXPERIMENT]["IDENTITY"].query.filter_by(frame_number=frame_number)
+        identity_table=tables["IDENTITY"].query.filter_by(frame_number=frame_number)
 
         for row in output.all():
             identity=None
@@ -237,7 +204,7 @@ def get_tracking(frame_number):
             
             data={
                 "frame_number": frame_number,
-                "t": frame_number/FRAMERATE + offset,
+                "t": frame_number/session.get("framerate", FRAMERATE) + offset,
                 "x": row.x,
                 "y": row.y,
                 "in_frame_index": row.in_frame_index,
@@ -287,27 +254,30 @@ def get_next_ai(frame_number):
     return get_ai(frame_number, "next")
 
 
-def get_first_non_zero_frame(session: Session, frame_number: int, direction=True):
+def get_first_non_zero_frame(sql_session: Session, frame_number: int, direction=True):
+    global SELECTED_EXPERIMENT
+    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+
     if direction == "next":
-        filter_condition = TABLES[SELECTED_EXPERIMENT]["IDENTITY"].frame_number > frame_number
+        filter_condition = tables["IDENTITY"].frame_number > frame_number
     elif direction == "previous":
-        filter_condition = TABLES[SELECTED_EXPERIMENT]["IDENTITY"].frame_number < frame_number
+        filter_condition = tables["IDENTITY"].frame_number < frame_number
     else:
         raise Exception(f"direction must be either next or previous. direction={direction}")
 
     subquery = (
-        session.query(
-            TABLES[SELECTED_EXPERIMENT]["IDENTITY"].frame_number,
-            func.min(TABLES[SELECTED_EXPERIMENT]["IDENTITY"].identity).label("min_identity")
+        sql_session.query(
+            tables["IDENTITY"].frame_number,
+            func.min(tables["IDENTITY"].identity).label("min_identity")
         )
         .filter(filter_condition)
-        .group_by(TABLES[SELECTED_EXPERIMENT]["IDENTITY"].frame_number)
+        .group_by(tables["IDENTITY"].frame_number)
         .subquery()
     )
 
     if direction=="previous":
         result = (
-            session.query(subquery)
+            sql_session.query(subquery)
             .filter(subquery.c.min_identity != 0)
             .order_by(-subquery.c.frame_number)
             .first()
@@ -315,7 +285,7 @@ def get_first_non_zero_frame(session: Session, frame_number: int, direction=True
     
     elif direction=="next":
         result = (
-            session.query(subquery)
+            sql_session.query(subquery)
             .filter(subquery.c.min_identity != 0)
             .order_by(subquery.c.frame_number)
             .first()
@@ -328,31 +298,33 @@ def get_first_non_zero_frame(session: Session, frame_number: int, direction=True
 def shutdown():
     shutdown_server()
     message='Shutting down gracefully...'
-    print(message)
+    logger.debug(message)
     return jsonify({"message": message})
 
 def shutdown_server():
     func = request.environ.get('werkzeug.server.shutdown')
-    # if func is None:
-    #     raise RuntimeError('Not running with the Werkzeug Server')
-    
-    print("Gracefully shutting down...")
+
+    logger.debug("Gracefully shutting down...")
     db.session.close()  # or however you close your DB connection
-    print("DB connection closed. Bye!")
+    logger.debug("DB connection closed. Bye!")
 
 def get_ok(frame_number, direction):
     frame_number= get_first_non_zero_frame(db.session, frame_number, direction)
-    print(frame_number)
+    logger.debug("get_ok %s", frame_number)
     return jsonify({"frame_number": frame_number})
 
 
 def get_error(frame_number, direction):
+
+    global SELECTED_EXPERIMENT
+    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+
     if direction=="next":
-        query=TABLES[SELECTED_EXPERIMENT]["IDENTITY"].query.filter(TABLES[SELECTED_EXPERIMENT]["IDENTITY"].frame_number>frame_number, TABLES[SELECTED_EXPERIMENT]["IDENTITY"].identity==0)
+        query=tables["IDENTITY"].query.filter(tables["IDENTITY"].frame_number>frame_number, tables["IDENTITY"].identity==0)
         hit=query.first()
     elif direction=="previous":
-        query=TABLES[SELECTED_EXPERIMENT]["IDENTITY"].query.filter(TABLES[SELECTED_EXPERIMENT]["IDENTITY"].frame_number<frame_number, TABLES[SELECTED_EXPERIMENT]["IDENTITY"].identity==0)
-        hit=query.order_by(-TABLES[SELECTED_EXPERIMENT]["IDENTITY"].id).first()   
+        query=tables["IDENTITY"].query.filter(tables["IDENTITY"].frame_number<frame_number, tables["IDENTITY"].identity==0)
+        hit=query.order_by(-tables["IDENTITY"].id).first()
     else:
         raise Exception(f"direction must be either next or previous. direction={direction}")
 
@@ -365,12 +337,15 @@ def get_error(frame_number, direction):
 
 
 def get_ai(frame_number, direction):
+    global SELECTED_EXPERIMENT
+    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+
     if direction=="next":
-        query=TABLES[SELECTED_EXPERIMENT]["AI"].query.filter(TABLES[SELECTED_EXPERIMENT]["AI"].frame_number>frame_number)
-        hit=query.order_by(TABLES[SELECTED_EXPERIMENT]["AI"].frame_number).first()   
+        query=tables["AI"].query.filter(tables["AI"].frame_number>frame_number)
+        hit=query.order_by(tables["AI"].frame_number).first()
     elif direction=="previous":
-        query=TABLES[SELECTED_EXPERIMENT]["AI"].query.filter(TABLES[SELECTED_EXPERIMENT]["AI"].frame_number<frame_number)
-        hit=query.order_by(-TABLES[SELECTED_EXPERIMENT]["AI"].frame_number).first()   
+        query=tables["AI"].query.filter(tables["AI"].frame_number<frame_number)
+        hit=query.order_by(-tables["AI"].frame_number).first()
     else:
         raise Exception(f"direction must be either next or previous. direction={direction}")
 

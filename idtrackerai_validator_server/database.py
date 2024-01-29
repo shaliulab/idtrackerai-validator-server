@@ -1,3 +1,45 @@
+import logging
+
+logger=logging.getLogger(__name__)
+
+from idtrackerai_validator_server.backend import generate_database_filename, list_experiments
+
+class DatabaseManager:
+    def __init__(self, app, db, with_fragments=True):
+        self.app = app
+        self.db = db
+        self.database_uris = {}
+        self.experiment=None
+        self.init_database_uris()
+        self.tables={}
+        self.with_fragments=with_fragments
+
+    def init_database_uris(self):
+        experiments = list_experiments()["experiments"]
+        for experiment in experiments:
+            db_uri = f'sqlite:///{generate_database_filename(experiment)}'
+            self.database_uris[experiment] = db_uri
+
+    def get_tables(self, experiment):
+        if self.experiment is None or self.experiment != experiment:
+            self.switch_database(experiment)
+            self.tables=make_templates(self.db, experiment, fragments=self.with_fragments)
+            self.experiment=experiment
+        
+        elif self.experiment==experiment:
+            pass
+
+        return self.tables
+            
+
+    def switch_database(self, experiment):
+        if experiment in self.database_uris:
+            self.app.config['SQLALCHEMY_DATABASE_URI'] = self.database_uris[experiment]
+            self.db.engine.dispose()  # Dispose the current engine
+            self.db.create_all()      # Reflect new database
+
+    # Additional methods as needed for database operations
+
 
 def make_templates(db, key=None, fragments=False):
 
@@ -5,6 +47,9 @@ def make_templates(db, key=None, fragments=False):
 
         class ROI_0(db.Model):
             __bind_key__ = key
+            # __tablename__ = f'roi_0_{key}'
+            __table_args__ = {'extend_existing': True}
+
             id = db.Column(db.Integer, primary_key=True)
             frame_number = db.Column(db.Integer)
             in_frame_index = db.Column(db.Integer)
@@ -16,6 +61,8 @@ def make_templates(db, key=None, fragments=False):
     else:
         class ROI_0(db.Model):
             __bind_key__ = key
+            __table_args__ = {'extend_existing': True}
+            # __tablename__ = f'roi_0_{key}'
             id = db.Column(db.Integer, primary_key=True)
             frame_number = db.Column(db.Integer)
             in_frame_index = db.Column(db.Integer)
@@ -27,11 +74,16 @@ def make_templates(db, key=None, fragments=False):
 
     class METADATA(db.Model):
         __bind_key__ = key
+        __table_args__ = {'extend_existing': True}
+        # __tablename__ = f'metadata_{key}'
         field = db.Column(db.String(100), primary_key=True)
         value = db.Column(db.String(4000))
 
     class IDENTITY(db.Model):
+
         __bind_key__ = key
+        __table_args__ = {'extend_existing': True}
+        # __tablename__ = f'identity_{key}'
         id = db.Column(db.Integer, primary_key=True)
         frame_number = db.Column(db.Integer)
         in_frame_index = db.Column(db.Integer)
@@ -40,6 +92,8 @@ def make_templates(db, key=None, fragments=False):
 
     class CONCATENATION(db.Model):
         __bind_key__ = key
+        __table_args__ = {'extend_existing': True}
+        # __tablename__ = f'concatenation_{key}'
         id = db.Column(db.Integer, primary_key=True)
         chunk = db.Column(db.Integer)
         local_identity = db.Column(db.Integer)
@@ -50,10 +104,12 @@ def make_templates(db, key=None, fragments=False):
 
     class AI(db.Model):
         __bind_key__ = key
+        __table_args__ = {'extend_existing': True}
+        # __tablename__ = f'ai_{key}'
         frame_number = db.Column(db.Integer, primary_key=True)
         ai = db.Column(db.String(30))
 
 
     tables = {"ROI_0": ROI_0, "METADATA": METADATA, "IDENTITY": IDENTITY, "CONCATENATION": CONCATENATION, "AI": AI}
-    return db, tables
+    return tables
 
