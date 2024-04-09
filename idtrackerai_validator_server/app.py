@@ -39,7 +39,11 @@ if os.path.exists(FRAMES_DIR):
 
 # Database configuration
 basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], DEFAULT_EXPERIMENT)
-database_file = glob.glob(os.path.join(basedir, database_pattern))[0]
+try:
+    pattern=os.path.join(basedir, database_pattern)
+    database_file = glob.glob(pattern)[0]
+except IndexError as error:
+    app.logger.error("%s not found", pattern)
 
 EXPERIMENTS = list_experiments()["experiments"]
 
@@ -48,6 +52,7 @@ app.config['SQLALCHEMY_BINDS'] = {
     basedir_suffix: f'sqlite:///{generate_database_filename(basedir_suffix)}'
     for basedir_suffix in EXPERIMENTS
 }
+
 print(app.config['PERMANENT_SESSION_LIFETIME'])
 
 db=SQLAlchemy(app)
@@ -79,10 +84,11 @@ def get(experiment):
 
 
     tokens=experiment.split("_")
+    tokens[0]="FlyHostel" + tokens[0][9:]
     basedir_suffix="/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
 
     if basedir_suffix==SELECTED_EXPERIMENT:
-        app.logger.debug("Requested experiment is already loaded")
+        app.logger.debug("Requested experiment is already loaded, (%s == %s)", basedir_suffix, SELECTED_EXPERIMENT)
         return jsonify({"message": "success"})
    
     if cap is not None:
@@ -100,9 +106,7 @@ def get(experiment):
         SELECTED_EXPERIMENT=basedir_suffix
         logger.debug("Setting active experiment to %s", basedir_suffix)
     else:
-        logger.error("Could not load %s", basedir_suffix)
-
-    app.logger.debug("Selected experiment = %s", basedir_suffix)
+        logger.error("Could not load %s, selected experiment remains %s", basedir_suffix, SELECTED_EXPERIMENT)
     return jsonify(out)
 
 
@@ -180,15 +184,14 @@ def get_preprocess(frame_number):
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
     global SELECTED_EXPERIMENT
-    basedir_suffix=SELECTED_EXPERIMENT
-    logger.debug("Loading tracking data for %s", basedir_suffix)
-
-    tables = db_manager.get_tables(basedir_suffix)
+    logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
+    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
 
     try:
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
         out=[]
         identity_table=tables["IDENTITY"].query.filter_by(frame_number=frame_number)
+        number_of_animals=0
 
         for row in output.all():
             identity=None
@@ -215,13 +218,16 @@ def get_tracking(frame_number):
                 "modified": row.modified,
             }
 
-            app.logger.debug("Sending %s", data)
-
+            number_of_animals+=1
             out.append(data)
     except Exception as error:
         app.logger.error(error)
         out= []
+    
+    if number_of_animals==0:
+        app.logger.warning("No animals found for frame %s", frame_number)
 
+    # app.logger.debug("Sending %s", out)
     return jsonify(out)
 
 

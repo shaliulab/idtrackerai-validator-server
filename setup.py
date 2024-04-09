@@ -18,12 +18,14 @@ setup(
     python_requires='>=3.7.4',  # Specify your minimal Python version
     install_requires=[
         "flask>=2.2.5",
-        "Flask-SQLAlchemy>=3.1.1",
-        "flask_cors",
+        "Flask-SQLAlchemy>=3.0.5",
+        "sqlalchemy>=2.0.0",
+        "flask_cors>=4.0.0",
         "pandas>=1.3.5",
         "numpy>=1.21.6",
-        "sqlalchemy>=2.0.15",
         "opencv-python",
+        "webcolors",
+        "flyhostel",
         ""
         # Add more packages as needed
     ],

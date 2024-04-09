@@ -4,6 +4,8 @@ logger=logging.getLogger(__name__)
 
 from idtrackerai_validator_server.backend import generate_database_filename, list_experiments
 from flyhostel.data.human_validation.utils import check_if_validated
+
+
 class DatabaseManager:
     def __init__(self, app, db, with_fragments=True):
         self.app = app
@@ -25,7 +27,9 @@ class DatabaseManager:
 
     def get_tables(self, experiment):
         if self.experiment is None or self.experiment != experiment:
+            logger.warning("Switching %s for %s", self.experiment, experiment)
             self.switch_database(experiment)
+            logger.debug("Making templates")
             self.tables=make_templates(self.db, experiment, fragments=self.with_fragments, use_val=self.use_val)
             self.experiment=experiment
         
@@ -37,77 +41,90 @@ class DatabaseManager:
 
     def switch_database(self, experiment):
         if experiment in self.database_uris:
+            logger.debug("Setting URI to %s", self.database_uris[experiment])
             self.app.config['SQLALCHEMY_DATABASE_URI'] = self.database_uris[experiment]
+            self.dbfile=self.app.config['SQLALCHEMY_DATABASE_URI'].replace("sqlite:///", "")
+            self.use_val=check_if_validated(self.dbfile)
             self.db.engine.dispose()  # Dispose the current engine
             self.db.create_all()      # Reflect new database
 
     # Additional methods as needed for database operations
 
 
-def make_templates(db, key=None, fragments=False, use_val=True):
+def make_templates(db, key=None, fragments=False, use_val="_VAL"):
+    
+    # Updated abstract model class using db.Model
+    class ROI_ABS(db.Model):
+        __abstract__ = True
+        id = db.Column(db.Integer, primary_key=True)
+        frame_number = db.Column(db.Integer)
+        in_frame_index = db.Column(db.Integer)
+        x = db.Column(db.Integer)
+        y = db.Column(db.Integer)
+        modified = db.Column(db.String(80))
+        fragment = db.Column(db.String(80), nullable=True)  # Make nullable based on the use case
+        area = db.Column(db.Integer)
 
-    if use_val:
 
+    class IDENTITY_ABS(db.Model):
+        __abstract__ = True
+        id = db.Column(db.Integer, primary_key=True)
+        frame_number = db.Column(db.Integer)
+        in_frame_index = db.Column(db.Integer)
+        local_identity = db.Column(db.Integer)
+        identity = db.Column(db.Integer)
+
+    class CONCATENATION_ABS(db.Model):
+        __abstract__ = True
+        id = db.Column(db.Integer, primary_key=True)
+        chunk = db.Column(db.Integer)
+        local_identity = db.Column(db.Integer)
+        local_identity_after = db.Column(db.Integer)
+        is_inferred = db.Column(db.Integer)
+        is_broken = db.Column(db.Integer)
+
+    # Function to dynamically create model class
+    def get_roi_model(suffix, fragments=False):
+        tablename = f'ROI_0{suffix}'  # Adjust table name based on suffix
+        class_name = f'ROI_0{suffix}'  # Similarly, adjust class name
+
+        # Conditionally add 'fragment' column based on the fragments flag
+        attributes = {'__tablename__': tablename, '__table_args__': {'extend_existing': True}}
         if fragments:
+            attributes['fragment'] = db.Column(db.String(80))
 
-            class ROI_0(db.Model):
-                __bind_key__ = key
-                __tablename__ = 'ROI_0_VAL'
-                __table_args__ = {'extend_existing': True}
+        Model = type(class_name, (ROI_ABS,), attributes)
+        return Model
+    
+    # Function to dynamically create model class
+    def get_identity_model(suffix):
+        tablename = f'IDENTITY{suffix}'  # Adjust table name based on suffix
+        class_name = f'IDENTITY{suffix}'  # Similarly, adjust class name
 
-                id = db.Column(db.Integer, primary_key=True)
-                frame_number = db.Column(db.Integer)
-                in_frame_index = db.Column(db.Integer)
-                x = db.Column(db.Integer)
-                y = db.Column(db.Integer)
-                modified = db.Column(db.String(80))
-                fragment = db.Column(db.String(80))
-                area = db.Column(db.Integer)
-        else:
-            class ROI_0(db.Model):
-                __bind_key__ = key
-                __tablename__ = 'ROI_0_VAL'
-                __table_args__ = {'extend_existing': True}
-                # __tablename__ = f'roi_0_{key}'
-                id = db.Column(db.Integer, primary_key=True)
-                frame_number = db.Column(db.Integer)
-                in_frame_index = db.Column(db.Integer)
-                x = db.Column(db.Integer)
-                y = db.Column(db.Integer)
-                modified = db.Column(db.String(80))
-                area = db.Column(db.Integer)
+        # Conditionally add 'fragment' column based on the fragments flag
+        attributes = {'__tablename__': tablename, '__table_args__': {'extend_existing': True}}
 
 
-    else:
+        Model = type(class_name, (IDENTITY_ABS,), attributes)
+        return Model
+    
+    # Function to dynamically create model class
+    def get_concatenation_model(suffix):
+        tablename = f'CONCATENATION{suffix}'  # Adjust table name based on suffix
+        class_name = f'CONCATENATION{suffix}'  # Similarly, adjust class name
 
-        if fragments:
+        # Conditionally add 'fragment' column based on the fragments flag
+        attributes = {'__tablename__': tablename, '__table_args__': {'extend_existing': True}}
 
-            class ROI_0(db.Model):
-                __bind_key__ = key
-                __tablename__ = 'ROI_0'
-                __table_args__ = {'extend_existing': True}
 
-                id = db.Column(db.Integer, primary_key=True)
-                frame_number = db.Column(db.Integer)
-                in_frame_index = db.Column(db.Integer)
-                x = db.Column(db.Integer)
-                y = db.Column(db.Integer)
-                modified = db.Column(db.String(80))
-                fragment = db.Column(db.String(80))
-                area = db.Column(db.Integer)
-        else:
-            class ROI_0(db.Model):
-                __bind_key__ = key
-                __tablename__ = 'ROI_0'
-                __table_args__ = {'extend_existing': True}
-                # __tablename__ = f'roi_0_{key}'
-                id = db.Column(db.Integer, primary_key=True)
-                frame_number = db.Column(db.Integer)
-                in_frame_index = db.Column(db.Integer)
-                x = db.Column(db.Integer)
-                y = db.Column(db.Integer)
-                modified = db.Column(db.String(80))
-                area = db.Column(db.Integer)
+        Model = type(class_name, (CONCATENATION_ABS,), attributes)
+        return Model
+
+
+    ROI_0=get_roi_model(use_val, fragments=fragments)
+    IDENTITY=get_identity_model(use_val)
+    CONCATENATION=get_concatenation_model(use_val)
+
 
 
     class METADATA(db.Model):
@@ -116,58 +133,6 @@ def make_templates(db, key=None, fragments=False, use_val=True):
         # __tablename__ = f'metadata_{key}'
         field = db.Column(db.String(100), primary_key=True)
         value = db.Column(db.String(4000))
-
-    if use_val:        
-        class IDENTITY(db.Model):
-
-            __bind_key__ = key
-            __tablename__ = 'IDENTITY_VAL'
-            __table_args__ = {'extend_existing': True}
-            id = db.Column(db.Integer, primary_key=True)
-            frame_number = db.Column(db.Integer)
-            in_frame_index = db.Column(db.Integer)
-            local_identity = db.Column(db.Integer)
-            identity = db.Column(db.Integer)
-
-
-    else:
-        
-        class IDENTITY(db.Model):
-            __bind_key__ = key
-            __tablename__ = 'IDENTITY'
-            __table_args__ = {'extend_existing': True}
-            id = db.Column(db.Integer, primary_key=True)
-            frame_number = db.Column(db.Integer)
-            in_frame_index = db.Column(db.Integer)
-            local_identity = db.Column(db.Integer)
-            identity = db.Column(db.Integer)
-
-    if use_val:
-        class CONCATENATION(db.Model):
-            __bind_key__ = key
-            __table_args__ = {'extend_existing': True}
-            __tablename__ = 'CONCATENATION_VAL'
-            id = db.Column(db.Integer, primary_key=True)
-            chunk = db.Column(db.Integer)
-            local_identity = db.Column(db.Integer)
-            local_identity_after = db.Column(db.Integer)
-            is_inferred = db.Column(db.Integer)
-            is_broken = db.Column(db.Integer)
-
-
-    else:
-        
-        class CONCATENATION(db.Model):
-            __bind_key__ = key
-            __table_args__ = {'extend_existing': True}
-            __tablename__ = 'CONCATENATION'
-            id = db.Column(db.Integer, primary_key=True)
-            chunk = db.Column(db.Integer)
-            local_identity = db.Column(db.Integer)
-            local_identity_after = db.Column(db.Integer)
-            is_inferred = db.Column(db.Integer)
-            is_broken = db.Column(db.Integer)
-
 
     class AI(db.Model):
         __bind_key__ = key

@@ -9,14 +9,21 @@ import sqlite3
 import math
 import re
 
+import webcolors
 import cv2
 import numpy as np
 import pandas as pd
 from imgstore.interface import VideoCapture
 
+from idtrackerai.utils.py_utils import get_spaced_colors_util
 from idtrackerai.animals_detection.segmentation import _process_frame
 
 logger=logging.getLogger(__name__)
+
+RED=webcolors.name_to_rgb("red")[::-1]
+GREEN=webcolors.name_to_rgb("green")[::-1]
+BLACK=webcolors.name_to_rgb("black")[::-1]
+
 
 def process_config(config):
 
@@ -40,6 +47,17 @@ def process_config(config):
 
 
 def process_frame(frame, config):
+    """
+    Generate the contours that idtrackerai would obtain using the passed config
+
+    Arguments:
+
+        frame (np.ndarray):
+        config (dict): idtrackerai config
+
+    Returns
+        contour_list (list): List of contours. See draw_frame on how to draw them on the frame
+    """
     config=process_config(config)
 
     roi_mask = np.zeros_like(frame)
@@ -67,6 +85,79 @@ def process_frame(frame, config):
 
     contours_list = [contour.tolist() for contour in contours]
     return contours_list
+
+
+
+def annotate_text(frame, color, text, org, fontScale=1):
+
+    fontScale = 1
+    thickness = 2
+    fontFace = cv2.FONT_HERSHEY_SIMPLEX
+
+    textSize = cv2.getTextSize(text, fontFace, fontScale, thickness)[0]
+
+    # Calculate the box in which the text will be placed (x, y, w, h)
+    text_box = (org[0], org[1] - textSize[1], textSize[0], textSize[1])
+
+    # Adjust the top-left corner to draw the rectangle
+    rect_top_left = (text_box[0], text_box[1] - 5)  # Adjusted for padding
+    rect_bottom_right = (text_box[0] + text_box[2], text_box[1] + text_box[3] + 10)  # Adjusted for padding
+
+    # Draw a white rectangle
+    cv2.rectangle(frame, rect_top_left, rect_bottom_right, (255, 255, 255), cv2.FILLED)
+
+    # Then, put the text on the image
+    frame = cv2.putText(frame, text, org, fontFace, fontScale, color, thickness)
+
+    return frame
+    
+def annotate_frame(frame, row):
+    if row["yolov7_qc"]:
+        frame=annotate_text(frame, BLACK, "YOLOv7", (10, 50))
+    else:
+        frame=annotate_text(frame, RED, "YOLOv7", (10, 50))
+    
+    if row["inter_qc"]:
+        frame=annotate_text(frame, BLACK, "Fragments", (10, 100))
+    else:
+        frame=annotate_text(frame, RED, "Fragments", (10, 100))
+
+    chunk=row["chunk"]
+    frame_number=row["frame_number"]
+    frame=annotate_text(frame, BLACK, f"{str(chunk).zfill(6)} - {frame_number}", (700, 50), fontScale=.3)
+
+    return frame
+
+
+
+def draw_frame(frame, tracking_data, number_of_animals, blobs=None, field="identity"):
+    colors=get_spaced_colors_util(number_of_animals, black=False)
+
+    for i, row in tracking_data.iterrows():
+        org=(int(row["x"]), int(row["y"]))
+        identity=int(row[field])
+        fragment=int(row["fragment"])
+        if identity<=0:
+            color=(0, 0, 0)
+        else:
+            color=colors[identity-1]
+    
+        frame=cv2.putText(
+            frame, text=f"{identity} ({fragment})",
+            org=org,
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            thickness=2,
+            color=color,
+            fontScale=1,
+        )
+
+    if blobs:
+        for blob in blobs:
+            # TODO
+            pass
+    
+    return frame
+
 
 
 def filter_by_date(experiment):
@@ -112,7 +203,6 @@ def load_flyhostel_metadata(basedir_suffix, db_manager):
         logger.error(error)
         logger.error(traceback.print_exc())
         print(basedir_suffix)
-        import ipdb; ipdb.set_trace()
         metadata = (None, None, None)
 
     return metadata
@@ -136,10 +226,15 @@ def load_experiment(basedir_suffix, chunk, db_manager):
         logger.error(f"Could not load VideoCapture {store_path}")
         metadata=(None, None, None)
     else:
-        metadata=load_flyhostel_metadata(basedir_suffix, db_manager)
-        chunksize=metadata[1]
-        frame_number = chunksize * chunk
-        frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
+        try:
+
+            metadata=load_flyhostel_metadata(basedir_suffix, db_manager)
+            chunksize=metadata[1]
+            frame_number = chunksize * chunk
+            frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
+        except Exception as error:
+            logger.error("Cannot load %s", basedir_suffix)
+            raise error
 
     return {"message": "success"}, cap , metadata, idtrackerai_config
 
@@ -173,4 +268,3 @@ def str2pandas(string):
         filehandle.write(string)
 
     return pd.read_csv(temp_file.name, index_col=0)
-
