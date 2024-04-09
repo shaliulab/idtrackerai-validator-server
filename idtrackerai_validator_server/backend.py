@@ -196,7 +196,7 @@ def load_idtrackerai_config(basedir):
     return idtrackerai_config
 
 def load_flyhostel_metadata(basedir_suffix, db_manager):
-    metadata_table=db_manager.get_tables(basedir_suffix)["METADATA"]
+    metadata_table=db_manager.tables["METADATA"]
     try:
         metadata=load_experiment_metadata(metadata_table)
     except Exception as error:

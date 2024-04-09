@@ -2,53 +2,22 @@ import logging
 
 logger=logging.getLogger(__name__)
 
-from idtrackerai_validator_server.backend import generate_database_filename, list_experiments
 from flyhostel.data.human_validation.utils import check_if_validated
 
 
 class DatabaseManager:
-    def __init__(self, app, db, with_fragments=True):
+    def __init__(self, app, db, experiment, with_fragments=True):
         self.app = app
         self.db = db
-        self.database_uris = {}
-        self.experiment=None
-        self.init_database_uris()
-        self.tables={}
         self.with_fragments=with_fragments
         self.dbfile=app.config['SQLALCHEMY_DATABASE_URI'].replace("sqlite:///", "")
         self.use_val=check_if_validated(self.dbfile)
         logger.debug("dbfile %s", self.dbfile)
-
-    def init_database_uris(self):
-        experiments = list_experiments()["experiments"]
-        for experiment in experiments:
-            db_uri = f'sqlite:///{generate_database_filename(experiment)}'
-            self.database_uris[experiment] = db_uri
-
-    def get_tables(self, experiment):
-        if self.experiment is None or self.experiment != experiment:
-            logger.warning("Switching %s for %s", self.experiment, experiment)
-            self.switch_database(experiment)
-            logger.debug("Making templates")
-            self.tables=make_templates(self.db, experiment, fragments=self.with_fragments, use_val=self.use_val)
-            self.experiment=experiment
-        
-        elif self.experiment==experiment:
-            pass
-
-        return self.tables
-            
-
-    def switch_database(self, experiment):
-        if experiment in self.database_uris:
-            logger.debug("Setting URI to %s", self.database_uris[experiment])
-            self.app.config['SQLALCHEMY_DATABASE_URI'] = self.database_uris[experiment]
-            self.dbfile=self.app.config['SQLALCHEMY_DATABASE_URI'].replace("sqlite:///", "")
-            self.use_val=check_if_validated(self.dbfile)
-            self.db.engine.dispose()  # Dispose the current engine
-            self.db.create_all()      # Reflect new database
-
-    # Additional methods as needed for database operations
+        single_housed="1X" in self.dbfile    
+        if not self.use_val=="_VAL" and not single_housed:
+            logger.warning("%s not validated", self.dbfile)
+        self.tables=make_templates(self.db, experiment, fragments=self.with_fragments, use_val=self.use_val)
+        self.experiment=experiment            
 
 
 def make_templates(db, key=None, fragments=False, use_val="_VAL"):
@@ -124,8 +93,6 @@ def make_templates(db, key=None, fragments=False, use_val="_VAL"):
     ROI_0=get_roi_model(use_val, fragments=fragments)
     IDENTITY=get_identity_model(use_val)
     CONCATENATION=get_concatenation_model(use_val)
-
-
 
     class METADATA(db.Model):
         __bind_key__ = key

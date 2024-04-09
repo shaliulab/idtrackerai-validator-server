@@ -1,5 +1,4 @@
 import os
-import glob
 import shutil
 import time
 from threading import Lock
@@ -14,10 +13,10 @@ from sqlalchemy.orm import Session
 from flask import session
 
 from idtrackerai_validator_server.constants import (
-    WITH_FRAGMENTS, DEFAULT_EXPERIMENT, first_chunk, FRAMES_DIR, database_pattern
+    WITH_FRAGMENTS, first_chunk, FRAMES_DIR
 )
 from idtrackerai_validator_server.database import DatabaseManager
-from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, list_experiments, process_frame
+from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, process_frame
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -25,6 +24,11 @@ logger=logging.getLogger(__name__)
 logging.getLogger("idtrackerai_validator_server.backend").setLevel(logging.DEBUG)
 logging.getLogger("imgstore").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers").setLevel(logging.WARNING)
+
+try:
+    SELECTED_EXPERIMENT=os.environ["VALIDATOR_EXPERIMENT"]
+except KeyError:
+    raise Exception("Please define VALIDATOR_EXPERIMENT to the path to some flyhostel experiment")
 
 lock=Lock()
 
@@ -38,104 +42,31 @@ if os.path.exists(FRAMES_DIR):
     shutil.rmtree(FRAMES_DIR)
 
 # Database configuration
-basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], DEFAULT_EXPERIMENT)
-try:
-    pattern=os.path.join(basedir, database_pattern)
-    database_file = glob.glob(pattern)[0]
-except IndexError as error:
-    app.logger.error("%s not found", pattern)
-
-EXPERIMENTS = list_experiments()["experiments"]
-
+database_file=generate_database_filename(SELECTED_EXPERIMENT)
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{database_file}"
 app.config['SQLALCHEMY_BINDS'] = {
-    basedir_suffix: f'sqlite:///{generate_database_filename(basedir_suffix)}'
-    for basedir_suffix in EXPERIMENTS
+    SELECTED_EXPERIMENT: f"sqlite:///{database_file}"
 }
-
-print(app.config['PERMANENT_SESSION_LIFETIME'])
-
 db=SQLAlchemy(app)
-db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS)
+db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT)
 
 # Load default dataset
 with app.app_context():
-    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(DEFAULT_EXPERIMENT, first_chunk, db_manager)
+    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
     offset, CHUNKSIZE, FRAMERATE=experiment_metadata
-    SELECTED_EXPERIMENT=DEFAULT_EXPERIMENT
     frame = None
     contours=None
 
 
+@app.route("/", methods=["GET"])
+def get():
+    return jsonify({"message": "success"})
+
 
 @app.route("/api/list", methods=["GET"])
 def list():
-    return jsonify(list_experiments())
-
-
-@app.route("/api/get/<experiment>", methods=['GET'])
-def get(experiment):
-    """
-    Reload the VideoCapture
-    """
-    global cap
-    global offset
     global SELECTED_EXPERIMENT
-
-
-    tokens=experiment.split("_")
-    tokens[0]="FlyHostel" + tokens[0][9:]
-    basedir_suffix="/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
-
-    if basedir_suffix==SELECTED_EXPERIMENT:
-        app.logger.debug("Requested experiment is already loaded, (%s == %s)", basedir_suffix, SELECTED_EXPERIMENT)
-        return jsonify({"message": "success"})
-   
-    if cap is not None:
-            cap.release()
-            time.sleep(1)
-        
-    app.logger.info("Loading %s", basedir_suffix)
-
-    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(basedir_suffix, first_chunk, db_manager)
-    
-    offset, session["chunksize"], session["framerate"]=experiment_metadata
-    assert IDTRACKERAI_CONFIG is not None
-
-    if cap is not None:
-        SELECTED_EXPERIMENT=basedir_suffix
-        logger.debug("Setting active experiment to %s", basedir_suffix)
-    else:
-        logger.error("Could not load %s, selected experiment remains %s", basedir_suffix, SELECTED_EXPERIMENT)
-    return jsonify(out)
-
-
-@app.route("/api/load", methods=['POST'])
-def load():
-    """
-    Reload the VideoCapture
-    """
-    global cap
-    global offset
-    global SELECTED_EXPERIMENT
-
-    basedir_suffix = request.json.get('experiment', None)
-    
-    if cap is not None:
-            cap.release()
-
-    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(basedir_suffix, first_chunk, db_manager)
-    (offset, session["chunksize"], session["framerate"])=experiment_metadata
-    assert IDTRACKERAI_CONFIG is not None
-
-    if cap is None:
-        logger.warning("VideoCapture object for experiment %s could not be initialized", basedir_suffix)
-    else:
-        SELECTED_EXPERIMENT=basedir_suffix
-        logger.debug("Setting active experiment to %s", basedir_suffix)
-
-    return jsonify(out)
-
+    return jsonify({"experiments": SELECTED_EXPERIMENT})
 
 def row2dict(row):
     d = {}
@@ -185,7 +116,7 @@ def get_preprocess(frame_number):
 def get_tracking(frame_number):
     global SELECTED_EXPERIMENT
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
-    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+    tables = db_manager.tables
 
     try:
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
@@ -262,7 +193,7 @@ def get_next_ai(frame_number):
 
 def get_first_non_zero_frame(sql_session: Session, frame_number: int, direction=True):
     global SELECTED_EXPERIMENT
-    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+    tables = db_manager.tables
 
     if direction == "next":
         filter_condition = tables["IDENTITY"].frame_number > frame_number
@@ -323,7 +254,7 @@ def get_ok(frame_number, direction):
 def get_error(frame_number, direction):
 
     global SELECTED_EXPERIMENT
-    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+    tables = db_manager.tables
 
     if direction=="next":
         query=tables["IDENTITY"].query.filter(tables["IDENTITY"].frame_number>frame_number, tables["IDENTITY"].identity==0)
@@ -344,7 +275,7 @@ def get_error(frame_number, direction):
 
 def get_ai(frame_number, direction):
     global SELECTED_EXPERIMENT
-    tables = db_manager.get_tables(SELECTED_EXPERIMENT)
+    tables = db_manager.tables
 
     if direction=="next":
         query=tables["AI"].query.filter(tables["AI"].frame_number>frame_number)
