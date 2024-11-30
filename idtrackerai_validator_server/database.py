@@ -6,18 +6,27 @@ from flyhostel.data.human_validation.utils import check_if_validated
 
 
 class DatabaseManager:
-    def __init__(self, app, db, experiment, with_fragments=True):
+
+    def __init__(self, app, db, experiment, with_fragments=True, use_val=None):
         self.app = app
         self.db = db
         self.with_fragments=with_fragments
         self.dbfile=app.config['SQLALCHEMY_DATABASE_URI'].replace("sqlite:///", "")
-        self.use_val=check_if_validated(self.dbfile)
+        print(f"Opening {self.dbfile}")
+        if use_val is None:
+            self.use_val=check_if_validated(self.dbfile)
+        else:
+            if use_val:
+                self.use_val="_VAL"
+            else:
+                self.use_val=""
+
         logger.debug("dbfile %s", self.dbfile)
         single_housed="1X" in self.dbfile    
         if not self.use_val=="_VAL" and not single_housed:
             logger.warning("%s not validated", self.dbfile)
         self.tables=make_templates(self.db, experiment, fragments=self.with_fragments, use_val=self.use_val)
-        self.experiment=experiment            
+        self.experiment=experiment
 
 
 def make_templates(db, key=None, fragments=False, use_val="_VAL"):

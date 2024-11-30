@@ -1,5 +1,6 @@
 import os
 import shutil
+import argparse
 import time
 from threading import Lock
 import logging
@@ -30,6 +31,10 @@ try:
 except KeyError:
     raise Exception("Please define VALIDATOR_EXPERIMENT to the path to some flyhostel experiment")
 
+USE_VAL=os.environ.get("USE_VAL", None)
+if USE_VAL is not None:
+    USE_VAL=USE_VAL=="True"
+
 lock=Lock()
 
 # Initialize application with CORS settings
@@ -48,7 +53,8 @@ app.config['SQLALCHEMY_BINDS'] = {
     SELECTED_EXPERIMENT: f"sqlite:///{database_file}"
 }
 db=SQLAlchemy(app)
-db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT)
+db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
+print(f"Validation status: {db_manager.use_val}")
 
 # Load default dataset
 with app.app_context():
@@ -117,6 +123,7 @@ def get_tracking(frame_number):
     global SELECTED_EXPERIMENT
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables
+    print(tables["ROI_0"], tables["IDENTITY"])
 
     try:
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
@@ -135,6 +142,11 @@ def get_tracking(frame_number):
 
             if not hit:
                 identity = None
+
+            if row.modified is None:
+                modified=0
+            else:
+                modified=row.modified
             
             data={
                 "frame_number": frame_number,
@@ -146,17 +158,20 @@ def get_tracking(frame_number):
                 "area": row.area,
                 "identity": identity,
                 "local_identity": local_identity,
-                "modified": row.modified,
+                "modified": modified,
             }
 
             number_of_animals+=1
             out.append(data)
+        out=sorted(out, key=lambda x: x["identity"])
     except Exception as error:
         app.logger.error(error)
         out= []
     
     if number_of_animals==0:
         app.logger.warning("No animals found for frame %s", frame_number)
+    else:
+        app.logger.info("Number of animals found = %s", number_of_animals)
 
     # app.logger.debug("Sending %s", out)
     return jsonify(out)
@@ -296,5 +311,15 @@ def get_ai(frame_number, direction):
     return jsonify({"frame_number": frame_number, "ai": ai})
 
 
+def get_parser():
+
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--port", default=5000, type=int)
+    ap.add_argument("--host",default="0.0.0.0")
+    return ap
+
 if __name__ == "__main__":
-    app.run(port=5000, host="0.0.0.0", debug=True)  # or set debug=False for production
+
+    ap=get_parser()
+    args=ap.parse_args()
+    app.run(port=args.port, host=args.host, debug=True)  # or set debug=False for production
