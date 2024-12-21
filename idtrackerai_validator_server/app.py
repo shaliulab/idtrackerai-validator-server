@@ -2,6 +2,7 @@ import os
 import shutil
 import argparse
 import time
+import re
 from threading import Lock
 import logging
 from flask import Flask, jsonify, request, send_from_directory
@@ -121,6 +122,7 @@ def get_preprocess(frame_number):
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
     global SELECTED_EXPERIMENT
+    number_of_animals=int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables
     print(tables["ROI_0"], tables["IDENTITY"])
@@ -129,7 +131,7 @@ def get_tracking(frame_number):
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
         out=[]
         identity_table=tables["IDENTITY"].query.filter_by(frame_number=frame_number)
-        number_of_animals=0
+        number_of_animals_found=0
 
         for row in output.all():
             identity=None
@@ -161,20 +163,21 @@ def get_tracking(frame_number):
                 "modified": modified,
             }
 
-            number_of_animals+=1
+            number_of_animals_found+=1
             out.append(data)
         out=sorted(out, key=lambda x: x["identity"])
     except Exception as error:
         app.logger.error(error)
         out= []
     
-    if number_of_animals==0:
+    if number_of_animals_found==0:
         app.logger.warning("No animals found for frame %s", frame_number)
     else:
-        app.logger.info("Number of animals found = %s", number_of_animals)
+        app.logger.info("Number of animals found = %s", number_of_animals_found)
 
     # app.logger.debug("Sending %s", out)
-    return jsonify(out)
+    data={"tracking_data": out, "number_of_animals": number_of_animals}
+    return jsonify(data)
 
 
 @app.route('/api/prev_error/<int:frame_number>', methods=['GET'])
