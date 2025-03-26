@@ -136,7 +136,11 @@ def draw_frame(frame, tracking_data, number_of_animals, blobs=None, field="ident
     for i, row in tracking_data.iterrows():
         org=(int(row["x"]), int(row["y"]))
         identity=int(row[field])
-        fragment=int(row["fragment"])
+        try:
+            fragment=int(row["fragment"])
+        except ValueError:
+            fragment="NaN"
+
         if identity<=0:
             color=(0, 0, 0)
         else:
@@ -246,7 +250,7 @@ def load_experiment_metadata(table):
 
     ethoscope_metadata=out.all()[0].value
     ethoscope_metadata=str2pandas(ethoscope_metadata)
-    assert ethoscope_metadata.shape[0] > 0, f"Ethoscope metadata has no data in"
+    assert ethoscope_metadata.shape[0] > 0, f"Ethoscope metadata is empty"
     reference_hour=ethoscope_metadata["reference_hour"].values
     assert np.all(np.diff(reference_hour) == 0)
     reference_hour=reference_hour[0].item()

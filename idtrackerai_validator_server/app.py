@@ -9,6 +9,8 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from flask import g
 from flask_sqlalchemy import SQLAlchemy
+import numpy as np
+import pandas as pd
 import cv2
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -19,6 +21,7 @@ from idtrackerai_validator_server.constants import (
 )
 from idtrackerai_validator_server.database import DatabaseManager
 from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, process_frame
+from flyhostel.utils import get_basedir
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -179,6 +182,15 @@ def get_tracking(frame_number):
     data={"tracking_data": out, "number_of_animals": number_of_animals}
     return jsonify(data)
 
+@app.route('/api/prev_rejection/<int:frame_number>', methods=['GET'])
+def get_prev_rejection(frame_number):
+    return get_rejection(frame_number, "previous")
+
+
+@app.route('/api/next_rejection/<int:frame_number>', methods=['GET'])
+def get_next_rejection(frame_number):
+    return get_rejection(frame_number, "next")
+
 
 @app.route('/api/prev_error/<int:frame_number>', methods=['GET'])
 def get_prev_error(frame_number):
@@ -267,6 +279,37 @@ def get_ok(frame_number, direction):
     frame_number= get_first_non_zero_frame(db.session, frame_number, direction)
     logger.debug("get_ok %s", frame_number)
     return jsonify({"frame_number": frame_number})
+
+def get_rejection(frame_number, direction):
+
+    global SELECTED_EXPERIMENT
+    experiment=SELECTED_EXPERIMENT.replace("/", "_")
+    csv_file=os.path.join(
+        get_basedir(experiment), "interactions", f"{experiment}_rejections.csv"
+    )
+    rejections=pd.read_csv(csv_file)
+
+    frames_with_rejection=rejections["first_frame"].values
+    diff=frames_with_rejection-frame_number
+
+    try:
+        if direction=="next":
+            frames_with_rejection=frames_with_rejection[diff>0]
+            diff=diff[diff>0]
+            fn=frames_with_rejection[np.argmin(diff)]
+        elif direction=="previous":
+            frames_with_rejection=frames_with_rejection[diff<0]
+            diff=diff[diff<0]
+            fn=frames_with_rejection[np.argmin(-diff)]
+    except KeyError:
+        logger.warning("Cannot find %s rejection", direction)
+        fn=frame_number
+    except FileNotFoundError as error:
+        logger.warning(error)
+        fn=frame_number
+
+
+    return jsonify({"frame_number": int(fn)})
 
 
 def get_error(frame_number, direction):

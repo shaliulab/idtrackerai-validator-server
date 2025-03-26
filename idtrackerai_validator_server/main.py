@@ -3,7 +3,6 @@ import shlex
 import pathlib
 import os.path
 import sys
-import os.path
 python_bin=os.path.join(sys.prefix, "bin", "python")
 
 def main():
@@ -13,7 +12,7 @@ def main():
 
     cmd=shlex.split(
         f"""
-        {python_bin} {executable} -m flask run --host \\"0.0.0.0\\" --port 5000
+        {python_bin} {executable} -m flask run --host \\"0.0.0.0\\" --port {os.environ.get('BACKEND_PORT', 5000)}
         """
     )
 
