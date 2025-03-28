@@ -21,7 +21,10 @@ from idtrackerai_validator_server.constants import (
 )
 from idtrackerai_validator_server.database import DatabaseManager
 from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, process_frame
-from flyhostel.utils import get_basedir
+from flyhostel.utils import (
+    get_basedir,
+    get_identities
+)
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -57,6 +60,8 @@ app.config['SQLALCHEMY_BINDS'] = {
     SELECTED_EXPERIMENT: f"sqlite:///{database_file}"
 }
 db=SQLAlchemy(app)
+
+
 db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
 print(f"Validation status: {db_manager.use_val}")
 
@@ -65,7 +70,7 @@ with app.app_context():
     out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
     offset, CHUNKSIZE, FRAMERATE=experiment_metadata
     frame = None
-    contours=None
+    contours=[]
 
 
 @app.route("/", methods=["GET"])
@@ -92,8 +97,14 @@ def get_frame(frame_number):
     global frame
     global contours
 
+    if frame is None:
+        empty_frame=np.ones((1000, 1000), np.uint8)*255
+    else:
+        empty_frame=np.ones_like(frame, np.uint8)*255
+
+
     if cap is None:
-        return jsonify({'error': 'Cap could not be loaded'}), 404 
+        return jsonify({'error': 'Cap could not be loaded'}), 404
 
     app.logger.debug(f"Fetching frame {frame_number}")
     lock.acquire()
@@ -103,10 +114,17 @@ def get_frame(frame_number):
     filename=f"{frame_number}.jpg"
     img_path = os.path.join(FRAMES_DIR, filename)
     os.makedirs(os.path.dirname(img_path), exist_ok=True)
-    cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-    assert os.path.exists(img_path), f"Could not save {img_path}"
-    app.logger.debug(f"{cap._basedir} -> {img_path}")
-    contours=process_frame(frame, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
+    try:
+        cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])       
+        assert os.path.exists(img_path), f"Could not save {img_path}"
+        app.logger.debug(f"{cap._basedir} -> {img_path}")
+        contours=process_frame(frame, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
+        
+    except Exception as error:
+        contours=[]
+        logger.error(error)
+        cv2.imwrite(img_path, empty_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])       
+
 
     if frame is None:
         return jsonify({'error': 'Frame not found'}), 404
@@ -121,14 +139,38 @@ def get_preprocess(frame_number):
     global contours
     return jsonify({"contours": contours})
 
+
+def get_pose(db_manager, frame_number):
+    identities=get_identities(SELECTED_EXPERIMENT.replace("/", "_"))
+    pose={}
+    for identity in identities:
+        pose[str(identity)]=db_manager.get_pose_for_animal(identity, frame_number)
+    return pose
+
+def project_to_absolute(pose, centroids):
+    centroids_coords={}
+    for centroid in centroids:
+        centroids_coords[str(centroid["identity"])]=(centroid["x"], centroid["y"])
     
+    pose_abs={}
+    for identity in centroids_coords:
+        pose_={}
+        for bodypart in pose[identity]:
+            if any((coord is None for coord in pose[identity][bodypart])):
+                pose_[bodypart]=(None, None)
+            else:
+                pose_[bodypart]=np.round(np.array(pose[identity][bodypart])-50 + centroids_coords[identity]).tolist()
+        
+        pose_abs[identity]=pose_
+    return pose_abs
+
+
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
     global SELECTED_EXPERIMENT
     number_of_animals=int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables
-    print(tables["ROI_0"], tables["IDENTITY"])
 
     try:
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
@@ -178,8 +220,10 @@ def get_tracking(frame_number):
     else:
         app.logger.info("Number of animals found = %s", number_of_animals_found)
 
-    # app.logger.debug("Sending %s", out)
-    data={"tracking_data": out, "number_of_animals": number_of_animals}
+
+    pose=get_pose(db_manager, frame_number)
+    pose_absolute=project_to_absolute(pose, out)
+    data={"tracking_data": out, "number_of_animals": number_of_animals, "pose": pose_absolute}
     return jsonify(data)
 
 @app.route('/api/prev_rejection/<int:frame_number>', methods=['GET'])
@@ -288,25 +332,26 @@ def get_rejection(frame_number, direction):
         get_basedir(experiment), "interactions", f"{experiment}_rejections.csv"
     )
     rejections=pd.read_csv(csv_file)
-
     frames_with_rejection=rejections["first_frame"].values
     diff=frames_with_rejection-frame_number
+    fn=frame_number
 
     try:
         if direction=="next":
             frames_with_rejection=frames_with_rejection[diff>0]
             diff=diff[diff>0]
-            fn=frames_with_rejection[np.argmin(diff)]
+            index=np.argmin(diff)
+            fn=frames_with_rejection[index]
+
         elif direction=="previous":
             frames_with_rejection=frames_with_rejection[diff<0]
             diff=diff[diff<0]
-            fn=frames_with_rejection[np.argmin(-diff)]
+            index=np.argmin(-diff)
+            fn=frames_with_rejection[index]
     except KeyError:
         logger.warning("Cannot find %s rejection", direction)
-        fn=frame_number
     except FileNotFoundError as error:
         logger.warning(error)
-        fn=frame_number
 
 
     return jsonify({"frame_number": int(fn)})
