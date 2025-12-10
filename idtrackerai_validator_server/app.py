@@ -1,7 +1,6 @@
 import os
 import shutil
 import argparse
-import time
 import re
 from threading import Lock
 import logging
@@ -10,19 +9,18 @@ from flask_cors import CORS
 from flask import g
 from flask_sqlalchemy import SQLAlchemy
 import numpy as np
-import pandas as pd
 import cv2
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from flask import session
 
 from idtrackerai_validator_server.constants import (
-    WITH_FRAGMENTS, first_chunk, FRAMES_DIR
+    WITH_FRAGMENTS, first_chunk, FRAMES_DIR, INCLUDE_POSE
 )
 from idtrackerai_validator_server.database import DatabaseManager
 from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, process_frame
+from idtrackerai_validator_server.utils import load_rejections
 from flyhostel.utils import (
-    get_basedir,
     get_identities
 )
 
@@ -34,7 +32,13 @@ logging.getLogger("imgstore").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers").setLevel(logging.WARNING)
 
 try:
-    SELECTED_EXPERIMENT=os.environ["VALIDATOR_EXPERIMENT"]
+    SELECTED_EXPERIMENT_=os.environ["VALIDATOR_EXPERIMENT"]
+    if "/" not in SELECTED_EXPERIMENT_:
+        tokens=SELECTED_EXPERIMENT_.split("_")
+        SELECTED_EXPERIMENT="/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
+    else:
+        SELECTED_EXPERIMENT=SELECTED_EXPERIMENT_
+
 except KeyError:
     raise Exception("Please define VALIDATOR_EXPERIMENT to the path to some flyhostel experiment")
 
@@ -89,6 +93,12 @@ def row2dict(row):
         d[column.name] = getattr(row, column.name)
     return d
 
+@app.route("/api/framerate", methods=['GET'])
+def get_framerate():
+    global SELECTED_EXPERIMENT
+    tables = db_manager.tables
+    framerate=tables["METADATA"].query.filter_by(field="framerate").first().value
+    return framerate
 
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
 def get_frame(frame_number):
@@ -106,11 +116,25 @@ def get_frame(frame_number):
     if cap is None:
         return jsonify({'error': 'Cap could not be loaded'}), 404
 
-    app.logger.debug(f"Fetching frame {frame_number}")
     lock.acquire()
-    frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
+    try:
+        assert frame_number is not None
+        app.logger.warning(f"frame_number = {frame_number}")
+
+        app.logger.debug(f"Fetching frame {frame_number}")
+        frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
+        app.logger.debug(f"Fetching frame {frame_number} done")
+
+    except ValueError or AssertionError as error:
+        frame=empty_frame.copy()
+        frame_number=first_chunk*CHUNKSIZE
+        frame_timestamp=0
+        app.logger.error(f"Can't fetch frame {frame_number}")
+        app.logger.error(error)
+
     lock.release()
-    app.logger.debug(f"Fetching frame {frame_number} done")
+
+    # frame=cv2.resize(frame, (1000, 1000))
     filename=f"{frame_number}.jpg"
     img_path = os.path.join(FRAMES_DIR, filename)
     os.makedirs(os.path.dirname(img_path), exist_ok=True)
@@ -155,6 +179,8 @@ def project_to_absolute(pose, centroids):
     pose_abs={}
     for identity in centroids_coords:
         pose_={}
+        if identity not in pose:
+            continue
         for bodypart in pose[identity]:
             if any((coord is None for coord in pose[identity][bodypart])):
                 pose_[bodypart]=(None, None)
@@ -173,6 +199,9 @@ def get_tracking(frame_number):
     tables = db_manager.tables
 
     try:
+
+        chunksize=tables["METADATA"].query.filter_by(field="chunksize").all()[0].value
+
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
         out=[]
         identity_table=tables["IDENTITY"].query.filter_by(frame_number=frame_number)
@@ -195,9 +224,16 @@ def get_tracking(frame_number):
             else:
                 modified=row.modified
             
+            t = frame_number/session.get("framerate", FRAMERATE) + offset
+            hours=str(int(t // 3600)).zfill(2)
+            minutes=str(int((t % 3600)//60)).zfill(2)
+            seconds=str(int(t % 60)).zfill(2)
+            zt = f"{hours}:{minutes}:{seconds}"
+    
             data={
                 "frame_number": frame_number,
-                "t": frame_number/session.get("framerate", FRAMERATE) + offset,
+                "t": t,
+                "ZT": zt,
                 "x": row.x,
                 "y": row.y,
                 "in_frame_index": row.in_frame_index,
@@ -206,6 +242,7 @@ def get_tracking(frame_number):
                 "identity": identity,
                 "local_identity": local_identity,
                 "modified": modified,
+                "chunksize": chunksize,
             }
 
             number_of_animals_found+=1
@@ -221,9 +258,12 @@ def get_tracking(frame_number):
         app.logger.info("Number of animals found = %s", number_of_animals_found)
 
 
-    pose=get_pose(db_manager, frame_number)
-    pose_absolute=project_to_absolute(pose, out)
-    data={"tracking_data": out, "number_of_animals": number_of_animals, "pose": pose_absolute}
+    if INCLUDE_POSE:
+        pose=get_pose(db_manager, frame_number)
+        pose_absolute=project_to_absolute(pose, out)
+    else:
+        pose_absolute={}
+        data={"tracking_data": out, "number_of_animals": number_of_animals, "pose": pose_absolute}
     return jsonify(data)
 
 @app.route('/api/prev_rejection/<int:frame_number>', methods=['GET'])
@@ -324,19 +364,20 @@ def get_ok(frame_number, direction):
     logger.debug("get_ok %s", frame_number)
     return jsonify({"frame_number": frame_number})
 
+
 def get_rejection(frame_number, direction):
 
     global SELECTED_EXPERIMENT
     experiment=SELECTED_EXPERIMENT.replace("/", "_")
-    csv_file=os.path.join(
-        get_basedir(experiment), "interactions", f"{experiment}_rejections.csv"
-    )
-    rejections=pd.read_csv(csv_file)
-    frames_with_rejection=rejections["first_frame"].values
-    diff=frames_with_rejection-frame_number
-    fn=frame_number
 
+    fn=frame_number
+    
     try:
+        rejections, features=load_rejections(experiment)
+
+        frames_with_rejection=rejections["first_frame"].values
+        diff=frames_with_rejection-frame_number
+
         if direction=="next":
             frames_with_rejection=frames_with_rejection[diff>0]
             diff=diff[diff>0]

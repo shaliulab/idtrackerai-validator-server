@@ -237,6 +237,7 @@ def load_experiment(basedir_suffix, chunk, db_manager):
             frame_number = chunksize * chunk
             frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
         except Exception as error:
+            logger.error(error)
             logger.error("Cannot load %s", basedir_suffix)
             raise error
 

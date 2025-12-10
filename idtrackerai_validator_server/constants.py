@@ -5,3 +5,5 @@ SELECTED_EXPERIMENT=DEFAULT_EXPERIMENT
 database_pattern="FlyHostel*.db"
 FRAMES_DIR="./frames"
 WITH_FRAGMENTS=True
+INCLUDE_POSE=False
+POSE_NAME="raw"

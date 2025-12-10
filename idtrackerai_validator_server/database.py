@@ -5,8 +5,8 @@ from flyhostel.utils import (
     get_pose_file,
     get_identities
 )
-from flyhostel.data.pose.loaders.movement import from_sleap_file
-POSE_NAME="raw"
+
+from idtrackerai_validator_server.constants import INCLUDE_POSE, POSE_NAME
 logger = logging.getLogger(__name__)
 
 
@@ -60,12 +60,17 @@ class DatabaseManager:
         self.pose_data = {}
 
         identities=get_identities(experiment.replace("/", "_"))
-        pose_files={
-            identity: get_pose_file(experiment.replace("/", "_"), identity, pose_name=POSE_NAME)
-            for identity in identities
-        }
+        if INCLUDE_POSE:
+            pose_files={
+                identity: get_pose_file(experiment.replace("/", "_"), identity, pose_name=POSE_NAME)
+                for identity in identities
+            }
+        else:
+            pose_files={}
 
         if pose_files:
+            raise NotImplementedError
+            # need to reimplement from_sleap_file or something equivalent
             # If pose_files is a dictionary mapping animal_id to file path:
             if isinstance(pose_files, dict):
                 for identity, file_path in pose_files.items():
