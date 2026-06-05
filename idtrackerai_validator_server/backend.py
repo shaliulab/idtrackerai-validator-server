@@ -23,6 +23,7 @@ logger=logging.getLogger(__name__)
 RED=webcolors.name_to_rgb("red")[::-1]
 GREEN=webcolors.name_to_rgb("green")[::-1]
 BLACK=webcolors.name_to_rgb("black")[::-1]
+DEFAULT_REFERENCE_HOUR=13
 
 
 def process_config(config):
@@ -111,26 +112,49 @@ def annotate_text(frame, color, text, org, fontScale=1):
 
     return frame
     
-def annotate_frame(frame, row):
-    if row["yolov7_qc"]:
+def annotate_frame(frame, data):
+    """
+    Annotate why is the frame marked for validation
+
+    Arguments:
+
+        frame (np.array): Original frame from the experiment
+        data (dict-like): Contains
+                yolov7_qc
+                inter_qc
+                frame_number
+                chunk
+    
+    Return:
+
+        frame (np.array): The same frame but now has a text banner
+        that tells the user why the frame was marked 
+    """
+
+    if data["yolov7_qc"]:
         frame=annotate_text(frame, BLACK, "YOLOv7", (10, 50))
     else:
         frame=annotate_text(frame, RED, "YOLOv7", (10, 50))
     
-    if row["inter_qc"]:
+    if data["inter_qc"]:
         frame=annotate_text(frame, BLACK, "Fragments", (10, 100))
     else:
         frame=annotate_text(frame, RED, "Fragments", (10, 100))
 
-    chunk=row["chunk"]
-    frame_number=row["frame_number"]
+    chunk=data["chunk"]
+    frame_number=data["frame_number"]
     frame=annotate_text(frame, BLACK, f"{str(chunk).zfill(6)} - {frame_number}", (700, 50), fontScale=.3)
-
     return frame
 
 
-
 def draw_frame(frame, tracking_data, number_of_animals, blobs=None, field="identity"):
+    """
+
+    Arguments:
+
+        tracking_data (pd.DataFrame): Contains
+            x, y, fragment, and whatever field is set to
+    """
     colors=get_spaced_colors_util(number_of_animals, black=False)
 
     for i, row in tracking_data.iterrows():
@@ -154,11 +178,6 @@ def draw_frame(frame, tracking_data, number_of_animals, blobs=None, field="ident
             color=color,
             fontScale=1,
         )
-
-    if blobs:
-        for blob in blobs:
-            # TODO
-            pass
     
     return frame
 
@@ -251,10 +270,16 @@ def load_experiment_metadata(table):
 
     ethoscope_metadata=out.all()[0].value
     ethoscope_metadata=str2pandas(ethoscope_metadata)
-    assert ethoscope_metadata.shape[0] > 0, f"Ethoscope metadata is empty"
-    reference_hour=ethoscope_metadata["reference_hour"].values
-    assert np.all(np.diff(reference_hour) == 0)
-    reference_hour=reference_hour[0].item()
+
+    if ethoscope_metadata.shape[0]==0:
+        logger.warning("Ethoscope metadata is empty")
+        reference_hour=DEFAULT_REFERENCE_HOUR
+    else:
+        reference_hour=ethoscope_metadata["reference_hour"].values
+        assert np.all(np.diff(reference_hour) == 0)
+        reference_hour=reference_hour[0].item()
+
+
     offset = experiment_start_time - reference_hour*3600
 
     out = table.query.filter_by(field="chunksize")
