@@ -190,14 +190,13 @@ def filter_by_date(experiment):
 
 
 def list_experiments():
-    
-    experiments = []
-    
-    with open(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), "r") as filehandle:
-        experiments = [experiment.strip() for experiment in filehandle.readlines()]
-        experiments = [path for path in experiments if re.search(r"FlyHostel\d_\d{1,2}X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}.db", os.path.basename(path))]
-        experiments = [os.path.sep.join(experiment.split(os.path.sep)[-4:-1]) for experiment in experiments]
-        experiments = sorted([experiment for experiment in experiments if filter_by_date(experiment)])
+    BEHAVIOR_METADATA="/home/vibflysleep/opt/vsc-scripts/nextflow/pipelines/behavior_prediction/animals.csv"
+
+    metadata=pd.read_csv(BEHAVIOR_METADATA)
+    metadata.columns=["experiment", "basedir", "identity", "done", "comment", "select"]
+    metadata=metadata.loc[metadata["select"]=="SELECT"]
+    experiments=metadata["experiment"].drop_duplicates().tolist()
+    print(experiments)
     return {"experiments": experiments}
 
 

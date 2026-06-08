@@ -10,7 +10,7 @@ from flask import g
 from flask_sqlalchemy import SQLAlchemy
 import numpy as np
 import cv2
-from sqlalchemy import func
+from sqlalchemy import func, create_engine
 from sqlalchemy.orm import Session
 from flask import session
 
@@ -18,7 +18,12 @@ from idtrackerai_validator_server.constants import (
     WITH_FRAGMENTS, first_chunk, FRAMES_DIR, INCLUDE_POSE
 )
 from idtrackerai_validator_server.database import DatabaseManager
-from idtrackerai_validator_server.backend import load_experiment, generate_database_filename, process_frame
+from idtrackerai_validator_server.backend import (
+    load_experiment,
+    generate_database_filename,
+    process_frame,
+    list_experiments
+)
 from idtrackerai_validator_server.utils import load_rejections
 from flyhostel.utils import (
     get_identities
@@ -31,22 +36,21 @@ logging.getLogger("idtrackerai_validator_server.backend").setLevel(logging.DEBUG
 logging.getLogger("imgstore").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers").setLevel(logging.WARNING)
 
-try:
-    SELECTED_EXPERIMENT_=os.environ["VALIDATOR_EXPERIMENT"]
+SELECTED_EXPERIMENT_ = os.environ.get("VALIDATOR_EXPERIMENT", None)
+if SELECTED_EXPERIMENT_ is not None:
     if "/" not in SELECTED_EXPERIMENT_:
-        tokens=SELECTED_EXPERIMENT_.split("_")
-        SELECTED_EXPERIMENT="/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
+        tokens = SELECTED_EXPERIMENT_.split("_")
+        SELECTED_EXPERIMENT = "/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
     else:
-        SELECTED_EXPERIMENT=SELECTED_EXPERIMENT_
+        SELECTED_EXPERIMENT = SELECTED_EXPERIMENT_
+else:
+    SELECTED_EXPERIMENT = None
 
-except KeyError:
-    raise Exception("Please define VALIDATOR_EXPERIMENT to the path to some flyhostel experiment")
-
-USE_VAL=os.environ.get("USE_VAL", None)
+USE_VAL = os.environ.get("USE_VAL", None)
 if USE_VAL is not None:
-    USE_VAL=USE_VAL=="True"
+    USE_VAL = USE_VAL == "True"
 
-lock=Lock()
+lock = Lock()
 
 # Initialize application with CORS settings
 app = Flask(__name__)
@@ -57,24 +61,36 @@ CORS(app)
 if os.path.exists(FRAMES_DIR):
     shutil.rmtree(FRAMES_DIR)
 
-# Database configuration
-database_file=generate_database_filename(SELECTED_EXPERIMENT)
-app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{database_file}"
-app.config['SQLALCHEMY_BINDS'] = {
-    SELECTED_EXPERIMENT: f"sqlite:///{database_file}"
-}
-db=SQLAlchemy(app)
+# Use a placeholder URI until an experiment is loaded via POST /api/load
+if SELECTED_EXPERIMENT is not None:
+    database_file = generate_database_filename(SELECTED_EXPERIMENT)
+    app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{database_file}"
+    app.config['SQLALCHEMY_BINDS'] = {SELECTED_EXPERIMENT: f"sqlite:///{database_file}"}
+else:
+    app.config['SQLALCHEMY_DATABASE_URI'] = "sqlite:///:memory:"
+    app.config['SQLALCHEMY_BINDS'] = {}
+
+db = SQLAlchemy(app)
+
+cap = None
+frame = None
+contours = []
+offset = None
+CHUNKSIZE = None
+FRAMERATE = None
+IDTRACKERAI_CONFIG = None
+db_manager = None
+
+if SELECTED_EXPERIMENT is not None:
+    db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
+    print(f"Validation status: {db_manager.use_val}")
+    with app.app_context():
+        out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
+        offset, CHUNKSIZE, FRAMERATE = experiment_metadata
 
 
-db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
-print(f"Validation status: {db_manager.use_val}")
-
-# Load default dataset
-with app.app_context():
-    out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
-    offset, CHUNKSIZE, FRAMERATE=experiment_metadata
-    frame = None
-    contours=[]
+def _experiment_required():
+    return jsonify({"error": "No experiment loaded. POST to /api/load first."}), 503
 
 
 @app.route("/", methods=["GET"])
@@ -84,8 +100,69 @@ def get():
 
 @app.route("/api/list", methods=["GET"])
 def list():
-    global SELECTED_EXPERIMENT
-    return jsonify({"experiments": SELECTED_EXPERIMENT})
+    try:
+        return jsonify(list_experiments())
+    except Exception as error:
+        logger.error("Error listing experiments: %s", error)
+        return jsonify({"experiments": [SELECTED_EXPERIMENT] if SELECTED_EXPERIMENT else []})
+
+@app.route("/api/load", methods=["POST"])
+def load():
+    global SELECTED_EXPERIMENT, cap, frame, contours, db_manager
+    global offset, CHUNKSIZE, FRAMERATE, IDTRACKERAI_CONFIG
+
+    data = request.get_json()
+    if not data or "experiment" not in data:
+        return jsonify({"error": "experiment field required"}), 400
+
+    new_experiment = data["experiment"]
+    if "/" not in new_experiment:
+        tokens = new_experiment.split("_")
+        new_experiment = "/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
+
+    new_database_file = generate_database_filename(new_experiment)
+    if not os.path.exists(new_database_file):
+        return jsonify({"error": f"Experiment database not found: {new_database_file}"}), 404
+
+    lock.acquire()
+    try:
+        SELECTED_EXPERIMENT = new_experiment
+
+        db.session.remove()
+
+        app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{new_database_file}"
+        app.config["SQLALCHEMY_BINDS"] = {new_experiment: f"sqlite:///{new_database_file}"}
+
+        try:
+            engines_dict = db._app_engines[app]
+            for eng in engines_dict.values():
+                eng.dispose()
+            engines_dict.clear()
+            new_engine = create_engine(f"sqlite:///{new_database_file}")
+            engines_dict[None] = new_engine
+            engines_dict[new_experiment] = new_engine
+        except (AttributeError, KeyError):
+            pass
+
+        db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
+
+        out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
+        if experiment_metadata is None:
+            return jsonify({"error": f"Failed to load experiment metadata for {new_experiment}"}), 500
+
+        offset, CHUNKSIZE, FRAMERATE = experiment_metadata
+        frame = None
+        contours = []
+        logger.info("Switched to experiment %s", SELECTED_EXPERIMENT)
+
+    except Exception as error:
+        logger.error("Error loading experiment %s: %s", new_experiment, error)
+        return jsonify({"error": str(error)}), 500
+    finally:
+        lock.release()
+
+    return jsonify({"message": "success", "experiment": SELECTED_EXPERIMENT, "first_frame": first_chunk * CHUNKSIZE})
+
 
 def row2dict(row):
     d = {}
@@ -95,7 +172,8 @@ def row2dict(row):
 
 @app.route("/api/framerate", methods=['GET'])
 def get_framerate():
-    global SELECTED_EXPERIMENT
+    if db_manager is None:
+        return _experiment_required()
     tables = db_manager.tables
     framerate=tables["METADATA"].query.filter_by(field="framerate").first().value
     return framerate
@@ -193,19 +271,21 @@ def project_to_absolute(pose, centroids):
 
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     global SELECTED_EXPERIMENT
     number_of_animals=int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables
 
+    out = []
+    number_of_animals_found = 0
     try:
 
         chunksize=tables["METADATA"].query.filter_by(field="chunksize").all()[0].value
 
         output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
-        out=[]
         identity_table=tables["IDENTITY"].query.filter_by(frame_number=frame_number)
-        number_of_animals_found=0
 
         for row in output.all():
             identity=None
@@ -250,7 +330,6 @@ def get_tracking(frame_number):
         out=sorted(out, key=lambda x: x["identity"])
     except Exception as error:
         app.logger.error(error)
-        out= []
     
     if number_of_animals_found==0:
         app.logger.warning("No animals found for frame %s", frame_number)
@@ -268,40 +347,56 @@ def get_tracking(frame_number):
 
 @app.route('/api/prev_rejection/<int:frame_number>', methods=['GET'])
 def get_prev_rejection(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_rejection(frame_number, "previous")
 
 
 @app.route('/api/next_rejection/<int:frame_number>', methods=['GET'])
 def get_next_rejection(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_rejection(frame_number, "next")
 
 
 @app.route('/api/prev_error/<int:frame_number>', methods=['GET'])
 def get_prev_error(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_error(frame_number, "previous")
 
 
 @app.route('/api/next_error/<int:frame_number>', methods=['GET'])
 def get_next_error(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_error(frame_number, "next")
 
 
 @app.route('/api/prev_ok/<int:frame_number>', methods=['GET'])
 def get_prev_ok(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_ok(frame_number, "previous")
 
 
 @app.route('/api/next_ok/<int:frame_number>', methods=['GET'])
 def get_next_ok(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_ok(frame_number, "next")
 
 @app.route('/api/prev_ai/<int:frame_number>', methods=['GET'])
 def get_prev_ai(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_ai(frame_number, "previous")
 
 
 @app.route('/api/next_ai/<int:frame_number>', methods=['GET'])
 def get_next_ai(frame_number):
+    if db_manager is None:
+        return _experiment_required()
     return get_ai(frame_number, "next")
 
 
