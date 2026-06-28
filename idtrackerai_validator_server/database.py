@@ -2,10 +2,9 @@ import logging
 import numpy as np
 from flyhostel.data.human_validation.utils import check_if_validated
 from flyhostel.utils import (
-    get_pose_file,
     get_identities
 )
-
+from flyhostel.utils.pose_export import get_pose_file
 from idtrackerai_validator_server.constants import INCLUDE_POSE, POSE_NAME
 logger = logging.getLogger(__name__)
 
