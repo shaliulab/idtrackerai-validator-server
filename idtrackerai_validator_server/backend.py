@@ -190,13 +190,11 @@ def filter_by_date(experiment):
 
 
 def list_experiments():
-    BEHAVIOR_METADATA="/home/vibflysleep/opt/vsc-scripts/nextflow/pipelines/behavior_prediction/animals.csv"
-
-    metadata=pd.read_csv(BEHAVIOR_METADATA)
-    metadata.columns=["experiment", "basedir", "identity", "done", "comment", "select"]
-    metadata=metadata.loc[metadata["select"]=="SELECT"]
-    experiments=metadata["experiment"].drop_duplicates().tolist()
-    print(experiments)
+    # cd /flyhostel_data/videos
+    # find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db > index.txt
+    index=pd.read_csv("/flyhostel_data/videos/index.txt", header=None)
+    dbfiles=index[0]
+    experiments=[os.path.basename(path).replace(".db", "") for path in dbfiles]
     return {"experiments": experiments}
 
 
