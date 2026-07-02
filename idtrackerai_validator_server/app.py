@@ -179,11 +179,6 @@ def get_pose_from_h5(fly_id_str, frame_number, experiment, chunksize):
         - Experiment frame 15000 = Video frame 65000 (chunk 6, position 5000)
     """
     try:
-        # Step 1: Extract which chunk this H5 file contains
-        # fly_id_str ends with __XX where XX is the chunk number
-        fly_chunk_id = int(fly_id_str.split("__")[-1])
-
-
         # Step 6: Open the H5 file and validate bounds
         h5_file = get_h5_file(fly_id_str, experiment)     
 
@@ -490,12 +485,19 @@ def get_tracking(frame_number):
 
             identities = get_identities(experiment)
             identity_to_fly_id = {i: fly_id for i, fly_id in enumerate(identities)}
+
+            print(f"Loading pose of {len(out)} animals: {identity_to_fly_id} {out}")
             
             for animal in out:
-                if animal['identity'] is not None and animal['identity'] in identity_to_fly_id:
+                if animal['identity'] is not None and animal['identity'] in identity_to_fly_id.values():
+                    print(f"Drawing {animal['identity']}")
                     try:
-                        fly_id = identity_to_fly_id[animal['identity']]
-                        pose_relative = get_pose_from_h5(str(fly_id).zfill(2), frame_number, experiment, chunksize)
+                        pose_relative = get_pose_from_h5(
+                            str(animal['identity']).zfill(2),
+                            frame_number,
+                            experiment,
+                            chunksize
+                        )
                         
                         if pose_relative:
                             # Convert from relative (centroid-relative) to absolute coordinates
@@ -517,9 +519,9 @@ def get_tracking(frame_number):
                             pose_absolute[str(animal['identity'])] = pose_absolute_animal
                     except Exception as e:
                         logger.error(f"Failed to load pose for identity {animal['identity']}: {e}")
+                        logger.error(traceback.print_exc())
         except Exception as e:
             logger.error(f"Error in pose processing: {e}")
-
 
 
      
