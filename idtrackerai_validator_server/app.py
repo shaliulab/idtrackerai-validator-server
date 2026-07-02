@@ -98,7 +98,7 @@ _h5_file_cache = {}
 _h5_cache_lock = Lock()
 
 # Bodypart indices to keep (figure this out from step 1)
-BODYPARTS_TO_IGNORE = [6, 7, 8, 9, 10, 11]  # ← UPDATE THIS
+BODYPARTS_TO_IGNORE = [12, 13, 14, 15, 16, 17]  # ← UPDATE THIS
 BODYPARTS_TO_KEEP = [i for i in range(18) if i not in BODYPARTS_TO_IGNORE]
 
 # Map bodypart index to name
@@ -485,12 +485,9 @@ def get_tracking(frame_number):
 
             identities = get_identities(experiment)
             identity_to_fly_id = {i: fly_id for i, fly_id in enumerate(identities)}
-
-            print(f"Loading pose of {len(out)} animals: {identity_to_fly_id} {out}")
-            
+           
             for animal in out:
                 if animal['identity'] is not None and animal['identity'] in identity_to_fly_id.values():
-                    print(f"Drawing {animal['identity']}")
                     try:
                         pose_relative = get_pose_from_h5(
                             str(animal['identity']).zfill(2),
