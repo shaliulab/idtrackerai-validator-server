@@ -4,7 +4,6 @@ from flyhostel.data.human_validation.utils import check_if_validated
 from flyhostel.utils import (
     get_identities
 )
-from flyhostel.utils.pose_export import get_pose_file
 from idtrackerai_validator_server.constants import INCLUDE_POSE, POSE_NAME
 logger = logging.getLogger(__name__)
 
@@ -54,31 +53,6 @@ class DatabaseManager:
         
         self.tables = make_templates(self.db, experiment, fragments=self.with_fragments, use_val=self.use_val)
         self.experiment = experiment
-
-        # Initialize a dictionary to hold the pose data from HDF5 files.
-        self.pose_data = {}
-
-        identities=get_identities(experiment.replace("/", "_"))
-        if INCLUDE_POSE:
-            pose_files={
-                identity: get_pose_file(experiment.replace("/", "_"), identity, pose_name=POSE_NAME)
-                for identity in identities
-            }
-        else:
-            pose_files={}
-
-        if pose_files:
-            raise NotImplementedError
-            # need to reimplement from_sleap_file or something equivalent
-            # If pose_files is a dictionary mapping animal_id to file path:
-            if isinstance(pose_files, dict):
-                for identity, file_path in pose_files.items():
-                    try:
-                        self.pose_data[identity] = from_sleap_file(file_path)
-                        logger.info("Loaded pose data for animal %s from %s", identity, file_path)
-                    except Exception as e:
-                        logger.error("Error loading HDF5 file for animal %s: %s", identity, e)
-
 
     def get_pose_for_animal(self, animal_id, frame_number):
         """

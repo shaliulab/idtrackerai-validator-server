@@ -2,6 +2,7 @@ import os
 import shutil
 import argparse
 import re
+import traceback
 from threading import Lock
 import logging
 from flask import Flask, jsonify, request, send_from_directory
@@ -13,6 +14,8 @@ import cv2
 from sqlalchemy import func, create_engine
 from sqlalchemy.orm import Session
 from flask import session
+import h5py
+from pathlib import Path
 
 from idtrackerai_validator_server.constants import (
     WITH_FRAGMENTS, first_chunk, FRAMES_DIR, INCLUDE_POSE
@@ -26,8 +29,11 @@ from idtrackerai_validator_server.backend import (
 )
 from idtrackerai_validator_server.utils import load_rejections
 from flyhostel.utils import (
-    get_identities
+    get_identities,
+    get_square_width,
+    get_square_height,    
 )
+from flyhostel.utils.pose_export import recreate_pose_file
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -87,7 +93,138 @@ if SELECTED_EXPERIMENT is not None:
     with app.app_context():
         out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
         offset, CHUNKSIZE, FRAMERATE = experiment_metadata
+# H5 file handle cache
+_h5_file_cache = {}
+_h5_cache_lock = Lock()
 
+# Bodypart indices to keep (figure this out from step 1)
+BODYPARTS_TO_IGNORE = [6, 7, 8, 9, 10, 11]  # ← UPDATE THIS
+BODYPARTS_TO_KEEP = [i for i in range(18) if i not in BODYPARTS_TO_IGNORE]
+
+# Map bodypart index to name
+BODYPART_NAMES = {
+    0: "head",
+    1: "thorax",
+    2: "abdomen",
+    3: "fLL",
+    4: "mLL",
+    5: "rLL",
+    6: "fRL",
+    7: "mRL",
+    8: "rRL",
+    9: "head",
+    10: 'lW',
+    11: 'rW',
+}
+
+
+def get_h5_file(fly_id_str, experiment):
+    """Get or open H5 file with caching"""
+    cache_key = f"{experiment}__{fly_id_str}"
+    
+    with _h5_cache_lock:
+        if cache_key in _h5_file_cache:
+            return _h5_file_cache[cache_key]
+        
+        folder=f"/flyhostel_data/videos/{experiment}/motionmapper/00/pose_raw"
+        pose_file = f"{folder}/{cache_key}/{cache_key}.h5"
+        
+        if not Path(pose_file).exists():
+            recreate_pose_file(experiment, int(fly_id_str), output=folder)
+            logger.debug(f"Pose file not found: {pose_file}")
+            return None
+        
+        try:
+            f = h5py.File(pose_file, 'r')
+            _h5_file_cache[cache_key] = f
+            logger.debug(f"Opened pose file: {pose_file}")
+            return f
+        except Exception as e:
+            logger.error(f"Failed to open pose file {pose_file}: {e}")
+            return None
+
+
+def close_h5_files():
+    """Close all cached H5 file handles"""
+    with _h5_cache_lock:
+        for f in _h5_file_cache.values():
+            try:
+                f.close()
+            except:
+                pass
+        _h5_file_cache.clear()
+
+
+def get_pose_from_h5(fly_id_str, frame_number, experiment, chunksize):
+    """
+    Extract pose from H5 file, properly handling chunk offsets.
+    
+    CRITICAL: The experiment doesn't start at frame 0 of the H5 file.
+    It starts at first_chunk * chunksize.
+    
+    Args:
+        fly_id_str: e.g., "FlyHostel1_1X_2026-06-13_17-00-00__00"
+                    The __00 suffix indicates which chunk this fly's H5 file contains
+        frame_number: frame number in the EXPERIMENT (0-indexed, where 0 is first_chunk*chunksize)
+        experiment: experiment path
+        chunksize: frames per chunk (from METADATA table)
+        first_chunk: first chunk number of this experiment (from constants or METADATA)
+    
+    Returns:
+        Dict {bodypart_name: [x, y]} (coords RELATIVE to centroid) or None
+    
+    Example:
+        If first_chunk=5, chunksize=10000:
+        - Experiment frame 0 = Video frame 50000 (chunk 5, position 0)
+        - Experiment frame 15000 = Video frame 65000 (chunk 6, position 5000)
+    """
+    try:
+        # Step 1: Extract which chunk this H5 file contains
+        # fly_id_str ends with __XX where XX is the chunk number
+        fly_chunk_id = int(fly_id_str.split("__")[-1])
+
+
+        # Step 6: Open the H5 file and validate bounds
+        h5_file = get_h5_file(fly_id_str, experiment)     
+
+        if h5_file is None:
+            logger.debug(f"Could not open H5 file for {fly_id_str}")
+            return None
+        
+        first_chunk=int(os.path.basename(h5_file["files"][0].decode()).split(".")[0])
+
+        # Step 5: Calculate the index WITHIN this H5 file
+        # Each chunk spans [chunk_id * chunksize, (chunk_id + 1) * chunksize)
+        # So for a frame in chunk N, the index within that chunk is:
+        h5_frame_index = frame_number - (first_chunk * chunksize)
+
+        # tracks shape: (1, 2, 18, total_frames_in_chunk)
+        # Validate the index
+        if h5_frame_index >= h5_file['tracks'].shape[3]:
+            logger.error(
+                f"H5 frame index {h5_frame_index} out of bounds "
+                f"(max: {h5_file['tracks'].shape[3]}) for {fly_id_str}"
+            )
+            return None
+        
+        # Step 7: Extract the coordinates for this frame
+        xy_coords = h5_file['tracks'][0, :, :, h5_frame_index]  # shape: (2, 18)
+        
+        # Step 8: Build and return the pose dict
+        pose_dict = {}
+        for bp_idx in BODYPARTS_TO_KEEP:
+            name = BODYPART_NAMES.get(bp_idx, f"bp_{bp_idx}")
+            x = float(xy_coords[0, bp_idx])
+            y = float(xy_coords[1, bp_idx])
+            pose_dict[name] = [x, y]
+        
+        return pose_dict
+    
+    except Exception as e:
+        logger.error(f"Error extracting pose for {fly_id_str} frame {frame_number}: {e}")
+        logger.error(traceback.print_exc())
+        return None
+    
 
 def _experiment_required():
     return jsonify({"error": "No experiment loaded. POST to /api/load first."}), 503
@@ -156,6 +293,8 @@ def load():
         logger.info("Switched to experiment %s", SELECTED_EXPERIMENT)
 
     except Exception as error:
+        print(traceback.print_exc())
+
         logger.error("Error loading experiment %s: %s", new_experiment, error)
         return jsonify({"error": str(error)}), 500
     finally:
@@ -273,44 +412,45 @@ def project_to_absolute(pose, centroids):
 def get_tracking(frame_number):
     if db_manager is None:
         return _experiment_required()
+    
     global SELECTED_EXPERIMENT
-    number_of_animals=int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
+    number_of_animals = int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables
-
+ 
     out = []
     number_of_animals_found = 0
     try:
-
-        chunksize=tables["METADATA"].query.filter_by(field="chunksize").all()[0].value
-
-        output=tables["ROI_0"].query.filter_by(frame_number=frame_number)
-        identity_table=tables["IDENTITY"].query.filter_by(frame_number=frame_number)
-
+        chunksize = int(float(tables["METADATA"].query.filter_by(field="chunksize").all()[0].value))
+ 
+        output = tables["ROI_0"].query.filter_by(frame_number=frame_number)
+        identity_table = tables["IDENTITY"].query.filter_by(frame_number=frame_number)
+ 
         for row in output.all():
-            identity=None
-            hit=False
+            identity = None
+            local_identity = None
+            hit = False
             for id_row in identity_table:
                 if row.in_frame_index == id_row.in_frame_index:
                     identity = id_row.identity
                     local_identity = id_row.local_identity
-                    hit=True
-
+                    hit = True
+ 
             if not hit:
                 identity = None
-
+ 
             if row.modified is None:
-                modified=0
+                modified = 0
             else:
-                modified=row.modified
+                modified = row.modified
             
-            t = frame_number/session.get("framerate", FRAMERATE) + offset
-            hours=str(int(t // 3600)).zfill(2)
-            minutes=str(int((t % 3600)//60)).zfill(2)
-            seconds=str(int(t % 60)).zfill(2)
+            t = frame_number / session.get("framerate", FRAMERATE) + offset
+            hours = str(int(t // 3600)).zfill(2)
+            minutes = str(int((t % 3600) // 60)).zfill(2)
+            seconds = str(int(t % 60)).zfill(2)
             zt = f"{hours}:{minutes}:{seconds}"
     
-            data={
+            data = {
                 "frame_number": frame_number,
                 "t": t,
                 "ZT": zt,
@@ -324,26 +464,75 @@ def get_tracking(frame_number):
                 "modified": modified,
                 "chunksize": chunksize,
             }
-
-            number_of_animals_found+=1
+ 
+            number_of_animals_found += 1
             out.append(data)
-        out=sorted(out, key=lambda x: x["identity"])
+        
+        out = sorted(out, key=lambda x: x["identity"] if x["identity"] is not None else -1)
     except Exception as error:
         app.logger.error(error)
     
-    if number_of_animals_found==0:
+    if number_of_animals_found == 0:
         app.logger.warning("No animals found for frame %s", frame_number)
     else:
         app.logger.info("Number of animals found = %s", number_of_animals_found)
-
-
+ 
+    # ===== NEW: FETCH POSE DATA FOR EACH ANIMAL FROM H5 FILES =====
+    pose_absolute = {}
+    
     if INCLUDE_POSE:
-        pose=get_pose(db_manager, frame_number)
-        pose_absolute=project_to_absolute(pose, out)
-    else:
-        pose_absolute={}
-        data={"tracking_data": out, "number_of_animals": number_of_animals, "pose": pose_absolute}
-    return jsonify(data)
+        try:
+            # Get list of fly identities
+            experiment=SELECTED_EXPERIMENT.replace("/", "_")
+            square_width=get_square_width(experiment)
+            square_height=get_square_height(experiment)
+
+
+            identities = get_identities(experiment)
+            identity_to_fly_id = {i: fly_id for i, fly_id in enumerate(identities)}
+            
+            for animal in out:
+                if animal['identity'] is not None and animal['identity'] in identity_to_fly_id:
+                    try:
+                        fly_id = identity_to_fly_id[animal['identity']]
+                        pose_relative = get_pose_from_h5(str(fly_id).zfill(2), frame_number, experiment, chunksize)
+                        
+                        if pose_relative:
+                            # Convert from relative (centroid-relative) to absolute coordinates
+                            pose_absolute_animal = {}
+                            # Pose is relative to top-left of 200x200 square centered at centroid
+                            # Top-left corner is at (centroid_x - 100, centroid_y - 100)
+                            square_top_left_x = animal['x'] - square_width//2
+                            square_top_left_y = animal['y'] - square_height//2
+                            
+                            for bodypart_name, (rel_x, rel_y) in pose_relative.items():
+                                if rel_x is not None and rel_y is not None:
+                                    # The H5 coordinates are relative to centroid
+                                    abs_x = round(square_top_left_x  + rel_x, 2)
+                                    abs_y = round(square_top_left_y  + rel_y, 2)
+                                    pose_absolute_animal[bodypart_name] = [None if np.isnan(abs_x) else abs_x, None if np.isnan(abs_y) else abs_y]
+                                else:
+                                    pose_absolute_animal[bodypart_name] = [None, None]
+                            
+                            pose_absolute[str(animal['identity'])] = pose_absolute_animal
+                    except Exception as e:
+                        logger.error(f"Failed to load pose for identity {animal['identity']}: {e}")
+        except Exception as e:
+            logger.error(f"Error in pose processing: {e}")
+
+
+
+     
+    data = {
+        "tracking_data": out,
+        "number_of_animals": number_of_animals,
+        "pose": pose_absolute
+    }
+
+    response=jsonify(data)
+    response.headers['Content-Type'] = 'application/json; charset=utf-8'
+    return response
+
 
 @app.route('/api/prev_rejection/<int:frame_number>', methods=['GET'])
 def get_prev_rejection(frame_number):
@@ -400,6 +589,25 @@ def get_next_ai(frame_number):
     return get_ai(frame_number, "next")
 
 
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    shutdown_server()
+    message='Shutting down gracefully...'
+    logger.debug(message)
+    return jsonify({"message": message})
+
+
+def shutdown_server():
+    func = request.environ.get('werkzeug.server.shutdown')
+    
+    logger.debug("Gracefully shutting down...")
+    close_h5_files()  # ← ADD THIS
+    db.session.close()
+    logger.debug("DB connection closed. Bye!")
+ 
+
+
 def get_first_non_zero_frame(sql_session: Session, frame_number: int, direction=True):
     global SELECTED_EXPERIMENT
     tables = db_manager.tables
@@ -438,21 +646,6 @@ def get_first_non_zero_frame(sql_session: Session, frame_number: int, direction=
         )
 
     return result.frame_number if result else None
-
-
-@app.route('/shutdown', methods=['POST'])
-def shutdown():
-    shutdown_server()
-    message='Shutting down gracefully...'
-    logger.debug(message)
-    return jsonify({"message": message})
-
-def shutdown_server():
-    func = request.environ.get('werkzeug.server.shutdown')
-
-    logger.debug("Gracefully shutting down...")
-    db.session.close()  # or however you close your DB connection
-    logger.debug("DB connection closed. Bye!")
 
 def get_ok(frame_number, direction):
     frame_number= get_first_non_zero_frame(db.session, frame_number, direction)
