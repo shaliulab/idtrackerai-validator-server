@@ -103,7 +103,7 @@ BODYPARTS_TO_KEEP = [i for i in range(18) if i not in BODYPARTS_TO_IGNORE]
 
 # Map bodypart index to name
 BODYPART_NAMES = {
-    0: "head",
+    0: "proboscis",
     1: "thorax",
     2: "abdomen",
     3: "fLL",
@@ -115,6 +115,7 @@ BODYPART_NAMES = {
     9: "head",
     10: 'lW',
     11: 'rW',
+    
 }
 
 
