@@ -17,6 +17,7 @@ from flask import session
 import h5py
 from pathlib import Path
 
+
 from idtrackerai_validator_server.constants import (
     WITH_FRAGMENTS, first_chunk, FRAMES_DIR, INCLUDE_POSE
 )
@@ -118,7 +119,6 @@ BODYPART_NAMES = {
     
 }
 
-
 def get_h5_file(fly_id_str, experiment):
     """Get or open H5 file with caching"""
     cache_key = f"{experiment}__{fly_id_str}"
@@ -127,7 +127,7 @@ def get_h5_file(fly_id_str, experiment):
         if cache_key in _h5_file_cache:
             return _h5_file_cache[cache_key]
         
-        folder=f"/flyhostel_data/videos/{experiment}/motionmapper/00/pose_raw"
+        folder=f"/flyhostel_data/videos/{experiment}/motionmapper/{fly_id_str}/pose_raw"
         pose_file = f"{folder}/{cache_key}/{cache_key}.h5"
         
         if not Path(pose_file).exists():
@@ -141,8 +141,17 @@ def get_h5_file(fly_id_str, experiment):
             logger.debug(f"Opened pose file: {pose_file}")
             return f
         except Exception as e:
-            logger.error(f"Failed to open pose file {pose_file}: {e}")
-            return None
+            logger.warning(f"Failed to open pose file {pose_file}: {e}. Attempting to recreate...")
+            try:
+                os.remove(pose_file)
+                recreate_pose_file(experiment, int(fly_id_str), output=folder)
+                f = h5py.File(pose_file, 'r')
+                _h5_file_cache[cache_key] = f
+                logger.info(f"Successfully recreated and opened pose file: {pose_file}")
+                return f
+            except Exception as e2:
+                logger.error(f"Failed to recreate and open pose file {pose_file}: {e2}")
+                return None
 
 
 def close_h5_files():
@@ -164,8 +173,7 @@ def get_pose_from_h5(fly_id_str, frame_number, experiment, chunksize):
     It starts at first_chunk * chunksize.
     
     Args:
-        fly_id_str: e.g., "FlyHostel1_1X_2026-06-13_17-00-00__00"
-                    The __00 suffix indicates which chunk this fly's H5 file contains
+        fly_id_str: e.g., "FlyHostel1_1X_2026-06-13_17-00-00__01"
         frame_number: frame number in the EXPERIMENT (0-indexed, where 0 is first_chunk*chunksize)
         experiment: experiment path
         chunksize: frames per chunk (from METADATA table)
@@ -181,7 +189,7 @@ def get_pose_from_h5(fly_id_str, frame_number, experiment, chunksize):
     """
     try:
         # Step 6: Open the H5 file and validate bounds
-        h5_file = get_h5_file(fly_id_str, experiment)     
+        h5_file = get_h5_file(fly_id_str, experiment)
 
         if h5_file is None:
             logger.debug(f"Could not open H5 file for {fly_id_str}")
@@ -490,8 +498,9 @@ def get_tracking(frame_number):
             for animal in out:
                 if animal['identity'] is not None and animal['identity'] in identity_to_fly_id.values():
                     try:
+                        fly_id_str=str(animal['identity']).zfill(2)
                         pose_relative = get_pose_from_h5(
-                            str(animal['identity']).zfill(2),
+                            fly_id_str,
                             frame_number,
                             experiment,
                             chunksize
