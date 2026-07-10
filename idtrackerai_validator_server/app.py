@@ -35,6 +35,7 @@ from flyhostel.utils import (
     get_square_height,    
 )
 from flyhostel.utils.pose_export import recreate_pose_file
+from pe_validation import register_pe_validation
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -63,6 +64,8 @@ lock = Lock()
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
 CORS(app)
+
+register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
@@ -596,6 +599,20 @@ def get_next_ai(frame_number):
     if db_manager is None:
         return _experiment_required()
     return get_ai(frame_number, "next")
+
+@app.route('/api/pe/flies', methods=['GET'])
+def get_flies():
+    if SELECTED_EXPERIMENT is None:
+        return jsonify([])
+    else:
+        experiment=SELECTED_EXPERIMENT.replace("/", "_")
+        logger.warning(experiment)
+        identities=get_identities(experiment)
+        flies = [
+            f"{experiment}__{str(identity).zfill(2)}"
+            for identity in identities
+        ]
+        return jsonify(flies)
 
 
 
