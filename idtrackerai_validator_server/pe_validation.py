@@ -38,7 +38,7 @@ def _media_dir(experiment):
     return os.path.join(get_basedir(experiment.replace("/", "_")),
                         "flyhostel", "proboscis_extensions")
 
-_VERDICTS = ("pe", "not_pe", "unsure")
+_VERDICTS = ("pe", "feed", "groom", "other", "unsure")
 
 
 def _init_db():
@@ -51,7 +51,7 @@ def _init_db():
                 end_frame   INTEGER NOT NULL,
                 burst_id    INTEGER,
                 bout_uid    REAL,
-                verdict     TEXT    NOT NULL CHECK (verdict IN ('pe','not_pe','unsure')),
+                verdict     TEXT    NOT NULL CHECK (verdict IN ('pe','feed','groom', 'other', 'unsure')),
                 pe_score    REAL,
                 reviewer    TEXT,
                 reviewed_at TEXT    NOT NULL,
@@ -97,16 +97,32 @@ def register_pe_validation(app, get_selected_experiment):
             return jsonify({"error": f"no bouts feather for {fly}"}), 404
 
         df = pd.read_feather(feather)
-        df = df[df["label"] == "pe"].copy()
-        # low score first: the bouts most likely wrong are the most useful to review
-        df = df.sort_values("pe_score", ascending=True)
-        df["start_fidx"]=df["start_fn"]%chunksize
-        df["end_fidx"]=df["end_fn"]%chunksize
-    
-        cols = [c for c in ("burst_id", "bout_uid", "start_fn", "end_fn", "start_fidx", "end_fidx", "n_in_burst",
-                            "is_solitary", "pe_score", "dur_s", "label_reason")
+        # bursts that contain at least one PE bout
+        pe_bursts = set(df.loc[df["label"] == "pe", "burst_id"].unique())
+        df = df[df["burst_id"].isin(pe_bursts)].copy()
+
+        # low score first among the PE ones; keep burst grouping intact
+        df = df.sort_values(["burst_id", "start_fn"])
+
+        df["start_fidx"] = df["start_fn"] % chunksize
+        df["end_fidx"]   = df["end_fn"]   % chunksize
+        df["is_pe"]      = (df["label"] == "pe")          # annotatable vs display-only
+
+        cols = [c for c in ("burst_id", "bout_uid", "start_fn", "end_fn",
+                            "start_fidx", "end_fidx", "n_in_burst", "is_solitary",
+                            "pe_score", "dur_s", "label", "label_reason", "is_pe")
                 if c in df.columns]
         bouts = df[cols].to_dict("records")
+
+        # # low score first: the bouts most likely wrong are the most useful to review
+        # df = df.sort_values("pe_score", ascending=True)
+        # df["start_fidx"]=df["start_fn"]%chunksize
+        # df["end_fidx"]=df["end_fn"]%chunksize
+    
+        # cols = [c for c in ("burst_id", "bout_uid", "start_fn", "end_fn", "start_fidx", "end_fidx", "n_in_burst",
+        #                     "is_solitary", "pe_score", "dur_s", "label_reason")
+        #         if c in df.columns]
+        # bouts = df[cols].to_dict("records")
 
         # attach existing verdicts
         with sqlite3.connect(PE_DB) as c:
