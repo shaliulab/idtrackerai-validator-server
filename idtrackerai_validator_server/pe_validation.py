@@ -37,12 +37,14 @@ def _media_dir(experiment):
     return os.path.join(get_basedir(experiment.replace("/", "_")),
                         "flyhostel", "proboscis_extensions")
 
-_VERDICTS = ("pe", "feed", "groom", "other", "unsure")
+
+_VERDICTS = ("pe", "feed", "groom", "walk", "other", "merge", "unsure")
 
 
 def _init_db():
+    verdict_list = ",".join(f"'{v}'" for v in _VERDICTS)
     with sqlite3.connect(PE_DB) as c:
-        c.execute("""
+        c.execute(f"""
             CREATE TABLE IF NOT EXISTS pe_annotations (
                 experiment  TEXT    NOT NULL,
                 identity    INTEGER NOT NULL,
@@ -50,7 +52,7 @@ def _init_db():
                 end_frame   INTEGER NOT NULL,
                 burst_id    INTEGER,
                 bout_uid    REAL,
-                verdict     TEXT    NOT NULL CHECK (verdict IN ('pe','feed','groom', 'other', 'unsure')),
+                verdict     TEXT    NOT NULL CHECK (verdict IN ({verdict_list})),
                 pe_score    REAL,
                 reviewer    TEXT,
                 reviewed_at TEXT    NOT NULL,
