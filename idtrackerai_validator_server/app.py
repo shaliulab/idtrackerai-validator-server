@@ -134,8 +134,8 @@ def get_h5_file(fly_id_str, experiment):
         pose_file = f"{folder}/{cache_key}/{cache_key}.h5"
         
         if not Path(pose_file).exists():
+            print(f"INFO {pose_file} not found")
             recreate_pose_file(experiment, int(fly_id_str), output=folder)
-            logger.debug(f"Pose file not found: {pose_file}")
             return None
         
         try:
@@ -146,6 +146,7 @@ def get_h5_file(fly_id_str, experiment):
         except Exception as e:
             logger.warning(f"Failed to open pose file {pose_file}: {e}. Attempting to recreate...")
             try:
+                print(f"INFO {pose_file} invalid")
                 os.remove(pose_file)
                 recreate_pose_file(experiment, int(fly_id_str), output=folder)
                 f = h5py.File(pose_file, 'r')

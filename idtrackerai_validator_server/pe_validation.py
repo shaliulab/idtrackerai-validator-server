@@ -28,7 +28,6 @@ from flyhostel.utils import (
 # --- where your pipeline wrote things (edit or set via env) ---------------------
 # PE media lives UNDER EACH EXPERIMENT'S TREE, so the media dir is DERIVED from the
 # experiment per request (see _media_dir), not a fixed constant.
-PE_BOUTS_DIR   = os.environ.get("PE_BOUTS_DIR", "pe_bouts")        # *_pe_bouts.feather
 PE_DB          = os.environ.get("PE_DB", "pe_annotations.db")      # separate from tracking DB
 
 
@@ -91,8 +90,11 @@ def register_pe_validation(app, get_selected_experiment):
         experiment, identity = fly.split("__")
         identity = int(identity)
 
+        basedir=get_basedir(experiment)
+        pe_bouts_dir=f"{basedir}/flyhostel/proboscis_extensions/pe_bouts"
+
         chunksize=get_chunksize(exp.replace("/", "_"))
-        feather = os.path.join(PE_BOUTS_DIR, f"{fly}_pe_bouts.feather")
+        feather = os.path.join(pe_bouts_dir, f"{fly}_pe_bouts.feather")
         if not os.path.exists(feather):
             return jsonify({"error": f"no bouts feather for {fly}"}), 404
 
@@ -206,10 +208,10 @@ def register_pe_validation(app, get_selected_experiment):
 
         fps = get_framerate(exp.replace("/", "_"))
 
-        csv = os.path.join(_media_dir(exp), f"{fly}.csv")   # the extract_burst_traces output
-        if not os.path.exists(csv):
-            return jsonify({"error": f"no trace csv for {fly}"}), 404
-        d = pd.read_csv(csv)
+        traces_file = os.path.join(_media_dir(exp), f"{fly}_traces.feather")   # the extract_burst_traces output
+        if not os.path.exists(traces_file):
+            return jsonify({"error": f"no trace feather for {fly}"}), 404
+        d = pd.read_feather(traces_file)
         d = d[d["burst_id"] == burst_id].sort_values("frame_number").copy()
         if d.empty:
             return jsonify({"error": f"burst {burst_id} not in trace"}), 404
