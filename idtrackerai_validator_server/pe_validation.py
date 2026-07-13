@@ -238,10 +238,12 @@ def register_pe_validation(app, get_selected_experiment):
         return jsonify({
             "fly": fly, "burst_id": burst_id, "fps": fps, "start_frame": f0,
             "points": [{"t_s": round(float(t), 4),
-                        "dist": None if pd.isna(v) else round(float(v), 4),
-                        "bout_uid": None if pd.isna(u) else int(u),
-                        "is_peak": bool(p)}
-                    for t, v, u, p in zip(d["t_s"], d["dist_rel"],
-                                            d["bout_uid"], d["is_peak"])],
+                    "dist": None if pd.isna(v) else round(float(v), 4),
+                    "conf": None if pd.isna(cf) else round(float(cf), 4),   # NEW
+                    "bout_uid": None if pd.isna(u) else int(u),
+                    "is_peak": bool(p)}
+                   for t, v, cf, u, p in zip(d["t_s"], d["dist_rel"],
+                                             d["prob_conf"], d["bout_uid"],  # NEW: prob_conf
+                                             d["is_peak"])],
             "spans": spans_out, "gaps": gaps_out,
         })
