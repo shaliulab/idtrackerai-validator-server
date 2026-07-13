@@ -491,9 +491,11 @@ def get_tracking(frame_number):
         app.logger.info("Number of animals found = %s", number_of_animals_found)
  
     # ===== NEW: FETCH POSE DATA FOR EACH ANIMAL FROM H5 FILES =====
-    pose_absolute = {}
     
-    if INCLUDE_POSE:
+    pose_absolute = {}
+    include_pose = INCLUDE_POSE and request.args.get("pose", "1") != "0"
+    
+    if include_pose:
         try:
             # Get list of fly identities
             experiment=SELECTED_EXPERIMENT.replace("/", "_")
