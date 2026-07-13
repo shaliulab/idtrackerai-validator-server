@@ -80,6 +80,13 @@ class DatabaseManager:
 
 # Existing function remains unchanged.
 def make_templates(db, key=None, fragments=False, use_val="_VAL"):
+
+    class STORE_INDEX(db.Model):
+        __bind_key__ = key
+        __table_args__ = {'extend_existing': True}
+        frame_number = db.Column(db.Integer, primary_key=True)
+        frame_time = db.Column(db.Integer)   # ms since the time marked in the experiment name
+            
     class ROI_ABS(db.Model):
         __abstract__ = True
         id = db.Column(db.Integer, primary_key=True)
@@ -144,5 +151,6 @@ def make_templates(db, key=None, fragments=False, use_val="_VAL"):
         frame_number = db.Column(db.Integer, primary_key=True)
         ai = db.Column(db.String(30))
 
-    tables = {"ROI_0": ROI_0, "METADATA": METADATA, "IDENTITY": IDENTITY, "CONCATENATION": CONCATENATION, "AI": AI}
+    tables = {"ROI_0": ROI_0, "METADATA": METADATA, "IDENTITY": IDENTITY,
+              "CONCATENATION": CONCATENATION, "AI": AI, "STORE_INDEX": STORE_INDEX}
     return tables

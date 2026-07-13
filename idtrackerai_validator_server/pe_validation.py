@@ -135,11 +135,11 @@ def register_pe_validation(app, get_selected_experiment):
                     for r in c.execute(
                         "SELECT start_frame,end_frame,verdict FROM pe_annotations "
                         "WHERE experiment=? AND identity=?", (exp, identity))}
-        for b in bouts:
-            b["verdict"] = seen.get((int(b["start_fn"]), int(b["end_fn"])))
 
         fly = _fly_id(exp, identity)
+
         for b in bouts:
+            b["verdict"] = seen.get((int(b["start_fn"]), int(b["end_fn"])))
             b["trace_stem"] = f"{fly}_burst_{int(b['burst_id'])}"                       # -> plots/{...}.png
             b["media_stem"] = f"{fly}_burst_{int(b['burst_id'])}_bout_{int(b['bout_uid'])}"
         return jsonify(bouts)

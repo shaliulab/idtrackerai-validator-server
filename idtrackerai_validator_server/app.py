@@ -433,7 +433,10 @@ def get_tracking(frame_number):
  
         output = tables["ROI_0"].query.filter_by(frame_number=frame_number)
         identity_table = tables["IDENTITY"].query.filter_by(frame_number=frame_number)
- 
+         # frame_time (ms since the marked time) lives in STORE_INDEX, keyed by frame_number
+        store_row = tables["STORE_INDEX"].query.filter_by(frame_number=frame_number).first()
+        frame_time = store_row.frame_time if store_row is not None else None
+
         for row in output.all():
             identity = None
             local_identity = None
@@ -452,7 +455,9 @@ def get_tracking(frame_number):
             else:
                 modified = row.modified
             
-            t = frame_number / session.get("framerate", FRAMERATE) + offset
+            # t = seconds since ZT0. frame_time is ms since the marked time; offset is
+            # the seconds between ZT0 and that marked time.
+            t = frame_time / 1000 + offset
             hours = str(int(t // 3600)).zfill(2)
             minutes = str(int((t % 3600) // 60)).zfill(2)
             seconds = str(int(t % 60)).zfill(2)
