@@ -102,8 +102,8 @@ def register_pe_validation(app, get_selected_experiment):
 
         df = pd.read_feather(feather)
         # bursts that contain at least one PE bout
-        pe_bursts = set(df.loc[df["label"] == "pe", "burst_id"].unique())
-        df = df[df["burst_id"].isin(pe_bursts)].copy()
+        # pe_bursts = set(df.loc[df["label"] == "pe", "burst_id"].unique())
+        # df = df[df["burst_id"].isin(pe_bursts)].copy()
 
         # low score first among the PE ones; keep burst grouping intact
         df = df.sort_values(["burst_id", "start_fn"])
@@ -117,16 +117,6 @@ def register_pe_validation(app, get_selected_experiment):
                             "pe_score", "dur_s", "label", "label_reason", "is_pe")
                 if c in df.columns]
         bouts = df[cols].to_dict("records")
-
-        # # low score first: the bouts most likely wrong are the most useful to review
-        # df = df.sort_values("pe_score", ascending=True)
-        # df["start_fidx"]=df["start_fn"]%chunksize
-        # df["end_fidx"]=df["end_fn"]%chunksize
-    
-        # cols = [c for c in ("burst_id", "bout_uid", "start_fn", "end_fn", "start_fidx", "end_fidx", "n_in_burst",
-        #                     "is_solitary", "pe_score", "dur_s", "label_reason")
-        #         if c in df.columns]
-        # bouts = df[cols].to_dict("records")
 
         # attach existing verdicts
         with sqlite3.connect(PE_DB) as c:
@@ -174,13 +164,16 @@ def register_pe_validation(app, get_selected_experiment):
 
     @app.route("/api/pe/media/<path:filename>", methods=["GET"])
     def pe_media(filename):
-        """Serve a burst clip / pose JSON / trace PNG for the LOADED experiment.
-        The directory is derived per experiment, so switching experiments serves the
-        right fly's media without any config change."""
         exp, err = _experiment_or_400()
         if err:
             return err
-        return send_from_directory(os.path.realpath(_media_dir(exp)), filename)
+        resp = send_from_directory(os.path.realpath(_media_dir(exp)), filename)
+        # explicit CORS so a cross-origin <video crossorigin> can taint-free-draw to canvas
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Range"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Range, Accept-Ranges, Content-Length"
+        return resp
 
     @app.route("/api/pe/export", methods=["GET"])
     def pe_export():
