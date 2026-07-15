@@ -143,10 +143,20 @@ def register_pe_validation(app, get_selected_experiment):
         need = ("fly", "start_frame", "end_frame", "verdict")
         if not all(k in d for k in need):
             return jsonify({"error": f"need {need}"}), 400
-        if d["verdict"] not in _VERDICTS:
-            return jsonify({"error": f"verdict must be one of {_VERDICTS}"}), 400
-
+        
+        verdict=d["verdict"]
         identity = int(d["fly"].rsplit("__", 1)[1])   # only the identity from fly
+
+        if verdict is None:
+            with sqlite3.connect(PE_DB) as c:
+                c.execute(
+                    "DELETE FROM pe_annotations "
+                    "WHERE experiment=? AND identity=? AND start_frame=? AND end_frame=?",
+                    (exp, identity, int(d["start_frame"]), int(d["end_frame"])))
+            return jsonify({"ok": True, "deleted": True})
+    
+        if verdict not in _VERDICTS:
+            return jsonify({"error": f"verdict must be one of {_VERDICTS}"}), 400
 
         with sqlite3.connect(PE_DB) as c:
             c.execute("""
@@ -158,7 +168,7 @@ def register_pe_validation(app, get_selected_experiment):
                 DO UPDATE SET verdict=excluded.verdict, pe_score=excluded.pe_score,
                             reviewer=excluded.reviewer, reviewed_at=excluded.reviewed_at
             """, (exp, identity, int(d["start_frame"]), int(d["end_frame"]),   # ← exp, not flat
-                d.get("burst_id"), d.get("bout_uid"), d["verdict"], d.get("pe_score"),
+                d.get("burst_id"), d.get("bout_uid"), verdict, d.get("pe_score"),
                 d.get("reviewer", "anon"), datetime.datetime.utcnow().isoformat()))
         return jsonify({"ok": True})
 
