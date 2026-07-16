@@ -14,6 +14,7 @@ INTEGRATION (see the chat message):
   3. set PE_BOUTS_DIR / PE_MEDIA_DIR / PE_DB below (or via env)
 """
 import os
+import logging
 import sqlite3
 import datetime
 import pandas as pd
@@ -25,11 +26,25 @@ from flyhostel.utils import (
     get_framerate
 )
 
+logger=logging.getLogger(__name__)
+
 # --- where your pipeline wrote things (edit or set via env) ---------------------
 # PE media lives UNDER EACH EXPERIMENT'S TREE, so the media dir is DERIVED from the
 # experiment per request (see _media_dir), not a fixed constant.
 PE_DB          = os.environ.get("PE_DB", "pe_annotations.db")      # separate from tracking DB
 
+
+import os
+_TRACE_CACHE = {}   # fly -> (mtime, DataFrame)
+
+def _load_traces_cached(traces_file, fly):
+    mtime = os.path.getmtime(traces_file)
+    hit = _TRACE_CACHE.get(fly)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    df = pd.read_feather(traces_file)
+    _TRACE_CACHE[fly] = (mtime, df)
+    return df
 
 def _media_dir(experiment):
     # parent of both plots/ and videos/, so a request for "videos/xxx.mp4" or
@@ -202,6 +217,7 @@ def register_pe_validation(app, get_selected_experiment):
     def pe_trace():
         """Per-frame trace + bout spans + inter-bout gaps for ONE burst.
         Query: ?identity=1&burst_id=2639"""
+        import time; t0 = time.time()
         exp, err = _experiment_or_400()
         if err:
             return err
@@ -216,8 +232,9 @@ def register_pe_validation(app, get_selected_experiment):
         traces_file = os.path.join(_media_dir(exp), f"{fly}_traces.feather")   # the extract_burst_traces output
         if not os.path.exists(traces_file):
             return jsonify({"error": f"no trace feather for {fly}"}), 404
-        d = pd.read_feather(traces_file)
+        d = _load_traces_cached(traces_file, fly)
         d = d[d["burst_id"] == burst_id].sort_values("frame_number").copy()
+
         if d.empty:
             return jsonify({"error": f"burst {burst_id} not in trace"}), 404
 
