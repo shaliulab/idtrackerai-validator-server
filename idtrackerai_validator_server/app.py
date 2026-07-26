@@ -317,6 +317,24 @@ def row2dict(row):
         d[column.name] = getattr(row, column.name)
     return d
 
+
+@app.route('/api/frame_range', methods=['GET'])
+def get_frame_range():
+    if db_manager is None:
+        return _experiment_required()
+    tables = db_manager.tables
+    try:
+        # tables["IDENTITY"] is already IDENTITY_VAL or IDENTITY,
+        # depending on db_manager.use_val — so this respects app.py's choice.
+        min_frame, max_frame = db.session.query(
+            func.min(tables["IDENTITY"].frame_number),
+            func.max(tables["IDENTITY"].frame_number),
+        ).one()
+        return jsonify({"min_frame": min_frame, "max_frame": max_frame})
+    except Exception as error:
+        logger.error("Error computing frame range: %s", error)
+        return jsonify({"message": str(error)}), 500
+
 @app.route("/api/framerate", methods=['GET'])
 def get_framerate():
     if db_manager is None:
