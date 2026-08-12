@@ -33,6 +33,7 @@ logger=logging.getLogger(__name__)
 # experiment per request (see _media_dir), not a fixed constant.
 PE_DB          = os.environ.get("PE_DB", "pe_annotations.db")      # separate from tracking DB
 
+AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "audit.csv")
 
 import os
 _TRACE_CACHE = {}   # fly -> (mtime, DataFrame)
@@ -267,3 +268,17 @@ def register_pe_validation(app, get_selected_experiment):
                                              d["is_peak"])],
             "spans": spans_out, "gaps": gaps_out,
         })
+
+
+    @app.route("/api/pe/audit", methods=["GET"])
+    def pe_audit():
+        exp, err = _experiment_or_400()
+        if err:
+            return err
+        fly = request.args["fly"]
+        if not os.path.exists(AUDIT_CSV):
+            return jsonify([])
+        logger.info("Reading %s", AUDIT_CSV)
+        a = pd.read_csv(AUDIT_CSV)
+        a = a[a["fly"] == fly]
+        return jsonify([int(b) for b in a["burst_id"]])
