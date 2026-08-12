@@ -5,10 +5,10 @@ setup(
     version='0.1.0',  # Your package version
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
-    description='A short description of your project',
+    description='An easy to use viewer of flyhostel data',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
-    url='https://github.com/shaliulab/behavior-viewer',
+    url='https://github.com/shaliulab/idtrackerai-validator-server',
     packages=find_packages(),
     classifiers=[
         'Programming Language :: Python :: 3',
@@ -27,7 +27,6 @@ setup(
         "webcolors",
         "flyhostel",
         ""
-        # Add more packages as needed
     ],
     entry_points={
         'console_scripts': [
