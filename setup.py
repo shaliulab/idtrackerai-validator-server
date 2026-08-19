@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='idtrackerai_validator_server',
-    version='0.1.0',  # Your package version
+    version='1.0',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',
@@ -15,7 +15,7 @@ setup(
         'License :: OSI Approved',
         'Operating System :: OS Independent',
     ],
-    python_requires='>=3.7.4',  # Specify your minimal Python version
+    python_requires='>=3.7.4',
     install_requires=[
         "flask>=2.2.5",
         "Flask-SQLAlchemy>=3.0.5",
@@ -26,7 +26,6 @@ setup(
         "opencv-python",
         "webcolors",
         "h5py",
-        # "flyhostel",
         ""
     ],
     entry_points={
