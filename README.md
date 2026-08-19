@@ -30,7 +30,8 @@ pip install .
 ```
 ## Set up npm
 
-*Install npm if not available in your machine. Google how.
+* Install npm if not available in your machine. Google how.
+
 
 Then run
 
