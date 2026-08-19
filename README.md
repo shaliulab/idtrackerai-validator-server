@@ -43,8 +43,37 @@ npm start
 # Setup
 ```
 echo "export FLYHOSTEL_VIDEOS='/path/to/flyhostel_data/videos'" >> ~/.bashrc
+FLYHOSTEL_VIDEOS='/path/to/flyhostel_data/videos'
 ```
 
+
+# Structure database
+
+The application assumes the experiment folders are saved in a database as follows
+
+`$FLYHOSTEL_VIDEOS/FlyHostelN/GROUPSIZEX/FOLDER`
+
+example:
+
+`'/path/to/flyhostel_data/videos/FlyHostel1/3X/2026-08-19_14-00-00'`
+
+Inside `2026-08-19_14-00-00` the application expects a collection of .mp4 files named 
+
+`000001.mp4`
+`000002.mp4`
+`000003.mp4`
+and so on
+
+and a sqlite file called 
+
+`FlyHostel1_3X_2026-08-19_14-00-00.db`
+
+Once you have a database structured like that, run:
+
+```
+cd $FLYHOSTEL_VIDEOS
+find -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db > index.txt
+```
 
 # Run
 
