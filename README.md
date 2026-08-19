@@ -12,7 +12,6 @@ Validate results of experiments in the flyhostel platform
 mkdir -p $HOME/opt
 cd $HOME/opt
 git clone git@github.com:shaliulab/idtrackerai-validator-server
-cd idtrackerai-validator-server
 ```
 
 # Make conda/mamba environment (optional)
@@ -23,6 +22,7 @@ conda activate validator
 
 ## Install python dependencies (tested on Python 3.10.4)
 ```
+cd $HOME/opt/idtrackerai-validator-server
 git submodule update --init
 pip install idtrackerai
 pip install flyhostel
