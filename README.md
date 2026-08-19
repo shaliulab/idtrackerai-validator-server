@@ -5,7 +5,9 @@ How to install in Linux
 git clone git@github.com:shaliulab/idtrackerai-validator-server
 cd idtrackerai-validator-server
 
+
 ## Install python dependencies (tested on Python 3.10.4)
+git submodule update --init
 pip install idtrackerai
 pip install flyhostel
 pip install .
