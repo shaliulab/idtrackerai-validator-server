@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='idtrackerai_validator_server',
-    version='1.0.1',
+    version='1.0.2',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',
