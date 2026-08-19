@@ -62,6 +62,7 @@ Inside `2026-08-19_14-00-00` the application expects a collection of .mp4 files 
 `000001.mp4`
 `000002.mp4`
 `000003.mp4`
+
 and so on
 
 and a sqlite file called 
@@ -77,7 +78,6 @@ find -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db > index.
 
 # Run
 
-
 ## Run backend
 
 Spawn a terminal and run
@@ -85,8 +85,6 @@ Spawn a terminal and run
 cd $HOME/opt/idtrackerai-validator-server
 python idtrackerai_validator_server/main.py
 ```
-
-
 
 ## Run frontend
 
