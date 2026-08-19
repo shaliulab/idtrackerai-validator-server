@@ -66,3 +66,5 @@ Spawn a terminal and run
 cd $HOME/opt/idtrackerai-validator-server/idtrackerai-validator-client
 npm start
 ```
+
+The application should then be available under http://localhost:3000
