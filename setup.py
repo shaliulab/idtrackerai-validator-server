@@ -25,7 +25,8 @@ setup(
         "numpy>=1.21.6",
         "opencv-python",
         "webcolors",
-        "flyhostel",
+        "h5py",
+        # "flyhostel",
         ""
     ],
     entry_points={
