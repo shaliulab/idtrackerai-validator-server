@@ -37,7 +37,7 @@ Then run
 
 ```
 cd $HOME/opt/idtrackerai-validator-server/idtrackerai-validator-client
-npm start
+npm install
 ```
 
 
