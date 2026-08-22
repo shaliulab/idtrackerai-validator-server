@@ -24,7 +24,9 @@ conda activate validator
 ```
 cd $HOME/opt/idtrackerai-validator-server
 git submodule update --init
-pip install ./idtrackerai ./flyhostel .
+pip install ./idtrackerai[gpu]
+pip install ./flyhostel
+pip install .
 ```
 ## Set up npm
 
