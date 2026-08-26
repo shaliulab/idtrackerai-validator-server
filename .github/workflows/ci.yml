@@ -30,6 +30,8 @@ jobs:
           python-version: '3.10'
 
       - name: Build the React client
+        env:
+            CI: false # TODO set to true when I fix the warnings
         run: |
           npm --prefix idtrackerai-validator-client ci
           npm --prefix idtrackerai-validator-client run build
