@@ -133,7 +133,7 @@ def get_h5_file(fly_id_str, experiment):
         if cache_key in _h5_file_cache:
             return _h5_file_cache[cache_key]
         
-        folder=f"/flyhostel_data/videos/{experiment}/motionmapper/{fly_id_str}/pose_raw"
+        folder=os.path.join(os.environ["FLYHOSTEL_VIDEOS"], f"{experiment}/motionmapper/{fly_id_str}/pose_raw")
         pose_file = f"{folder}/{cache_key}/{cache_key}.h5"
         
         if not Path(pose_file).exists():

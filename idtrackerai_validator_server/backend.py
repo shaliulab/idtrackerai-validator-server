@@ -8,6 +8,7 @@ import logging
 import sqlite3
 import math
 import re
+from pathlib import Path
 
 import webcolors
 import cv2
@@ -189,10 +190,29 @@ def filter_by_date(experiment):
     return dt >= datetime.datetime.strptime("2023-05-23", "%Y-%m-%d")
 
 
+
+
+DB_RE = re.compile(r".*FlyHostel.*db")
+def update_experiments(root=None, output="index.txt"):
+    root = Path(root or os.environ["FLYHOSTEL_VIDEOS"])
+
+    entries = []
+    for path in root.glob("*/*/*/*"):          # exactly 4 levels: -mindepth 4 -maxdepth 4
+        rel = path.relative_to(root).as_posix()
+        if path.name == "index.db":            # -not -name index.db
+            continue
+        if DB_RE.fullmatch(rel):               # -regex .*FlyHostel.*db
+            entries.append(f"./{rel}")
+
+    entries.sort()
+    (root / output).write_text("\n".join(entries) + "\n")
+    return entries
+
 def list_experiments():
-    # cd /flyhostel_data/videos
+    # cd $FLYHOSTEL_VIDEOS
     # find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db > index.txt
-    index=pd.read_csv("/flyhostel_data/videos/index.txt", header=None)
+    # update_experiments
+    index=pd.read_csv(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), header=None)
     dbfiles=index[0]
     experiments=[os.path.basename(path).replace(".db", "") for path in dbfiles]
     return {"experiments": experiments}
