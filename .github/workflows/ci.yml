@@ -107,9 +107,7 @@ jobs:
           # No [gpu] extra: torch/torchvision are multi-GB and the probes below
           # never run inference. If the server fails to start without them, the
           # right fix is a lazy import, not installing torch here.
-          /tmp/testenv/bin/pip install \
-            "git+https://github.com/shaliulab/idtrackerai" \
-            "git+https://github.com/shaliulab/flyhostel"
+          /tmp/testenv/bin/pip install "git+https://github.com/shaliulab/flyhostel"
 
       - name: Install the wheel
         run: /tmp/testenv/bin/pip install dist/*.whl
