@@ -1,9 +1,9 @@
 import os
+from threading import Lock, Timer
 import shutil
 import argparse
 import re
 import traceback
-from threading import Lock
 import logging
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -239,12 +239,6 @@ def get_pose_from_h5(fly_id_str, frame_number, experiment, chunksize):
 
 def _experiment_required():
     return jsonify({"error": "No experiment loaded. POST to /api/load first."}), 503
-
-
-@app.route("/", methods=["GET"])
-def get():
-    return jsonify({"message": "success"})
-
 
 @app.route("/api/list", methods=["GET"])
 def list():
@@ -643,20 +637,25 @@ def get_flies():
         ]
         return jsonify(flies)
 
-@app.route('/shutdown', methods=['POST'])
+@app.route('/api/shutdown', methods=['POST'])
 def shutdown():
-    shutdown_server()
-    message='Shutting down gracefully...'
-    logger.debug(message)
-    return jsonify({"message": message})
+    Timer(0.5, lambda: os._exit(0)).start()
+    return jsonify({"message": "Shutting down gracefully..."})
+
 
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
+    if path.startswith("api/"):
+        return jsonify({"error": "unknown endpoint"}), 404
+
     candidate = os.path.join(FRONTEND_DIR, path)
     if path and os.path.isfile(candidate):
-        return send_from_directory(FRONTEND_DIR, path)
-    return send_from_directory(FRONTEND_DIR, "index.html")
+        # Hashed filenames — safe to cache hard.
+        return send_from_directory(FRONTEND_DIR, path, max_age=31536000)
+
+    # index.html must never be cached, or a rebuilt bundle won't be picked up.
+    return send_from_directory(FRONTEND_DIR, "index.html", max_age=0)
 
 def shutdown_server():
     func = request.environ.get('werkzeug.server.shutdown')
