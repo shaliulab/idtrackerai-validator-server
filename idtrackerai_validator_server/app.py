@@ -61,6 +61,9 @@ if USE_VAL is not None:
 lock = Lock()
 
 # Initialize application with CORS settings
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "idtrackerai-validator-client")
+
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
 CORS(app)
@@ -640,8 +643,6 @@ def get_flies():
         ]
         return jsonify(flies)
 
-
-
 @app.route('/shutdown', methods=['POST'])
 def shutdown():
     shutdown_server()
@@ -649,6 +650,13 @@ def shutdown():
     logger.debug(message)
     return jsonify({"message": message})
 
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    candidate = os.path.join(FRONTEND_DIR, path)
+    if path and os.path.isfile(candidate):
+        return send_from_directory(FRONTEND_DIR, path)
+    return send_from_directory(FRONTEND_DIR, "index.html")
 
 def shutdown_server():
     func = request.environ.get('werkzeug.server.shutdown')
