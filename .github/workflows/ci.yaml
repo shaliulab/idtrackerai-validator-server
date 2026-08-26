@@ -1,0 +1,137 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: idtrackerai-validator-client/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Build the React client
+        run: |
+          npm --prefix idtrackerai-validator-client ci
+          npm --prefix idtrackerai-validator-client run build
+          rm -rf idtrackerai_validator_server/frontend
+          cp -r idtrackerai-validator-client/build idtrackerai_validator_server/frontend
+          test -f idtrackerai_validator_server/frontend/index.html
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Verify the frontend is inside both artifacts
+        run: |
+          set -euo pipefail
+
+          echo "--- wheel ---"
+          wheel=$(ls dist/*.whl)
+          unzip -l "$wheel" | grep -q 'idtrackerai_validator_server/frontend/index.html' \
+            || { echo "wheel is missing index.html"; exit 1; }
+          n=$(unzip -l "$wheel" | grep -c 'frontend/static/' || true)
+          echo "static assets in wheel: $n"
+          test "$n" -gt 0 || { echo "wheel has no static assets"; exit 1; }
+
+          echo "--- sdist ---"
+          sdist=$(ls dist/*.tar.gz)
+          tar -tzf "$sdist" | grep -q 'idtrackerai_validator_server/frontend/index.html' \
+            || { echo "sdist is missing index.html"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  smoke-test:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install the wheel into a clean environment
+        run: |
+          python -m venv /tmp/testenv
+          /tmp/testenv/bin/pip install --upgrade pip
+          /tmp/testenv/bin/pip install dist/*.whl
+
+      - name: Serve and probe
+        run: |
+          set -euo pipefail
+
+          # Empty data directory: the server must start and answer even with
+          # no experiments, which is the state a new user is in.
+          mkdir -p /tmp/videos
+          : > /tmp/videos/index.txt
+          export FLYHOSTEL_VIDEOS=/tmp/videos
+
+          cd /tmp        # away from any source tree
+          /tmp/testenv/bin/start-idtrackerai-validator-server \
+            --port 5000 --no-browser > /tmp/server.log 2>&1 &
+
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:5000/ && break
+            sleep 1
+          done
+
+          echo "--- index ---"
+          curl -sf http://localhost:5000/ | head -c 100
+          echo
+
+          echo "--- main bundle ---"
+          js=$(curl -sf http://localhost:5000/ | grep -o '/static/js/main\.[^"]*\.js' | head -1)
+          test -n "$js" || { echo "no bundle referenced in index.html"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:5000$js")
+          test "$code" = "200" || { echo "bundle returned $code"; exit 1; }
+
+          echo "--- SPA catch-all ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/some/deep/route)
+          test "$code" = "200" || { echo "catch-all returned $code"; exit 1; }
+
+          echo "--- unknown API route must 404, not serve HTML ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/api/nonexistent)
+          test "$code" = "404" || { echo "unknown API route returned $code"; exit 1; }
+
+          echo "all probes passed"
+
+      - name: Server log
+        if: always()
+        run: cat /tmp/server.log || true
+
+  publish:
+    needs: [package, smoke-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write        # trusted publishing; no API token needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
