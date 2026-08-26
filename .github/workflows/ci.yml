@@ -50,16 +50,19 @@ jobs:
 
           echo "--- wheel ---"
           wheel=$(ls dist/*.whl)
-          unzip -l "$wheel" | grep -q 'idtrackerai_validator_server/frontend/index.html' \
+          unzip -l "$wheel" > /tmp/wheel-list.txt
+          grep -q 'idtrackerai_validator_server/frontend/index.html' /tmp/wheel-list.txt \
             || { echo "wheel is missing index.html"; exit 1; }
-          n=$(unzip -l "$wheel" | grep -c 'frontend/static/' || true)
+          n=$(grep -c 'frontend/static/' /tmp/wheel-list.txt || true)
           echo "static assets in wheel: $n"
           test "$n" -gt 0 || { echo "wheel has no static assets"; exit 1; }
 
           echo "--- sdist ---"
           sdist=$(ls dist/*.tar.gz)
-          tar -tzf "$sdist" | grep -q 'idtrackerai_validator_server/frontend/index.html' \
+          tar -tzf "$sdist" > /tmp/sdist-list.txt
+          grep -q 'idtrackerai_validator_server/frontend/index.html' /tmp/sdist-list.txt \
             || { echo "sdist is missing index.html"; exit 1; }
+          echo "static assets in sdist: $(grep -c 'frontend/static/' /tmp/sdist-list.txt || true)"
 
       - uses: actions/upload-artifact@v4
         with:
