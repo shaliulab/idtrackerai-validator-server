@@ -36,9 +36,9 @@ class BuildWithFrontend(build_py):
                 )
             subprocess.check_call([npm, "ci"], cwd=CLIENT_DIR)
             subprocess.check_call([npm, "run", "build"], cwd=CLIENT_DIR)
-            shutil.copytree(
-                os.path.join(CLIENT_DIR, "build"), FRONTEND_DST, dirs_exist_ok=True
-            )
+            if os.path.exists(FRONTEND_DST):
+                shutil.rmtree(FRONTEND_DST)
+            shutil.copytree(os.path.join(CLIENT_DIR, "build"), FRONTEND_DST)
         super().run()
 
 
