@@ -3,17 +3,21 @@ name: build
 on:
   push:
     branches: [main, master]
-    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 jobs:
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
+      # No `submodules: recursive` here: this job only builds the React client
+      # and packages the wheel, so idtrackerai/flyhostel (and their private
+      # nested submodules) are never needed.
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Check out the client submodule only
+        run: git submodule update --init idtrackerai-validator-client
 
       - uses: actions/setup-node@v4
         with:
@@ -63,6 +67,7 @@ jobs:
   smoke-test:
     needs: package
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -73,11 +78,36 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install the wheel into a clean environment
+      - name: Install runtime dependencies from GitHub
+        env:
+          GH_PAT: ${{ secrets.SUBMODULE_PAT }}
         run: |
+          set -euo pipefail
+
+          if [ -z "${GH_PAT}" ]; then
+            echo "SUBMODULE_PAT is not set. Add it under"
+            echo "Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+          # flyhostel and idtrackerai pull in private nested submodules
+          # (flyhostel-modelling, zeitgeber, googleapi, flyhostel-validation).
+          # This rewrite lets git authenticate to all of them with the token.
+          git config --global url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          git config --global url."https://${GH_PAT}@github.com/".insteadOf "git@github.com:"
+
           python -m venv /tmp/testenv
           /tmp/testenv/bin/pip install --upgrade pip
-          /tmp/testenv/bin/pip install dist/*.whl
+
+          # No [gpu] extra: torch/torchvision are multi-GB and the probes below
+          # never run inference. If the server fails to start without them, the
+          # right fix is a lazy import, not installing torch here.
+          /tmp/testenv/bin/pip install \
+            "git+https://github.com/shaliulab/idtrackerai" \
+            "git+https://github.com/shaliulab/flyhostel"
+
+      - name: Install the wheel
+        run: /tmp/testenv/bin/pip install dist/*.whl
 
       - name: Serve and probe
         run: |
@@ -108,9 +138,16 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:5000$js")
           test "$code" = "200" || { echo "bundle returned $code"; exit 1; }
 
-          echo "--- SPA catch-all ---"
-          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/some/deep/route)
-          test "$code" = "200" || { echo "catch-all returned $code"; exit 1; }
+          echo "--- SPA catch-all, one segment ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/settings)
+          test "$code" = "200" || { echo "one-segment route returned $code"; exit 1; }
+
+          echo "--- SPA catch-all, deep path ---"
+          # Regression guard: Flask's built-in static rule used to shadow the
+          # catch-all here, and a one-segment path alone would not have caught it.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+                 http://localhost:5000/experiment/FlyHostel1/3X/2026-08-19_14-00-00/frame/900)
+          test "$code" = "200" || { echo "deep route returned $code"; exit 1; }
 
           echo "--- unknown API route must 404, not serve HTML ---"
           code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/api/nonexistent)
@@ -121,17 +158,3 @@ jobs:
       - name: Server log
         if: always()
         run: cat /tmp/server.log || true
-
-  publish:
-    needs: [package, smoke-test]
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write        # trusted publishing; no API token needed
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
