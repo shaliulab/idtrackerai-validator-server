@@ -1,2 +1,5 @@
 frames/
+*.egg-info/
 __pycache__/
+server.log
+idtrackerai_validator_server/frontend/
