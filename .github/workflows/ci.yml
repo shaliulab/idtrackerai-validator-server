@@ -104,13 +104,28 @@ jobs:
           python -m venv /tmp/testenv
           /tmp/testenv/bin/pip install --upgrade pip
 
-          # No [gpu] extra: torch/torchvision are multi-GB and the probes below
-          # never run inference. If the server fails to start without them, the
-          # right fix is a lazy import, not installing torch here.
+          # idtrackerai[gpu] would pull the CUDA build of torch from PyPI (~3GB,
+          # plus a dozen nvidia-* packages). The probes below never run
+          # inference, so install the CPU wheels FIRST — pip leaves an already
+          # satisfied requirement alone, so the later install won't replace them.
+          /tmp/testenv/bin/pip install torch torchvision \
+            --index-url https://download.pytorch.org/whl/cpu
+
+          # opencv-python<4 (required by idtrackerai) is built against the
+          # numpy 1.x ABI and cannot load under numpy 2.
+          /tmp/testenv/bin/pip install "numpy<2"
+
           /tmp/testenv/bin/pip install "git+https://github.com/shaliulab/flyhostel"
 
       - name: Install the wheel
         run: /tmp/testenv/bin/pip install dist/*.whl
+
+      - name: Check the environment is consistent
+        run: |
+          /tmp/testenv/bin/pip list | grep -iE "numpy|opencv|torch" || true
+          # Catches incompatible metadata before the server tries to start,
+          # which gives a clearer failure than an ABI error deep in a traceback.
+          /tmp/testenv/bin/pip check
 
       - name: Serve and probe
         run: |
@@ -125,9 +140,17 @@ jobs:
           cd /tmp        # away from any source tree
           /tmp/testenv/bin/start-idtrackerai-validator-server \
             --port 5000 --no-browser > /tmp/server.log 2>&1 &
+          server_pid=$!
 
+          # Fail as soon as the process dies, rather than waiting out the full
+          # 30s and then reporting an opaque "connection refused".
           for i in $(seq 1 30); do
             curl -sf -o /dev/null http://localhost:5000/ && break
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              echo "server exited during startup:"
+              cat /tmp/server.log
+              exit 1
+            fi
             sleep 1
           done
 
