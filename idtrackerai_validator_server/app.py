@@ -17,6 +17,13 @@ from flask import session
 import h5py
 from pathlib import Path
 
+from flyhostel.utils import (
+    get_identities,
+    get_square_width,
+    get_square_height,    
+)
+from flyhostel.utils.pose_export import recreate_pose_file
+
 
 from idtrackerai_validator_server.constants import (
     WITH_FRAGMENTS, first_chunk, FRAMES_DIR, INCLUDE_POSE
@@ -28,14 +35,8 @@ from idtrackerai_validator_server.backend import (
     process_frame,
     list_experiments
 )
+from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.utils import load_rejections
-from flyhostel.utils import (
-    get_identities,
-    get_square_width,
-    get_square_height,    
-)
-from flyhostel.utils.pose_export import recreate_pose_file
-from pe_validation import register_pe_validation
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -61,10 +62,9 @@ if USE_VAL is not None:
 lock = Lock()
 
 # Initialize application with CORS settings
-FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "idtrackerai-validator-client")
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
 
-
-app = Flask(__name__)
+app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
 app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
 CORS(app)
 
