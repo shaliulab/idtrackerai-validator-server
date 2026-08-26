@@ -1,9 +1,9 @@
 [submodule "idtrackerai-validator-client"]
 	path = idtrackerai-validator-client
-	url = git@github.com:shaliulab/idtrackerai-validator-client
+	url = https://github.com/shaliulab/idtrackerai-validator-client
 [submodule "flyhostel"]
 	path = flyhostel
-	url = git@github.com:shaliulab/flyhostel
+	url = https://github.com/shaliulab/flyhostel
 [submodule "idtrackerai"]
 	path = idtrackerai
-	url = git@github.com:shaliulab/idtrackerai
+	url = https://github.com/shaliulab/idtrackerai
