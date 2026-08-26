@@ -69,7 +69,9 @@ setup(
         "flask_cors>=4.0.0",
         "pandas>=1.3.5",
         "numpy>=1.21.6,<2",
-        "opencv-python",
+        # opencv comes from idtrackerai via flyhostel, pinned to <4.
+        # Declaring opencv-python-headless here installs a second, conflicting
+        # copy of cv2 in the same directory.
         "webcolors",
         "h5py",
         "waitress",

@@ -113,8 +113,7 @@ jobs:
 
           # opencv-python<4 (required by idtrackerai) is built against the
           # numpy 1.x ABI and cannot load under numpy 2.
-          /tmp/testenv/bin/pip install "numpy<2"
-
+          # numpy<2 is declared in setup.py; no separate pin needed here
           /tmp/testenv/bin/pip install "git+https://github.com/shaliulab/flyhostel"
 
       - name: Install the wheel

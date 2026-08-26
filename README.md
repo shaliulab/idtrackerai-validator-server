@@ -29,7 +29,7 @@ git submodule update --init --recursive
 ## Make a conda/mamba environment (optional)
 
 ```
-conda create --name validator python=3.7.12
+conda create --name validator python=3.10
 conda activate validator
 ```
 
@@ -50,7 +50,7 @@ looks for it. Re-run it whenever you change the client.
 
 ## Install the Python package
 
-Tested on Python 3.7.12.
+Tested on Python 3.10.
 
 ```
 cd $HOME/opt/idtrackerai-validator-server
