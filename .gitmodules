@@ -4,6 +4,3 @@
 [submodule "flyhostel"]
 	path = flyhostel
 	url = https://github.com/shaliulab/flyhostel
-[submodule "idtrackerai"]
-	path = idtrackerai
-	url = https://github.com/shaliulab/idtrackerai
