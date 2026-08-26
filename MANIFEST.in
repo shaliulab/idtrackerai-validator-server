@@ -1,0 +1,4 @@
+include README.md
+recursive-include idtrackerai_validator_server/frontend *
+prune idtrackerai-validator-client
+global-exclude *.py[cod] __pycache__
