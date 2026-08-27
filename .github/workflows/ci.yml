@@ -16,8 +16,14 @@ jobs:
       # nested submodules) are never needed.
       - uses: actions/checkout@v4
 
-      - name: Check out the client submodule only
-        run: git submodule update --init idtrackerai-validator-client
+      - name: Check out submodules needed to build
+        env:
+          GH_PAT: ${{ secrets.SUBMODULE_PAT }}
+        run: |
+          git config --global --add url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          # Non-recursive: setup.py only needs flyhostel/setup.py to exist.
+          # Its own submodules are resolved at install time, not build time.
+          git submodule update --init idtrackerai-validator-client flyhostel
 
       - uses: actions/setup-node@v4
         with:
@@ -74,6 +80,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # The wheel records `flyhostel @ file:///home/runner/work/<repo>/<repo>/flyhostel`,
+      # an absolute path from the package job. GitHub's workspace path is
+      # deterministic, so checking the repo out here makes that URL resolve.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: dist
@@ -83,7 +94,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install runtime dependencies from GitHub
+      - name: Install runtime dependencies
         env:
           GH_PAT: ${{ secrets.SUBMODULE_PAT }}
         run: |
@@ -95,11 +106,16 @@ jobs:
             exit 1
           fi
 
-          # flyhostel and idtrackerai pull in private nested submodules
-          # (flyhostel-modelling, zeitgeber, googleapi, flyhostel-validation).
-          # This rewrite lets git authenticate to all of them with the token.
-          git config --global url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
-          git config --global url."https://${GH_PAT}@github.com/".insteadOf "git@github.com:"
+          # flyhostel's nested submodules are private (flyhostel-modelling,
+          # zeitgeber, googleapi, flyhostel-validation). This rewrite lets git
+          # authenticate to them with the token. --add keeps both entries:
+          # a second `git config` without it would replace the first.
+          git config --global --add url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          git config --global --add url."https://${GH_PAT}@github.com/".insteadOf "git@github.com:"
+
+          # Recursive: flyhostel's setup.py resolves idtrackerai and ethoscopy
+          # from its own libraries/ directory, so those must be populated.
+          git submodule update --init --recursive
 
           python -m venv /tmp/testenv
           /tmp/testenv/bin/pip install --upgrade pip
@@ -111,17 +127,19 @@ jobs:
           /tmp/testenv/bin/pip install torch torchvision \
             --index-url https://download.pytorch.org/whl/cpu
 
-          # opencv-python<4 (required by idtrackerai) is built against the
-          # numpy 1.x ABI and cannot load under numpy 2.
-          # numpy<2 is declared in setup.py; no separate pin needed here
-          /tmp/testenv/bin/pip install "git+https://github.com/shaliulab/flyhostel"
+          # opencv-python<4 (required by idtrackerai) is built against the numpy
+          # 1.x ABI. The wheel pins numpy<2, but flyhostel resolves first, so
+          # pin it here too.
+          /tmp/testenv/bin/pip install "numpy<2"
 
+      # flyhostel now comes from the wheel's own file:// dependency, which also
+      # exercises flyhostel's resolution of idtrackerai and ethoscopy.
       - name: Install the wheel
         run: /tmp/testenv/bin/pip install dist/*.whl
 
       - name: Check the environment is consistent
         run: |
-          /tmp/testenv/bin/pip list | grep -iE "numpy|opencv|torch" || true
+          /tmp/testenv/bin/pip list | grep -iE "numpy|opencv|torch|flyhostel|idtrackerai" || true
           # Catches incompatible metadata before the server tries to start,
           # which gives a clearer failure than an ABI error deep in a traceback.
           /tmp/testenv/bin/pip check

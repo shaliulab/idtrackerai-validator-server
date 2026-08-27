@@ -1,16 +1,48 @@
 import os
+import pathlib
 import shutil
 import subprocess
-
 from setuptools import setup, find_packages
 from setuptools.command.build_py import build_py
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-CLIENT_DIR = os.path.join(HERE, "idtrackerai-validator-client")
-FRONTEND_DST = os.path.join(HERE, "idtrackerai_validator_server", "frontend")
+HERE = pathlib.Path(__file__).parent.resolve()
+CLIENT_DIR = HERE / "idtrackerai-validator-client"
+FRONTEND_DST = HERE / "idtrackerai_validator_server" / "frontend"
 
-with open(os.path.join(HERE, "README.md"), encoding="utf-8") as fh:
+with open(HERE / "README.md", encoding="utf-8") as fh:
     LONG_DESCRIPTION = fh.read()
+
+
+def vendored(dist_name, path, extras=None):
+    """PEP 508 direct reference to a submodule checkout.
+
+    Absolute path required: pip resolves relative paths against the working
+    directory, not this file. `dist_name` must match the name declared in that
+    package's own setup.py, or pip rejects it as a metadata mismatch.
+    """
+    if not ((path / "setup.py").exists() or (path / "pyproject.toml").exists()):
+        raise SystemExit(
+            "{} is not checked out, and {} is not on PyPI.\n"
+            "Run: git submodule update --init --recursive".format(path.name, dist_name)
+        )
+    name = "{}[{}]".format(dist_name, ",".join(extras)) if extras else dist_name
+    return "{} @ {}".format(name, path.as_uri())
+
+
+install_requires = [
+    "flask>=2.2.5",
+    "Flask-SQLAlchemy>=3.0.5",
+    "sqlalchemy>=2.0.0",
+    "flask_cors>=4.0.0",
+    "pandas>=1.3.5",
+    "numpy>=1.21.6,<2",
+    # opencv comes from idtrackerai via flyhostel, pinned to <4. Declaring a
+    # different opencv variant here installs a second, conflicting copy of cv2.
+    "webcolors",
+    "h5py",
+    "waitress",
+    vendored("flyhostel", HERE / "flyhostel"),
+]
 
 
 class BuildWithFrontend(build_py):
@@ -61,21 +93,8 @@ setup(
         'License :: OSI Approved :: MIT License',
         'Operating System :: OS Independent',
     ],
-    python_requires='>=3.7',
-    install_requires=[
-        "flask>=2.2.5",
-        "Flask-SQLAlchemy>=3.0.5",
-        "sqlalchemy>=2.0.0",
-        "flask_cors>=4.0.0",
-        "pandas>=1.3.5",
-        "numpy>=1.21.6,<2",
-        # opencv comes from idtrackerai via flyhostel, pinned to <4.
-        # Declaring opencv-python-headless here installs a second, conflicting
-        # copy of cv2 in the same directory.
-        "webcolors",
-        "h5py",
-        "waitress",
-    ],
+    python_requires='>=3.10',
+    install_requires=install_requires,
     entry_points={
         'console_scripts': [
             "start-idtrackerai-validator-server=idtrackerai_validator_server.main:main",
