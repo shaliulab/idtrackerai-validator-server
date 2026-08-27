@@ -91,6 +91,7 @@ setup(
     classifiers=[
         'Programming Language :: Python :: 3',
     ],
+    license="MIT",
     python_requires='>=3.10',
     install_requires=install_requires,
     entry_points={
