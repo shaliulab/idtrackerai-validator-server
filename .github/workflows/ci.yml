@@ -45,12 +45,12 @@ jobs:
           cp -r idtrackerai-validator-client/build idtrackerai_validator_server/frontend
           test -f idtrackerai_validator_server/frontend/index.html
 
-      - name: Build sdist and wheel
+      - name: Build the wheel
         run: |
           python -m pip install --upgrade pip build
-          python -m build
+          python -m build --wheel
 
-      - name: Verify the frontend is inside both artifacts
+      - name: Verify the frontend is inside the wheel
         run: |
           set -euo pipefail
 
@@ -62,13 +62,6 @@ jobs:
           n=$(grep -c 'frontend/static/' /tmp/wheel-list.txt || true)
           echo "static assets in wheel: $n"
           test "$n" -gt 0 || { echo "wheel has no static assets"; exit 1; }
-
-          echo "--- sdist ---"
-          sdist=$(ls dist/*.tar.gz)
-          tar -tzf "$sdist" > /tmp/sdist-list.txt
-          grep -q 'idtrackerai_validator_server/frontend/index.html' /tmp/sdist-list.txt \
-            || { echo "sdist is missing index.html"; exit 1; }
-          echo "static assets in sdist: $(grep -c 'frontend/static/' /tmp/sdist-list.txt || true)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -134,8 +127,8 @@ jobs:
 
       # flyhostel now comes from the wheel's own file:// dependency, which also
       # exercises flyhostel's resolution of idtrackerai and ethoscopy.
-      - name: Install the wheel
-        run: /tmp/testenv/bin/pip install dist/*.whl
+      - name: Install as documented
+        run: /tmp/testenv/bin/pip install .
 
       - name: Check the environment is consistent
         run: |

@@ -54,8 +54,7 @@ Tested on Python 3.10.
 
 ```
 cd $HOME/opt/idtrackerai-validator-server
-pip install "./idtrackerai[gpu]"
-pip install ./flyhostel
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install .
 ```
 
