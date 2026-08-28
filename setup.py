@@ -47,10 +47,11 @@ install_requires = [
 
 class BuildWithFrontend(build_py):
     """Build the React client if its assets aren't already present.
-
-    When building from an sdist the assets are already inside the package, so
-    this is a no-op and npm is never needed. Only a build from a git checkout
-    triggers the npm run.
+    
+    
+    When the assets are already present
+    (built by build_frontend.sh or an earlier run),
+    this is a no-op and npm is never needed
     """
 
     def run(self):
@@ -76,7 +77,7 @@ class BuildWithFrontend(build_py):
 
 setup(
     name='idtrackerai_validator_server',
-    version='1.0.2',
+    version='1.1.0',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',
