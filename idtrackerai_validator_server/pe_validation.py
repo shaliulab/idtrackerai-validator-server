@@ -13,7 +13,7 @@ INTEGRATION (see the chat message):
          register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
   3. set PE_BOUTS_DIR / PE_MEDIA_DIR / PE_DB below (or via env)
 """
-import os
+import os.path
 import logging
 import sqlite3
 import datetime
@@ -31,7 +31,19 @@ logger=logging.getLogger(__name__)
 # --- where your pipeline wrote things (edit or set via env) ---------------------
 # PE media lives UNDER EACH EXPERIMENT'S TREE, so the media dir is DERIVED from the
 # experiment per request (see _media_dir), not a fixed constant.
-PE_DB          = os.environ.get("PE_DB", "pe_annotations.db")      # separate from tracking DB
+def annotations_db_path():
+    videos = os.environ.get("FLYHOSTEL_VIDEOS")
+    if videos:
+        return os.path.join(videos, "pe_annotations.db")
+    # Fall back to the XDG data directory when FLYHOSTEL_VIDEOS is unset.
+    base = os.environ.get(
+        "XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")
+    )
+    path = os.path.join(base, "flyhostel")
+    os.makedirs(path, exist_ok=True)
+    return os.path.join(path, "pe_annotations.db")
+
+PE_DB = os.environ.get("PE_ANNOTATIONS_DB") or annotations_db_path()
 
 AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "audit.csv")
 
