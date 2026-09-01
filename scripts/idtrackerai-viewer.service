@@ -1,0 +1,35 @@
+gUnit]
+Description=idtrackerai validator (FlyHostel viewer)
+Documentation=https://github.com/shaliulab/idtrackerai-validator-server
+After=network-online.target
+
+[Service]
+Type=simple
+
+# Full path to the entry point inside the conda environment. systemd does not
+# read your shell profile, so `conda activate` has no effect here — the
+# interpreter has to be named explicitly.
+ExecStart=/home/vibflysleep/mambaforge/envs/idtrackerai-viewer/bin/start-idtrackerai-validator-server --port 5000 --host 127.0.0.1 --no-browser
+
+Environment=FLYHOSTEL_VIDEOS=/flyhostel_data/videos
+Environment=PYTHONUNBUFFERED=1
+
+# Keep annotations outside any git working tree.
+Environment=PE_ANNOTATIONS_DB=/flyhostel_data/videos/pe_annotations.db
+
+WorkingDirectory=%h
+
+Restart=on-failure
+RestartSec=5
+
+# Give up if it crashes 5 times in 5 minutes, rather than looping forever on a
+# permanent fault such as a missing data directory.
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=idtrackerai-viewer
+
+[Install]
+WantedBy=default.target
