@@ -24,17 +24,19 @@ logger=logging.getLogger(__name__)
 RED=webcolors.name_to_rgb("red")[::-1]
 GREEN=webcolors.name_to_rgb("green")[::-1]
 BLACK=webcolors.name_to_rgb("black")[::-1]
-DEFAULT_REFERENCE_HOUR=13
 
 
 def process_config(config):
+
+    min_area=config["_area"]["value"][0]
+    max_area=config["_area"]["value"][1]   
 
     user_defined_parameters = {
         "number_of_animals": int(config["_number_of_animals"]["value"]),
         "min_threshold": config["_intensity"]["value"][0],
         "max_threshold": config["_intensity"]["value"][1],
-        "min_area": config["_area"]["value"][0],
-        "max_area": config["_area"]["value"][1],
+        "min_area": min_area,
+        "max_area": max_area,
         "check_segmentation": True,
         "tracking_interval": [0, math.inf],
         "apply_ROI": True,
@@ -45,6 +47,10 @@ def process_config(config):
         "identity_transfer": False,
         "identification_image_size": None,
     }
+
+    assert not isinstance(min_area, str), f"{min_area}"
+    assert not isinstance(max_area, str), f"{max_area}"
+            
     return user_defined_parameters
 
 
@@ -61,6 +67,8 @@ def process_frame(frame, config):
         contour_list (list): List of contours. See draw_frame on how to draw them on the frame
     """
     config=process_config(config)
+    # assert not isinstance(config["min_area"], str)
+
 
     roi_mask = np.zeros_like(frame)
     roi_contour = np.array(eval(config["rois"][0][0])).reshape((-1, 1, 2))
@@ -289,8 +297,7 @@ def load_experiment_metadata(table):
     ethoscope_metadata=str2pandas(ethoscope_metadata)
 
     if ethoscope_metadata.shape[0]==0:
-        logger.warning("Ethoscope metadata is empty")
-        reference_hour=DEFAULT_REFERENCE_HOUR
+        raise Exception("Ethoscope metadata is empty")
     else:
         reference_hour=ethoscope_metadata["reference_hour"].values
         assert np.all(np.diff(reference_hour) == 0)
