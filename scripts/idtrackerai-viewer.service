@@ -1,4 +1,4 @@
-gUnit]
+[Unit]
 Description=idtrackerai validator (FlyHostel viewer)
 Documentation=https://github.com/shaliulab/idtrackerai-validator-server
 After=network-online.target
