@@ -659,6 +659,30 @@ def serve_frontend(path):
     # index.html must never be cached, or a rebuilt bundle won't be picked up.
     return send_from_directory(FRONTEND_DIR, "index.html", max_age=0)
 
+@app.route("/api/use_val", methods=["GET"])
+def get_use_val():
+    return jsonify({
+        "use_val": db_manager.use_val if db_manager is not None else USE_VAL
+    })
+
+
+@app.route("/api/use_val", methods=["POST"])
+def set_use_val():
+    global USE_VAL, db_manager
+    data = request.get_json() or {}
+    USE_VAL = bool(data.get("use_val"))
+
+    if SELECTED_EXPERIMENT is None:
+        return jsonify({"use_val": USE_VAL})
+
+    with lock:
+        db_manager = DatabaseManager(
+            app, db, with_fragments=WITH_FRAGMENTS,
+            experiment=SELECTED_EXPERIMENT, use_val=USE_VAL,
+        )
+    logger.info("Validation status: %s", db_manager.use_val)
+    return jsonify({"use_val": db_manager.use_val})
+
 def shutdown_server():
     func = request.environ.get('werkzeug.server.shutdown')
     
