@@ -45,8 +45,8 @@ def annotations_db_path():
 
 PE_DB = os.environ.get("PE_ANNOTATIONS_DB") or annotations_db_path()
 
-AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "audit.csv")
-
+AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/calib.csv")
+print(f"Audit csv: {AUDIT_CSV}")
 import os
 _TRACE_CACHE = {}   # fly -> (mtime, DataFrame)
 
