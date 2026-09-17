@@ -46,6 +46,8 @@ def annotations_db_path():
 PE_DB = os.environ.get("PE_ANNOTATIONS_DB") or annotations_db_path()
 
 AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/calib.csv")
+AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/pe_near_food_audit.csv")
+
 print(f"Audit csv: {AUDIT_CSV}")
 import os
 _TRACE_CACHE = {}   # fly -> (mtime, DataFrame)
@@ -282,15 +284,43 @@ def register_pe_validation(app, get_selected_experiment):
         })
 
 
+    def _flat_to_slash(exp_flat):
+        # "FlyHostel4_2X_2025-06-28_16-00-00" -> "FlyHostel4/2X/2025-06-28_16-00-00"
+        return exp_flat.replace("_", "/", 2)
+
     @app.route("/api/pe/audit", methods=["GET"])
     def pe_audit():
         exp, err = _experiment_or_400()
         if err:
             return err
-        fly = request.args["fly"]
         if not os.path.exists(AUDIT_CSV):
             return jsonify([])
-        logger.info("Reading %s", AUDIT_CSV)
         a = pd.read_csv(AUDIT_CSV)
-        a = a[a["fly"] == fly]
-        return jsonify([int(b) for b in a["burst_id"]])
+
+        if not request.args.get("all"):                      # old per-fly behaviour
+            fly = request.args["fly"]
+            return jsonify([int(b) for b in a[a["fly"] == fly]["burst_id"]])
+
+        # ---- all=1: every CSV row + done flag (all bouts of the burst annotated) ----
+        out = []
+        with sqlite3.connect(PE_DB) as c:
+            for fly, grp in a.groupby("fly", sort=False):
+                exp_flat, ident = fly.rsplit("__", 1)
+                feather = os.path.join(get_basedir(exp_flat), "flyhostel",
+                                    "proboscis_extensions", "pe_bouts",
+                                    f"{fly}_pe_bouts.feather")
+                if not os.path.exists(feather):
+                    out += [{"fly": fly, "burst_id": int(b), "done": None}
+                            for b in grp["burst_id"]]
+                    continue
+                df = pd.read_feather(feather, columns=["burst_id", "start_fn", "end_fn"])
+                df = df[df["burst_id"].isin(set(grp["burst_id"].astype(int)))]
+                ann = {(r[0], r[1]) for r in c.execute(
+                    "SELECT start_frame, end_frame FROM pe_annotations "
+                    "WHERE identity=? AND experiment IN (?, ?)",
+                    (int(ident), _flat_to_slash(exp_flat), exp_flat))}
+                for bid, g in df.groupby("burst_id"):
+                    done = all((int(s), int(e)) in ann
+                            for s, e in zip(g["start_fn"], g["end_fn"]))
+                    out.append({"fly": fly, "burst_id": int(bid), "done": bool(done)})
+        return jsonify(out)
