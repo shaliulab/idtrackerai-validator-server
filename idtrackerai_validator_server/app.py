@@ -665,6 +665,10 @@ def get_use_val():
         "use_val": db_manager.use_val if db_manager is not None else USE_VAL
     })
 
+@app.route("/api/current_experiment", methods=["GET"])
+def current_experiment():
+    return jsonify({"experiment": SELECTED_EXPERIMENT})
+
 
 @app.route("/api/use_val", methods=["POST"])
 def set_use_val():
