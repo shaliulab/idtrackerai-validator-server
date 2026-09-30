@@ -1,3 +1,4 @@
+import io
 import os
 from threading import Lock, Timer
 import shutil
@@ -10,6 +11,7 @@ from flask_cors import CORS
 from flask import g
 from flask_sqlalchemy import SQLAlchemy
 import numpy as np
+import pandas as pd
 import cv2
 from sqlalchemy import func, create_engine
 from sqlalchemy.orm import Session
@@ -341,6 +343,45 @@ def get_framerate():
     tables = db_manager.tables
     framerate=tables["METADATA"].query.filter_by(field="framerate").first().value
     return framerate
+
+
+@app.route("/api/animal_metadata", methods=['GET'])
+def get_animal_metadata():
+    if db_manager is None:
+        return _experiment_required()
+    tables = db_manager.tables
+    try:
+        row = tables["METADATA"].query.filter_by(field="ethoscope_metadata").first()
+        if row is None:
+            return jsonify({})
+        df = pd.read_csv(io.StringIO(row.value), index_col=0)
+
+        experiment = SELECTED_EXPERIMENT.replace("/", "_")
+        try:
+            identities = get_identities(experiment)
+        except Exception:
+            identities = list(range(1, len(df) + 1))
+
+        def safe(v):
+            try:
+                return '' if pd.isna(v) else str(v)
+            except (TypeError, ValueError):
+                return str(v) if v is not None else ''
+
+        result = {}
+        for i, identity in enumerate(identities):
+            if i < len(df):
+                r = df.iloc[i]
+                entry = {}
+                if 'sex' in df.columns:
+                    entry['sex'] = safe(r.get('sex'))
+                if 'genotype' in df.columns:
+                    entry['genotype'] = safe(r.get('genotype'))
+                result[str(identity)] = entry
+        return jsonify(result)
+    except Exception as e:
+        logger.error("Error fetching animal metadata: %s", e)
+        return jsonify({})
 
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
 def get_frame(frame_number):
