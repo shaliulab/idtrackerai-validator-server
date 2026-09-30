@@ -25,7 +25,8 @@ from flyhostel.utils import (
     get_chunksize,
     get_framerate
 )
-
+from flyhostel.data.pose.proboscis_extension.label_overrides import read_pe_bouts
+                
 logger=logging.getLogger(__name__)
 
 # --- where your pipeline wrote things (edit or set via env) ---------------------
@@ -44,9 +45,10 @@ def annotations_db_path():
     return os.path.join(path, "pe_annotations.db")
 
 PE_DB = os.environ.get("PE_ANNOTATIONS_DB") or annotations_db_path()
+RESEG_DB = PE_DB
 
 AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/calib.csv")
-AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/pe_near_food_audit.csv")
+AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/pnf_audit.csv")
 
 print(f"Audit csv: {AUDIT_CSV}")
 import os
@@ -89,6 +91,21 @@ def _init_db():
                 PRIMARY KEY (experiment, identity, start_frame, end_frame)
             )""")
 
+        # segmentation display + human ground truth (mirrors segmentation.py SCHEMA)
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS auto_runs (method TEXT NOT NULL, fly TEXT NOT NULL,
+            params TEXT NOT NULL, ext_min_mm REAL, written_at TEXT NOT NULL,
+            PRIMARY KEY (method, fly));
+        CREATE TABLE IF NOT EXISTS auto_segments (method TEXT NOT NULL, fly TEXT NOT NULL,
+            start_frame INTEGER NOT NULL, end_frame INTEGER NOT NULL,
+            PRIMARY KEY (method, fly, start_frame));
+        CREATE TABLE IF NOT EXISTS gt_windows (fly TEXT NOT NULL, win_start INTEGER NOT NULL,
+            win_end INTEGER NOT NULL, annotator TEXT, done_at TEXT NOT NULL,
+            PRIMARY KEY (fly, win_start, win_end));
+        CREATE TABLE IF NOT EXISTS gt_segments (fly TEXT NOT NULL, start_frame INTEGER NOT NULL,
+            end_frame INTEGER NOT NULL, annotator TEXT, created_at TEXT NOT NULL,
+            PRIMARY KEY (fly, start_frame, end_frame));
+        """)
 
 def _fly_id(experiment, identity):
     # experiment global is stored as "FlyHostel4/2X/2025-02-04"; the feather/media use
@@ -130,7 +147,7 @@ def register_pe_validation(app, get_selected_experiment):
         if not os.path.exists(feather):
             return jsonify({"error": f"no bouts feather for {fly}"}), 404
 
-        df = pd.read_feather(feather)
+        df = read_pe_bouts(feather)
         # bursts that contain at least one PE bout
         # pe_bursts = set(df.loc[df["label"] == "pe", "burst_id"].unique())
         # df = df[df["burst_id"].isin(pe_bursts)].copy()
@@ -142,9 +159,12 @@ def register_pe_validation(app, get_selected_experiment):
         df["end_fidx"]   = df["end_fn"]   % chunksize
         df["is_pe"]      = (df["label"] == "pe")          # annotatable vs display-only
 
-        cols = [c for c in ("burst_id", "bout_uid", "start_fn", "end_fn",
-                            "start_fidx", "end_fidx", "n_in_burst", "is_solitary",
-                            "pe_score", "dur_s", "label", "label_reason", "is_pe")
+        cols = [c for c in (
+            "burst_id", "bout_uid", "start_fn", "end_fn",
+            "start_fidx", "end_fidx", "n_in_burst", "is_solitary",
+            "pe_score", "dur_s", "label", "label_reason", "is_pe",
+            "label_source", "label_pipeline"
+        )
                 if c in df.columns]
         bouts = df[cols].to_dict("records")
 
@@ -283,6 +303,79 @@ def register_pe_validation(app, get_selected_experiment):
             "spans": spans_out, "gaps": gaps_out,
         })
 
+
+    def _burst_window(exp, fly, burst_id):
+        """Same frame range the trace panel plots, so times line up exactly."""
+        tf = os.path.join(_media_dir(exp), f"{fly}_traces.feather")
+        if not os.path.exists(tf):
+            return None
+        fr = _load_traces_cached(tf, fly)
+        fr = fr.loc[fr["burst_id"] == burst_id, "frame_number"]
+        return (int(fr.min()), int(fr.max()) + 1) if len(fr) else None
+
+    @app.route("/api/pe/segments", methods=["GET"])
+    def pe_segments():
+        exp, err = _experiment_or_400()
+        if err:
+            return err
+        fly, bid = request.args["fly"], int(request.args["burst_id"])
+        method = request.args.get("method", "hyst")
+        win = _burst_window(exp, fly, bid)
+        if win is None:
+            return jsonify({"auto": [], "gt": [], "done": False, "params": None})
+        f0, f1 = win
+        fps = get_framerate(exp.replace("/", "_"))
+        t = lambda f: round((f - f0) / fps, 4)
+        with sqlite3.connect(RESEG_DB) as c:
+            auto = c.execute("SELECT start_frame, end_frame FROM auto_segments "
+                             "WHERE method=? AND fly=? AND end_frame>? AND start_frame<? "
+                             "ORDER BY start_frame", (method, fly, f0, f1)).fetchall()
+            gt = c.execute("SELECT start_frame, end_frame FROM gt_segments "
+                           "WHERE fly=? AND end_frame>? AND start_frame<? "
+                           "ORDER BY start_frame", (fly, f0, f1)).fetchall()
+            done = c.execute("SELECT 1 FROM gt_windows WHERE fly=? AND win_start<=? "
+                             "AND win_end>=?", (fly, f0, f1)).fetchone() is not None
+            run = c.execute("SELECT params FROM auto_runs WHERE method=? AND fly=?",
+                            (method, fly)).fetchone()
+        seg = lambda s, e: {"t0": t(s), "t1": t(e), "start_frame": s, "end_frame": e}
+        return jsonify({"auto": [seg(s, e) for s, e in auto],
+                        "gt": [seg(s, e) for s, e in gt],
+                        "done": done, "params": run[0] if run else None})
+
+    @app.route("/api/pe/gt_segment", methods=["POST"])
+    def pe_gt_segment():
+        d = request.get_json(force=True)
+        s, e = int(d["start_frame"]), int(d["end_frame"])
+        if e <= s:
+            return jsonify({"error": "end_frame must exceed start_frame"}), 400
+        with sqlite3.connect(RESEG_DB) as c:
+            if d.get("delete"):
+                c.execute("DELETE FROM gt_segments WHERE fly=? AND start_frame=? "
+                          "AND end_frame=?", (d["fly"], s, e))
+            else:
+                c.execute("INSERT OR REPLACE INTO gt_segments VALUES (?,?,?,?,?)",
+                          (d["fly"], s, e, d.get("annotator", "anon"),
+                           datetime.datetime.utcnow().isoformat()))
+        return jsonify({"ok": True})
+
+    @app.route("/api/pe/gt_window", methods=["POST"])
+    def pe_gt_window():
+        exp, err = _experiment_or_400()
+        if err:
+            return err
+        d = request.get_json(force=True)
+        win = _burst_window(exp, d["fly"], int(d["burst_id"]))
+        if win is None:
+            return jsonify({"error": "no trace for this burst"}), 404
+        with sqlite3.connect(RESEG_DB) as c:
+            if d.get("done", True):
+                c.execute("INSERT OR REPLACE INTO gt_windows VALUES (?,?,?,?,?)",
+                          (d["fly"], win[0], win[1], d.get("annotator", "anon"),
+                           datetime.datetime.utcnow().isoformat()))
+            else:
+                c.execute("DELETE FROM gt_windows WHERE fly=? AND win_start=? AND win_end=?",
+                          (d["fly"], *win))
+        return jsonify({"ok": True})
 
     def _flat_to_slash(exp_flat):
         # "FlyHostel4_2X_2025-06-28_16-00-00" -> "FlyHostel4/2X/2025-06-28_16-00-00"
