@@ -310,11 +310,15 @@ def register_ethogram(app, get_selected_experiment):
 
         segment, segment_start, _ = _segments_between(fly, position["movie_time"], position["movie_time"])[0]
         try:
+            # Seek after -i (decode and discard): input seeking silently returns
+            # nothing on some movies' segments, and segments are only ~10 s long.
             jpeg = _ffmpeg(
-                "-ss", f"{position['movie_time'] - segment_start:.3f}",
                 "-i", segment,
+                "-ss", f"{position['movie_time'] - segment_start:.3f}",
                 "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "2", "pipe:1",
             )
+            if not jpeg:
+                raise RuntimeError(f"ffmpeg extracted no frame from {segment} at {position['movie_time'] - segment_start:.3f} s")
         except RuntimeError as error:
             logger.error("Could not extract frame of %s: %s", fly, error)
             return jsonify({"error": str(error)}), 500
