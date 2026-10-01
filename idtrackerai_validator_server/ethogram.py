@@ -30,7 +30,6 @@ import sqlite3
 import logging
 import tempfile
 import zipfile
-import subprocess
 from contextlib import closing
 from functools import lru_cache
 
@@ -44,6 +43,18 @@ from flyhostel.utils import (
     get_identities,
 )
 
+# shared with FlyHostelLoader.record_all_sleep_bouts
+from flyhostel.data.pose.loaders.sleep_videos import (
+    SLEEP_BOUT_PADDING,
+    movie_first_chunk,
+    read_playlist,
+    playlist_duration,
+    segments_between,
+    run_ffmpeg,
+    cut_movie,
+    bout_video_name as _bout_video_name,
+)
+
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.utils import sleep_bouts as _sleep_bouts, find_sleep_bout as _find_sleep_bout
 
@@ -51,8 +62,6 @@ logger = logging.getLogger(__name__)
 
 FLY_PATTERN = re.compile(r"^FlyHostel\d+_\d+X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}__\d{2}$")
 
-# Seconds added before and after a sleep bout in the exported video.
-SLEEP_BOUT_PADDING = 5
 
 
 def _fly_dir(fly):
@@ -74,12 +83,8 @@ def _properties(fly):
     framerate = float(get_framerate(experiment))
     chunksize = int(get_chunksize(experiment))
 
-    feather_path = os.path.join(_fly_dir(fly), f"{fly}.feather")
-    first_chunk = None
-    if os.path.exists(feather_path):
-        frame_numbers = pd.read_feather(feather_path, columns=["frame_number"])["frame_number"]
-        if len(frame_numbers):
-            first_chunk = int(frame_numbers.iloc[0]) // chunksize
+    experiment, identity = fly.split("__")
+    first_chunk = movie_first_chunk(get_basedir(experiment), experiment, identity, chunksize)
 
     return {
         "framerate": framerate,
@@ -91,33 +96,15 @@ def _properties(fly):
 
 @lru_cache(maxsize=256)
 def _playlist(fly):
-    """[(segment path, start in movie time, duration)] of the HLS movie.
-
-    The playlist has #EXT-X-DISCONTINUITY tags (timestamps restart in every
-    segment), so ffmpeg cannot seek in the .m3u8: we address segments ourselves."""
-    segments = []
-    start = 0.0
-    duration = None
-    with open(os.path.join(_movie_dir(fly), "movie.m3u8")) as playlist:
-        for line in playlist:
-            line = line.strip()
-            if line.startswith("#EXTINF:"):
-                duration = float(line[len("#EXTINF:"):].split(",")[0])
-            elif line and not line.startswith("#") and duration is not None:
-                segments.append((os.path.join(_movie_dir(fly), line), start, duration))
-                start += duration
-                duration = None
-    return segments
+    return read_playlist(_movie_dir(fly))
 
 
 def _movie_duration(fly):
-    segments = _playlist(fly)
-    return segments[-1][1] + segments[-1][2] if segments else 0.0
+    return playlist_duration(_playlist(fly))
 
 
 def _segments_between(fly, start, end):
-    """Segments overlapping [start, end] of movie time."""
-    return [seg for seg in _playlist(fly) if seg[1] + seg[2] > start and seg[1] <= end]
+    return segments_between(_playlist(fly), start, end)
 
 
 def _connect(experiment):
@@ -199,31 +186,6 @@ def find_sleep_bout(fly, frame_number, direction="current"):
     }
 
 
-def _ffmpeg(*args):
-    process = subprocess.run(
-        ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", *args],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    if process.returncode != 0:
-        raise RuntimeError(process.stderr.decode(errors="replace").strip())
-    return process.stdout
-
-
-def _ffmpeg_with_progress(args, duration, on_progress):
-    """Run ffmpeg, calling on_progress(fraction) as it writes `duration` s of output."""
-    process = subprocess.Popen(
-        ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-progress", "pipe:1", "-nostats", *args],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    for line in process.stdout:
-        key, _, value = line.strip().partition("=")
-        if key == "out_time_us" and value.lstrip("-").isdigit() and duration > 0:
-            on_progress(min(1.0, max(0.0, int(value) / 1e6 / duration)))
-    stderr = process.stderr.read()
-    if process.wait() != 0:
-        raise RuntimeError(stderr.strip())
-
-
 def bout_video_name(fly, bout):
     """<fly>_sleep_bout_t0-XXXX_t1-YYYY.mp4, with t0 / t1 in seconds since ZT0."""
     experiment = fly.split("__")[0]
@@ -232,7 +194,7 @@ def bout_video_name(fly, bout):
         t1 = frame_to_zt(experiment, bout["end_frame"])
     except ValueError:   # the bout ends with the recording
         t1 = t0 + bout["duration"]
-    return f"{fly}_sleep_bout_t0-{round(t0)}_t1-{round(t1)}.mp4"
+    return _bout_video_name(fly, t0, t1)
 
 
 def cut_bout_video(fly, bout, path, on_progress=None):
@@ -243,30 +205,12 @@ def cut_bout_video(fly, bout, path, on_progress=None):
     """
     if not _properties(fly)["has_movie"]:
         raise ValueError(f"{fly} has no movie")
-    duration = _movie_duration(fly)
     start = _movie_time(fly, bout["start_frame"]) - SLEEP_BOUT_PADDING
     end = _movie_time(fly, bout["end_frame"]) + SLEEP_BOUT_PADDING
-    if end < 0 or start > duration:
-        raise ValueError(f"Sleep bout {bout['start_frame']}-{bout['end_frame']} is not covered by the movie of {fly}")
-    start, end = max(0.0, start), min(duration, end)
-
-    # Concatenate whole segments spanning the bout (+ padding). Stream copy is
-    # fast even for bouts of hours, but can only cut at keyframes: keeping whole
-    # segments guarantees the bout is included, at the cost of <= 1 segment
-    # (10 s) of extra context on each side.
-    segments = _segments_between(fly, start, end)
-    with tempfile.NamedTemporaryFile("w", suffix=".ffconcat", delete=False) as handle:
-        handle.write("\n".join(["ffconcat version 1.0"] + [f"file '{segment}'" for segment, _, _ in segments]) + "\n")
-        list_path = handle.name
     try:
-        # -f mp4: `path` may not end in .mp4 (e.g. a .part file renamed when complete)
-        args = ["-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-f", "mp4", "-movflags", "+faststart", path]
-        if on_progress is None:
-            _ffmpeg(*args)
-        else:
-            _ffmpeg_with_progress(args, sum(d for _, _, d in segments), on_progress)
-    finally:
-        os.unlink(list_path)
+        cut_movie(_playlist(fly), start, end, path, on_progress=on_progress)
+    except ValueError:
+        raise ValueError(f"Sleep bout {bout['start_frame']}-{bout['end_frame']} is not covered by the movie of {fly}")
 
 
 def register_ethogram(app, get_selected_experiment):
@@ -361,7 +305,7 @@ def register_ethogram(app, get_selected_experiment):
         try:
             # Seek after -i (decode and discard): input seeking silently returns
             # nothing on some movies' segments, and segments are only ~10 s long.
-            jpeg = _ffmpeg(
+            jpeg = run_ffmpeg(
                 "-i", segment,
                 "-ss", f"{position['movie_time'] - segment_start:.3f}",
                 "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "2", "pipe:1",

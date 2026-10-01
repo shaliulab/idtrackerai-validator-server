@@ -3,10 +3,11 @@ import os
 from threading import Lock, Timer
 import shutil
 import argparse
+from collections import OrderedDict
 import re
 import traceback
 import logging
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
 from flask import g
 from flask_sqlalchemy import SQLAlchemy
@@ -108,6 +109,11 @@ if SELECTED_EXPERIMENT is not None:
     with app.app_context():
         out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
         offset, CHUNKSIZE, FRAMERATE = experiment_metadata
+# Contours of the last frames segmented by /api/preprocess
+CONTOURS_CACHE_SIZE = 500
+_contours_cache = OrderedDict()
+_contours_lock = Lock()
+
 # H5 file handle cache
 _h5_file_cache = {}
 _h5_cache_lock = Lock()
@@ -303,6 +309,8 @@ def load():
         offset, CHUNKSIZE, FRAMERATE = experiment_metadata
         frame = None
         contours = []
+        with _contours_lock:
+            _contours_cache.clear()
         _sleep_cache.clear()
         logger.info("Switched to experiment %s", SELECTED_EXPERIMENT)
 
@@ -407,68 +415,65 @@ def navigate_sleep(direction, identity, frame_number):
     return jsonify({"frame_number": int(bout[0]) if bout else None})
 
 
+def _read_frame(frame_number):
+    """(image or None, actual frame number). Only cap.get_image needs the lock:
+    requests overlap (the client prefetches), so images stay in local variables."""
+    with lock:
+        try:
+            image, (frame_number, _) = cap.get_image(frame_number)
+            return image, frame_number
+        except (ValueError, AssertionError) as error:
+            app.logger.error(f"Can't fetch frame {frame_number}: {error}")
+            return None, frame_number
+
+
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
 def get_frame(frame_number):
-
-    global cap
+    """JPEG of `frame_number` (a blank image if it cannot be read)."""
     global frame
-    global contours
-
-    if frame is None:
-        empty_frame=np.ones((1000, 1000), np.uint8)*255
-    else:
-        empty_frame=np.ones_like(frame, np.uint8)*255
-
 
     if cap is None:
         return jsonify({'error': 'Cap could not be loaded'}), 404
 
-    lock.acquire()
-    try:
-        assert frame_number is not None
-        app.logger.warning(f"frame_number = {frame_number}")
-
-        app.logger.debug(f"Fetching frame {frame_number}")
-        frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
-        app.logger.debug(f"Fetching frame {frame_number} done")
-
-    except ValueError or AssertionError as error:
-        frame=empty_frame.copy()
-        frame_number=first_chunk*CHUNKSIZE
-        frame_timestamp=0
-        app.logger.error(f"Can't fetch frame {frame_number}")
-        app.logger.error(error)
-
-    lock.release()
-
-    # frame=cv2.resize(frame, (1000, 1000))
-    filename=f"{frame_number}.jpg"
-    img_path = os.path.join(FRAMES_DIR, filename)
-    os.makedirs(os.path.dirname(img_path), exist_ok=True)
-    try:
-        cv2.imwrite(img_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 50])       
-        assert os.path.exists(img_path), f"Could not save {img_path}"
-        app.logger.debug(f"{cap._basedir} -> {img_path}")
-        contours=process_frame(frame, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
-        
-    except Exception as error:
-        contours=[]
-        logger.error(error)
-        cv2.imwrite(img_path, empty_frame, [cv2.IMWRITE_JPEG_QUALITY, 50])       
-
-
-    if frame is None:
-        return jsonify({'error': 'Frame not found'}), 404
+    image, frame_number = _read_frame(frame_number)
+    if image is None:
+        image = np.ones((1000, 1000), np.uint8) * 255 if frame is None else np.ones_like(frame, np.uint8) * 255
     else:
-        return send_from_directory(os.path.realpath(FRAMES_DIR), filename)
+        frame = image
 
+    ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    if not ok:
+        return jsonify({'error': f'Could not encode frame {frame_number}'}), 500
+    response = send_file(io.BytesIO(jpeg.tobytes()), mimetype="image/jpeg")
+    response.headers["X-Frame-Number"] = str(frame_number)
+    return response
 
 
 @app.route('/api/preprocess/<int:frame_number>', methods=['GET'])
 def get_preprocess(frame_number):
-
+    """Contours of `frame_number`, from idtrackerai's segmentation (computed on demand, cached).
+    Segmentation takes ~40% of a frame's cost, so /api/frame does not do it."""
     global contours
-    return jsonify({"contours": contours})
+
+    if cap is None:
+        return jsonify({'error': 'Cap could not be loaded'}), 404
+    with _contours_lock:
+        frame_contours = _contours_cache.get(frame_number)
+    if frame_contours is None:
+        image, _ = _read_frame(frame_number)
+        if image is None:
+            return jsonify({"contours": [], "error": f"Frame {frame_number} cannot be read"}), 404
+        try:
+            frame_contours = process_frame(image, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
+        except Exception as error:
+            logger.error(error)
+            frame_contours = []
+        with _contours_lock:
+            _contours_cache[frame_number] = frame_contours
+            while len(_contours_cache) > CONTOURS_CACHE_SIZE:
+                _contours_cache.popitem(last=False)
+    contours = frame_contours
+    return jsonify({"contours": frame_contours})
 
 
 def get_pose(db_manager, frame_number):

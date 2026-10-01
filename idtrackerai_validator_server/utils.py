@@ -6,6 +6,12 @@ from flyhostel.utils import (
     get_basedir,
 )
 from flyhostel.data.pose.main import FlyHostelLoader
+# shared with FlyHostelLoader.record_all_sleep_bouts
+from flyhostel.data.pose.loaders.sleep_videos import (  # noqa: F401  (find_sleep_bout is re-exported)
+    SLEEP_BOUT_MAX_GAP,
+    group_sleep_bouts,
+    find_sleep_bout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,35 +68,6 @@ def load_sleep_data(experiment: str, identity: int) -> list:
     return sleep_frames
 
 
-def sleep_bouts(experiment: str, identity: int, framerate: float, max_gap: float = 2) -> list:
-    """[(first_frame, end_frame)] of every sleep bout, sorted. end_frame is exclusive.
-
-    Asleep rows further apart than `max_gap` seconds belong to different bouts;
-    each row stands for (about) one second, so a bout ends 1 s after its last row.
-    """
-    bouts = []
-    for frame_number in load_sleep_data(experiment, identity):
-        if bouts and frame_number - bouts[-1][1] <= max_gap * framerate:
-            bouts[-1][1] = frame_number
-        else:
-            bouts.append([frame_number, frame_number])
-    return [(start, int(end + framerate)) for start, end in bouts]
-
-
-def find_sleep_bout(bouts: list, frame_number: int, direction: str = "current"):
-    """Pick a bout relative to `frame_number`; None if there is none.
-
-    current: the bout ongoing at frame_number, or else the next one
-    next:    the first bout starting after frame_number (skips an ongoing bout)
-    prev:    the last bout starting before the ongoing bout, or before
-             frame_number when the fly is awake
-    """
-    if direction == "current":
-        return next(((s, e) for s, e in bouts if e > frame_number), None)
-    if direction == "next":
-        return next(((s, e) for s, e in bouts if s > frame_number), None)
-    if direction == "prev":
-        ongoing = next(((s, e) for s, e in bouts if s <= frame_number < e), None)
-        reference = ongoing[0] if ongoing else frame_number
-        return next(((s, e) for s, e in reversed(bouts) if s < reference), None)
-    raise ValueError(f"direction must be current, next or prev, not {direction}")
+def sleep_bouts(experiment: str, identity: int, framerate: float, max_gap: float = SLEEP_BOUT_MAX_GAP) -> list:
+    """[(first_frame, end_frame)] of every sleep bout (end exclusive); see flyhostel's group_sleep_bouts."""
+    return group_sleep_bouts(load_sleep_data(experiment, identity), framerate, max_gap=max_gap)
