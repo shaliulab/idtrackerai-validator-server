@@ -1,3 +1,4 @@
+import bisect
 import io
 import os
 from threading import Lock, Timer
@@ -107,6 +108,35 @@ if SELECTED_EXPERIMENT is not None:
 # H5 file handle cache
 _h5_file_cache = {}
 _h5_cache_lock = Lock()
+
+# Sleep frame cache: (experiment_flat, identity_int) -> sorted list[int] of asleep frame_numbers
+_sleep_cache: dict = {}
+
+
+def _load_sleep_data(experiment: str, identity: int) -> list:
+    """Return sorted list of frame_numbers where `identity` is asleep.
+
+    Result is cached; returns [] when the feather file is missing or on any error.
+    `experiment` must be the flat form (underscores, not slashes).
+    """
+    key = (experiment, int(identity))
+    if key in _sleep_cache:
+        return _sleep_cache[key]
+
+    sleep_frames: list = []
+    try:
+        from flyhostel.data.pose.main import FlyHostelLoader
+        loader = FlyHostelLoader(experiment, int(identity))
+        loader.load_sleep_data(bin_size=None, errors="warning")
+        df = loader.sleep
+        if df is not None and not df.empty and 'asleep' in df.columns and 'frame_number' in df.columns:
+            asleep_fn = df.loc[df['asleep'] == True, 'frame_number'].dropna().astype(int)
+            sleep_frames = sorted(asleep_fn.tolist())
+    except Exception as exc:
+        logger.warning("Sleep data unavailable for %s id=%s: %s", experiment, identity, exc)
+
+    _sleep_cache[key] = sleep_frames
+    return sleep_frames
 
 # Bodypart indices to keep (figure this out from step 1)
 BODYPARTS_TO_IGNORE = [12, 13, 14, 15, 16, 17]  # ← UPDATE THIS
@@ -299,6 +329,7 @@ def load():
         offset, CHUNKSIZE, FRAMERATE = experiment_metadata
         frame = None
         contours = []
+        _sleep_cache.clear()
         logger.info("Switched to experiment %s", SELECTED_EXPERIMENT)
 
     except Exception as error:
@@ -382,6 +413,35 @@ def get_animal_metadata():
     except Exception as e:
         logger.error("Error fetching animal metadata: %s", e)
         return jsonify({})
+
+
+@app.route('/api/sleep/<direction>/<int:identity>/<int:frame_number>', methods=['GET'])
+def navigate_sleep(direction, identity, frame_number):
+    """Return the nearest frame where `identity` is asleep, in the requested direction.
+
+    direction: "prev" | "next"
+    Returns {"frame_number": N} or {"frame_number": null} when none found.
+    """
+    if db_manager is None:
+        return _experiment_required()
+    if direction not in ('prev', 'next'):
+        return jsonify({"error": "direction must be prev or next"}), 400
+
+    experiment = SELECTED_EXPERIMENT.replace("/", "_")
+    frames = _load_sleep_data(experiment, identity)
+
+    if not frames:
+        return jsonify({"frame_number": None})
+
+    if direction == 'prev':
+        idx = bisect.bisect_left(frames, frame_number) - 1
+        result = int(frames[idx]) if idx >= 0 else None
+    else:
+        idx = bisect.bisect_right(frames, frame_number)
+        result = int(frames[idx]) if idx < len(frames) else None
+
+    return jsonify({"frame_number": result})
+
 
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
 def get_frame(frame_number):
