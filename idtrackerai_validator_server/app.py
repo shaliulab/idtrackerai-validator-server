@@ -40,7 +40,7 @@ from idtrackerai_validator_server.backend import (
 )
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
-from idtrackerai_validator_server.utils import load_rejections
+from idtrackerai_validator_server.utils import load_rejections, load_sleep_data as _load_sleep_data, SLEEP_CACHE as _sleep_cache
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -110,35 +110,6 @@ if SELECTED_EXPERIMENT is not None:
 # H5 file handle cache
 _h5_file_cache = {}
 _h5_cache_lock = Lock()
-
-# Sleep frame cache: (experiment_flat, identity_int) -> sorted list[int] of asleep frame_numbers
-_sleep_cache: dict = {}
-
-
-def _load_sleep_data(experiment: str, identity: int) -> list:
-    """Return sorted list of frame_numbers where `identity` is asleep.
-
-    Result is cached; returns [] when the feather file is missing or on any error.
-    `experiment` must be the flat form (underscores, not slashes).
-    """
-    key = (experiment, int(identity))
-    if key in _sleep_cache:
-        return _sleep_cache[key]
-
-    sleep_frames: list = []
-    try:
-        from flyhostel.data.pose.main import FlyHostelLoader
-        loader = FlyHostelLoader(experiment, int(identity))
-        loader.load_sleep_data(bin_size=None, errors="warning")
-        df = loader.sleep
-        if df is not None and not df.empty and 'asleep' in df.columns and 'frame_number' in df.columns:
-            asleep_fn = df.loc[df['asleep'] == True, 'frame_number'].dropna().astype(int)
-            sleep_frames = sorted(asleep_fn.tolist())
-    except Exception as exc:
-        logger.warning("Sleep data unavailable for %s id=%s: %s", experiment, identity, exc)
-
-    _sleep_cache[key] = sleep_frames
-    return sleep_frames
 
 # Bodypart indices to keep (figure this out from step 1)
 BODYPARTS_TO_IGNORE = [12, 13, 14, 15, 16, 17]  # ← UPDATE THIS
@@ -575,8 +546,8 @@ def get_tracking(frame_number):
             else:
                 modified = row.modified
             
-            # t = seconds since ZT0. frame_time is ms since the marked time; offset is
-            # the seconds between ZT0 and that marked time.
+            # t = seconds since ZT0. frame_time is ms since the o'clock hour the recording
+            # started in; offset is the seconds between ZT0 and that hour.
             t = frame_time / 1000 + offset
             hours = str(int(t // 3600)).zfill(2)
             minutes = str(int((t % 3600) // 60)).zfill(2)

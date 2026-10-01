@@ -290,7 +290,10 @@ def load_experiment(basedir_suffix, chunk, db_manager):
 
 def load_experiment_metadata(table):
     out = table.query.filter_by(field="date_time")
-    experiment_start_time=int(float(out.all()[0].value)) % (24*3600)
+    # imgstore frame_time counts from the o'clock hour in which the recording started,
+    # not from date_time itself: floor to the hour, as flyhostel.utils.load_meta_info does.
+    experiment_start_time=int(float(out.all()[0].value))
+    experiment_start_time=(experiment_start_time - experiment_start_time % 3600) % (24*3600)
     out = table.query.filter_by(field="ethoscope_metadata")
 
     ethoscope_metadata=out.all()[0].value
