@@ -5,6 +5,7 @@ import pandas as pd
 from flyhostel.utils import (
     get_basedir,
 )
+from flyhostel.data.pose.main import FlyHostelLoader
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,6 @@ def load_sleep_data(experiment: str, identity: int) -> list:
 
     sleep_frames: list = []
     try:
-        from flyhostel.data.pose.main import FlyHostelLoader
         loader = FlyHostelLoader(experiment, int(identity))
         loader.load_sleep_data(bin_size=None, errors="warning")
         df = loader.sleep

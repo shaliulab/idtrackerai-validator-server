@@ -44,6 +44,7 @@ from flyhostel.utils import (
     get_identities,
 )
 
+from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.utils import sleep_bouts as _sleep_bouts, find_sleep_bout as _find_sleep_bout
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,21 @@ def _ffmpeg(*args):
     return process.stdout
 
 
+def _ffmpeg_with_progress(args, duration, on_progress):
+    """Run ffmpeg, calling on_progress(fraction) as it writes `duration` s of output."""
+    process = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-progress", "pipe:1", "-nostats", *args],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    for line in process.stdout:
+        key, _, value = line.strip().partition("=")
+        if key == "out_time_us" and value.lstrip("-").isdigit() and duration > 0:
+            on_progress(min(1.0, max(0.0, int(value) / 1e6 / duration)))
+    stderr = process.stderr.read()
+    if process.wait() != 0:
+        raise RuntimeError(stderr.strip())
+
+
 def bout_video_name(fly, bout):
     """<fly>_sleep_bout_t0-XXXX_t1-YYYY.mp4, with t0 / t1 in seconds since ZT0."""
     experiment = fly.split("__")[0]
@@ -219,8 +235,9 @@ def bout_video_name(fly, bout):
     return f"{fly}_sleep_bout_t0-{round(t0)}_t1-{round(t1)}.mp4"
 
 
-def cut_bout_video(fly, bout, path):
+def cut_bout_video(fly, bout, path, on_progress=None):
     """Write to `path` an MP4 of the fly's movie spanning `bout` (+ padding).
+    on_progress(fraction) is called while the video is written.
 
     Raises ValueError if the movie does not cover the bout, RuntimeError if ffmpeg fails.
     """
@@ -243,7 +260,11 @@ def cut_bout_video(fly, bout, path):
         list_path = handle.name
     try:
         # -f mp4: `path` may not end in .mp4 (e.g. a .part file renamed when complete)
-        _ffmpeg("-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-f", "mp4", "-movflags", "+faststart", path)
+        args = ["-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-f", "mp4", "-movflags", "+faststart", path]
+        if on_progress is None:
+            _ffmpeg(*args)
+        else:
+            _ffmpeg_with_progress(args, sum(d for _, _, d in segments), on_progress)
     finally:
         os.unlink(list_path)
 
@@ -418,63 +439,83 @@ def register_ethogram(app, get_selected_experiment):
         )
 
     @app.route("/api/ethogram/<fly>/sleep_bouts/videos", methods=["POST"])
-    def ethogram_all_sleep_bout_videos(fly):
-        """One MP4 per sleep bout of the fly.
-        JSON body {"save": true}: written to <basedir>/flyhostel/videos/<fly>/ on the
-        server, returns the list of files. Otherwise: returned as a single zip."""
+    def ethogram_sleep_bout_videos_job(fly):
+        """Start a background job making one MP4 per sleep bout; poll /api/jobs/<id>.
+
+        JSON body:
+            frame_number (optional): only the bout ongoing at that frame, or the next one
+            save: write to <basedir>/flyhostel/videos/<fly>/ on the server instead of
+                  offering the result at /api/jobs/<id>/download (an mp4 for a single
+                  bout, a zip otherwise)
+        """
         err = _check_fly(fly)
         if err:
             return err
-        save = bool((request.get_json(silent=True) or {}).get("save"))
+        body = request.get_json(silent=True) or {}
+        save = bool(body.get("save"))
+        frame_number = body.get("frame_number")
         experiment, identity = fly.split("__")
         framerate = _properties(fly)["framerate"]
-        bouts = [
-            {"start_frame": start, "end_frame": end, "duration": (end - start) / framerate}
-            for start, end in _sleep_bouts(experiment, int(identity), framerate)
-        ]
-        if not bouts:
-            return jsonify({"error": f"{fly} has no sleep bouts"}), 404
 
-        def export(directory):
-            written, skipped = [], []
-            for bout in bouts:
-                name = bout_video_name(fly, bout)
-                partial = os.path.join(directory, f".{name}.part")
-                try:
-                    cut_bout_video(fly, bout, partial)
-                    os.replace(partial, os.path.join(directory, name))
-                    written.append(name)
-                except (ValueError, RuntimeError) as error:
-                    if os.path.exists(partial):
-                        os.unlink(partial)
-                    logger.warning("Skipping sleep bout video %s: %s", name, error)
-                    skipped.append({"video": name, "reason": str(error)})
-            return written, skipped
+        if frame_number is not None:
+            bout = find_sleep_bout(fly, int(frame_number))
+            if bout is None:
+                return jsonify({"error": f"{fly} has no more sleep bouts after frame {frame_number}"}), 404
+            bouts = [bout]
+        else:
+            bouts = [
+                {"start_frame": start, "end_frame": end, "duration": (end - start) / framerate}
+                for start, end in _sleep_bouts(experiment, int(identity), framerate)
+            ]
+            if not bouts:
+                return jsonify({"error": f"{fly} has no sleep bouts"}), 404
+        if not _properties(fly)["has_movie"]:
+            return jsonify({"error": f"{fly} has no movie"}), 404
 
+        names = [bout_video_name(fly, bout) for bout in bouts]
+        directory = os.path.join(get_basedir(experiment), "flyhostel", "videos", fly) if save else None
         if save:
-            directory = os.path.join(get_basedir(experiment), "flyhostel", "videos", fly)
             try:
                 os.makedirs(directory, exist_ok=True)
             except OSError as error:
                 return jsonify({"error": f"Cannot create {directory}: {error}"}), 500
-            written, skipped = export(directory)
-            return jsonify({"directory": directory, "videos": written, "skipped": skipped})
 
-        with tempfile.TemporaryDirectory() as workdir:
-            written, skipped = export(workdir)
+        def work(job):
+            if save:
+                job.directory = directory
+                output_dir = directory
+            else:
+                job.workdir = output_dir = tempfile.mkdtemp(prefix="sleep_bouts_")
+
+            written = []
+            for i, (bout, name) in enumerate(zip(bouts, names)):
+                job.update(i, status="running")
+                partial = os.path.join(output_dir, f".{name}.part")
+                try:
+                    cut_bout_video(fly, bout, partial, on_progress=lambda p, i=i: job.update(i, progress=p))
+                    os.replace(partial, os.path.join(output_dir, name))
+                    written.append(name)
+                    job.update(i, status="done", progress=1.0)
+                except (ValueError, RuntimeError) as error:
+                    if os.path.exists(partial):
+                        os.unlink(partial)
+                    logger.warning("Skipping sleep bout video %s: %s", name, error)
+                    job.update(i, status="skipped", error=str(error))
+
             if not written:
-                return jsonify({"error": "No sleep bout video could be made", "skipped": skipped}), 500
-            archive_path = os.path.join(workdir, f"{fly}_sleep_bouts.zip")
+                raise RuntimeError("No sleep bout video could be made")
+            if save:
+                return
+            if len(bouts) == 1:
+                job.result_path, job.download_name = os.path.join(output_dir, written[0]), written[0]
+                return
+            archive_path = os.path.join(output_dir, f"{fly}_sleep_bouts.zip")
             # mp4 does not compress further: just store
             with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
                 for name in written:
-                    archive.write(os.path.join(workdir, name), name)
-            archive_file = open(archive_path, "rb")   # the open handle outlives the directory
+                    archive.write(os.path.join(output_dir, name), name)
+            job.result_path, job.download_name = archive_path, os.path.basename(archive_path)
 
-        response = send_file(
-            archive_file, mimetype="application/zip", as_attachment=True,
-            download_name=f"{fly}_sleep_bouts.zip",
-        )
-        response.headers["X-Videos"] = str(len(written))
-        response.headers["X-Skipped"] = str(len(skipped))
-        return response
+        what = "sleep bout video" if frame_number is not None else "sleep bout videos"
+        job = start_job(f"{fly}: {what}", names, work)
+        return jsonify(job.to_dict()), 202
