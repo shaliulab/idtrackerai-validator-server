@@ -29,6 +29,7 @@ import re
 import sqlite3
 import logging
 import tempfile
+import zipfile
 import subprocess
 from contextlib import closing
 from functools import lru_cache
@@ -43,7 +44,7 @@ from flyhostel.utils import (
     get_identities,
 )
 
-from idtrackerai_validator_server.utils import load_sleep_data
+from idtrackerai_validator_server.utils import sleep_bouts as _sleep_bouts, find_sleep_bout as _find_sleep_bout
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +52,6 @@ FLY_PATTERN = re.compile(r"^FlyHostel\d+_\d+X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2
 
 # Seconds added before and after a sleep bout in the exported video.
 SLEEP_BOUT_PADDING = 5
-# Two asleep rows further apart than this many seconds belong to different bouts.
-SLEEP_BOUT_MAX_GAP = 2
 
 
 def _fly_dir(fly):
@@ -182,32 +181,21 @@ def locate(fly, frame_number=None, zt=None):
     }
 
 
-def sleep_bouts(fly):
-    """[(first_frame, last_frame + 1 s)] of every sleep bout of the fly, sorted."""
+def find_sleep_bout(fly, frame_number, direction="current"):
+    """See utils.find_sleep_bout. None if there is no such bout."""
     experiment, identity = fly.split("__")
     framerate = _properties(fly)["framerate"]
-    frames = load_sleep_data(experiment, int(identity))
-    bouts = []
-    for frame_number in frames:
-        if bouts and frame_number - bouts[-1][1] <= SLEEP_BOUT_MAX_GAP * framerate:
-            bouts[-1][1] = frame_number
-        else:
-            bouts.append([frame_number, frame_number])
-    # each asleep row stands for (about) one second
-    return [(start, int(end + framerate)) for start, end in bouts]
-
-
-def find_sleep_bout(fly, frame_number):
-    """The bout the fly is in at `frame_number`, or the next one. None if there is none."""
-    for start, end in sleep_bouts(fly):
-        if end > frame_number:
-            return {
-                "start_frame": start,
-                "end_frame": end,
-                "current": start <= frame_number,
-                "duration": (end - start) / _properties(fly)["framerate"],
-            }
-    return None
+    bout = _find_sleep_bout(_sleep_bouts(experiment, int(identity), framerate), frame_number, direction)
+    if bout is None:
+        return None
+    start, end = bout
+    return {
+        "start_frame": start,
+        "end_frame": end,
+        "current": start <= frame_number < end,
+        "duration": (end - start) / framerate,
+        "movie_time": _movie_time(fly, start),
+    }
 
 
 def _ffmpeg(*args):
@@ -218,6 +206,46 @@ def _ffmpeg(*args):
     if process.returncode != 0:
         raise RuntimeError(process.stderr.decode(errors="replace").strip())
     return process.stdout
+
+
+def bout_video_name(fly, bout):
+    """<fly>_sleep_bout_t0-XXXX_t1-YYYY.mp4, with t0 / t1 in seconds since ZT0."""
+    experiment = fly.split("__")[0]
+    t0 = frame_to_zt(experiment, bout["start_frame"])
+    try:
+        t1 = frame_to_zt(experiment, bout["end_frame"])
+    except ValueError:   # the bout ends with the recording
+        t1 = t0 + bout["duration"]
+    return f"{fly}_sleep_bout_t0-{round(t0)}_t1-{round(t1)}.mp4"
+
+
+def cut_bout_video(fly, bout, path):
+    """Write to `path` an MP4 of the fly's movie spanning `bout` (+ padding).
+
+    Raises ValueError if the movie does not cover the bout, RuntimeError if ffmpeg fails.
+    """
+    if not _properties(fly)["has_movie"]:
+        raise ValueError(f"{fly} has no movie")
+    duration = _movie_duration(fly)
+    start = _movie_time(fly, bout["start_frame"]) - SLEEP_BOUT_PADDING
+    end = _movie_time(fly, bout["end_frame"]) + SLEEP_BOUT_PADDING
+    if end < 0 or start > duration:
+        raise ValueError(f"Sleep bout {bout['start_frame']}-{bout['end_frame']} is not covered by the movie of {fly}")
+    start, end = max(0.0, start), min(duration, end)
+
+    # Concatenate whole segments spanning the bout (+ padding). Stream copy is
+    # fast even for bouts of hours, but can only cut at keyframes: keeping whole
+    # segments guarantees the bout is included, at the cost of <= 1 segment
+    # (10 s) of extra context on each side.
+    segments = _segments_between(fly, start, end)
+    with tempfile.NamedTemporaryFile("w", suffix=".ffconcat", delete=False) as handle:
+        handle.write("\n".join(["ffconcat version 1.0"] + [f"file '{segment}'" for segment, _, _ in segments]) + "\n")
+        list_path = handle.name
+    try:
+        # -f mp4: `path` may not end in .mp4 (e.g. a .part file renamed when complete)
+        _ffmpeg("-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", "-f", "mp4", "-movflags", "+faststart", path)
+    finally:
+        os.unlink(list_path)
 
 
 def register_ethogram(app, get_selected_experiment):
@@ -342,6 +370,24 @@ def register_ethogram(app, get_selected_experiment):
             return jsonify({"error": f"{fly} has no more sleep bouts after frame {frame_number}"}), 404
         return jsonify(bout)
 
+    @app.route("/api/ethogram/<fly>/sleep_bout/<direction>", methods=["GET"])
+    def ethogram_sleep_bout_nav(fly, direction):
+        """Start of the next / previous sleep bout relative to ?frame_number=.
+        An ongoing bout is skipped in both directions."""
+        err = _check_fly(fly)
+        if err:
+            return err
+        if direction not in ("prev", "next"):
+            return jsonify({"error": "direction must be prev or next"}), 400
+        frame_number = request.args.get("frame_number", type=int)
+        if frame_number is None:
+            return jsonify({"error": "frame_number is required"}), 400
+        bout = find_sleep_bout(fly, frame_number, direction)
+        if bout is None:
+            where = "after" if direction == "next" else "before"
+            return jsonify({"error": f"{fly} has no more sleep bouts {where} frame {frame_number}"}), 404
+        return jsonify(bout)
+
     @app.route("/api/ethogram/<fly>/sleep_bout/video", methods=["GET"])
     def ethogram_sleep_bout_video(fly):
         """MP4 cut from the fly's movie spanning the bout returned by /sleep_bout."""
@@ -354,39 +400,81 @@ def register_ethogram(app, get_selected_experiment):
         bout = find_sleep_bout(fly, frame_number)
         if bout is None:
             return jsonify({"error": f"{fly} has no more sleep bouts after frame {frame_number}"}), 404
-        if not _properties(fly)["has_movie"]:
-            return jsonify({"error": f"{fly} has no movie"}), 404
-
-        duration = _movie_duration(fly)
-        start = _movie_time(fly, bout["start_frame"]) - SLEEP_BOUT_PADDING
-        end = _movie_time(fly, bout["end_frame"]) + SLEEP_BOUT_PADDING
-        if end < 0 or start > duration:
-            return jsonify({"error": f"Sleep bout {bout['start_frame']}-{bout['end_frame']} is not covered by the movie of {fly}"}), 404
-        start, end = max(0.0, start), min(duration, end)
-
-        # Concatenate whole segments spanning the bout (+ padding). Stream copy is
-        # fast even for bouts of hours, but can only cut at keyframes: keeping whole
-        # segments guarantees the bout is included, at the cost of <= 1 segment
-        # (10 s) of extra context on each side.
-        segments = _segments_between(fly, start, end)
-        concat_list = ["ffconcat version 1.0"] + [f"file '{segment}'" for segment, _, _ in segments]
 
         with tempfile.TemporaryDirectory() as workdir:
-            list_path = os.path.join(workdir, "segments.ffconcat")
             path = os.path.join(workdir, "bout.mp4")
-            with open(list_path, "w") as handle:
-                handle.write("\n".join(concat_list) + "\n")
             try:
-                _ffmpeg(
-                    "-f", "concat", "-safe", "0", "-i", list_path,
-                    "-c", "copy", "-movflags", "+faststart", path,
-                )
-                video = open(path, "rb")   # the open handle outlives the directory
+                cut_bout_video(fly, bout, path)
+            except ValueError as error:
+                return jsonify({"error": str(error)}), 404
             except RuntimeError as error:
                 logger.error("Could not cut sleep bout of %s: %s", fly, error)
                 return jsonify({"error": str(error)}), 500
+            video = open(path, "rb")   # the open handle outlives the directory
 
         return send_file(
             video, mimetype="video/mp4", as_attachment=True,
-            download_name=f"{fly}_sleep_{bout['start_frame']}-{bout['end_frame']}.mp4",
+            download_name=bout_video_name(fly, bout),
         )
+
+    @app.route("/api/ethogram/<fly>/sleep_bouts/videos", methods=["POST"])
+    def ethogram_all_sleep_bout_videos(fly):
+        """One MP4 per sleep bout of the fly.
+        JSON body {"save": true}: written to <basedir>/flyhostel/videos/<fly>/ on the
+        server, returns the list of files. Otherwise: returned as a single zip."""
+        err = _check_fly(fly)
+        if err:
+            return err
+        save = bool((request.get_json(silent=True) or {}).get("save"))
+        experiment, identity = fly.split("__")
+        framerate = _properties(fly)["framerate"]
+        bouts = [
+            {"start_frame": start, "end_frame": end, "duration": (end - start) / framerate}
+            for start, end in _sleep_bouts(experiment, int(identity), framerate)
+        ]
+        if not bouts:
+            return jsonify({"error": f"{fly} has no sleep bouts"}), 404
+
+        def export(directory):
+            written, skipped = [], []
+            for bout in bouts:
+                name = bout_video_name(fly, bout)
+                partial = os.path.join(directory, f".{name}.part")
+                try:
+                    cut_bout_video(fly, bout, partial)
+                    os.replace(partial, os.path.join(directory, name))
+                    written.append(name)
+                except (ValueError, RuntimeError) as error:
+                    if os.path.exists(partial):
+                        os.unlink(partial)
+                    logger.warning("Skipping sleep bout video %s: %s", name, error)
+                    skipped.append({"video": name, "reason": str(error)})
+            return written, skipped
+
+        if save:
+            directory = os.path.join(get_basedir(experiment), "flyhostel", "videos", fly)
+            try:
+                os.makedirs(directory, exist_ok=True)
+            except OSError as error:
+                return jsonify({"error": f"Cannot create {directory}: {error}"}), 500
+            written, skipped = export(directory)
+            return jsonify({"directory": directory, "videos": written, "skipped": skipped})
+
+        with tempfile.TemporaryDirectory() as workdir:
+            written, skipped = export(workdir)
+            if not written:
+                return jsonify({"error": "No sleep bout video could be made", "skipped": skipped}), 500
+            archive_path = os.path.join(workdir, f"{fly}_sleep_bouts.zip")
+            # mp4 does not compress further: just store
+            with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as archive:
+                for name in written:
+                    archive.write(os.path.join(workdir, name), name)
+            archive_file = open(archive_path, "rb")   # the open handle outlives the directory
+
+        response = send_file(
+            archive_file, mimetype="application/zip", as_attachment=True,
+            download_name=f"{fly}_sleep_bouts.zip",
+        )
+        response.headers["X-Videos"] = str(len(written))
+        response.headers["X-Skipped"] = str(len(skipped))
+        return response

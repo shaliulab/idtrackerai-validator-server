@@ -1,4 +1,3 @@
-import bisect
 import io
 import os
 from threading import Lock, Timer
@@ -40,7 +39,7 @@ from idtrackerai_validator_server.backend import (
 )
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
-from idtrackerai_validator_server.utils import load_rejections, load_sleep_data as _load_sleep_data, SLEEP_CACHE as _sleep_cache
+from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -390,9 +389,10 @@ def get_animal_metadata():
 
 @app.route('/api/sleep/<direction>/<int:identity>/<int:frame_number>', methods=['GET'])
 def navigate_sleep(direction, identity, frame_number):
-    """Return the nearest frame where `identity` is asleep, in the requested direction.
+    """Return the start of the next / previous sleep bout of `identity`.
 
-    direction: "prev" | "next"
+    direction: "prev" | "next". An ongoing bout is skipped in both directions:
+    next goes to the bout after it, prev to the bout before it.
     Returns {"frame_number": N} or {"frame_number": null} when none found.
     """
     if db_manager is None:
@@ -401,19 +401,8 @@ def navigate_sleep(direction, identity, frame_number):
         return jsonify({"error": "direction must be prev or next"}), 400
 
     experiment = SELECTED_EXPERIMENT.replace("/", "_")
-    frames = _load_sleep_data(experiment, identity)
-
-    if not frames:
-        return jsonify({"frame_number": None})
-
-    if direction == 'prev':
-        idx = bisect.bisect_left(frames, frame_number) - 1
-        result = int(frames[idx]) if idx >= 0 else None
-    else:
-        idx = bisect.bisect_right(frames, frame_number)
-        result = int(frames[idx]) if idx < len(frames) else None
-
-    return jsonify({"frame_number": result})
+    bout = find_sleep_bout(sleep_bouts(experiment, identity, FRAMERATE), frame_number, direction)
+    return jsonify({"frame_number": int(bout[0]) if bout else None})
 
 
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
