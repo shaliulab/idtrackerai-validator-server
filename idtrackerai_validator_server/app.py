@@ -39,6 +39,7 @@ from idtrackerai_validator_server.backend import (
     list_experiments
 )
 from idtrackerai_validator_server.pe_validation import register_pe_validation
+from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.utils import load_rejections
 
 # Initialize logging
@@ -74,6 +75,7 @@ app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
 CORS(app)
 
 register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
