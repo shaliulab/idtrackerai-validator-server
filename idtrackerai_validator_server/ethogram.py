@@ -60,6 +60,9 @@ from idtrackerai_validator_server.utils import sleep_bouts as _sleep_bouts, find
 
 logger = logging.getLogger(__name__)
 
+# <fly>_sleep_bout_t0-XXXX_t1-YYYY.mp4 (see flyhostel's bout_video_name), t0 / t1 in s since ZT0
+SAVED_VIDEO_PATTERN = re.compile(r"^(?P<fly>.+)_sleep_bout_t0-(?P<t0>-?\d+)_t1-(?P<t1>-?\d+)\.mp4$")
+
 FLY_PATTERN = re.compile(r"^FlyHostel\d+_\d+X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}__\d{2}$")
 
 
@@ -71,6 +74,11 @@ def _fly_dir(fly):
 
 def _figure_path(fly):
     return os.path.join(_fly_dir(fly), f"{fly}.json")
+
+
+def _saved_videos_dir(fly):
+    """Where "save on server" / FlyHostelLoader.record_all_sleep_bouts() write sleep bout videos."""
+    return os.path.join(get_basedir(fly.split("__")[0]), "flyhostel", "videos", fly)
 
 
 def _movie_dir(fly):
@@ -276,6 +284,41 @@ def register_ethogram(app, get_selected_experiment):
             raise ValueError("Pass exactly one of ?frame_number= or ?zt=")
         return frame_number, zt
 
+    @app.route("/api/ethogram/<fly>/saved_videos", methods=["GET"])
+    def ethogram_saved_videos(fly):
+        """Sleep bout videos saved on the server for the fly (<basedir>/flyhostel/videos/<fly>/),
+        sorted by start, each placed on the ethogram's time axis."""
+        err = _check_fly(fly)
+        if err:
+            return err
+        experiment = fly.split("__")[0]
+        directory = _saved_videos_dir(fly)
+        if not os.path.isdir(directory):
+            return jsonify({"directory": directory, "videos": []})
+
+        props = _properties(fly)
+        videos = []
+        for name in sorted(os.listdir(directory)):
+            match = SAVED_VIDEO_PATTERN.match(name)
+            if not match or match["fly"] != fly:
+                continue
+            t0, t1 = float(match["t0"]), float(match["t1"])
+            try:
+                start_frame = zt_to_frame(experiment, t0)
+            except ValueError as error:
+                logger.warning("Cannot place %s: %s", name, error)
+                continue
+            videos.append({
+                "name": name,
+                "t0": t0,
+                "t1": t1,
+                "duration": t1 - t0,
+                "start_frame": start_frame,
+                "movie_time": _movie_time(fly, start_frame) if props["first_chunk"] is not None else None,
+            })
+        videos.sort(key=lambda video: video["t0"])
+        return jsonify({"directory": directory, "videos": videos})
+
     @app.route("/api/ethogram/<fly>/locate", methods=["GET"])
     def ethogram_locate(fly):
         """Convert ?frame_number= or ?zt= into frame_number, zt and movie_time."""
@@ -417,7 +460,7 @@ def register_ethogram(app, get_selected_experiment):
             return jsonify({"error": f"{fly} has no movie"}), 404
 
         names = [bout_video_name(fly, bout) for bout in bouts]
-        directory = os.path.join(get_basedir(experiment), "flyhostel", "videos", fly) if save else None
+        directory = _saved_videos_dir(fly) if save else None
         if save:
             try:
                 os.makedirs(directory, exist_ok=True)
