@@ -162,13 +162,18 @@ def _movie_time(fly, frame_number):
 
 
 def locate(fly, frame_number=None, zt=None):
-    """Resolve a frame number or a ZT time into all three time conventions."""
+    """Resolve a frame number or a ZT time into all three time conventions.
+    movie_time is None when the fly has no motionmapper feather to place frames in its movie."""
     experiment = fly.split("__")[0]
     if frame_number is None:
         frame_number = zt_to_frame(experiment, zt)
     zt = frame_to_zt(experiment, frame_number)
-    movie_time = _movie_time(fly, frame_number)
-    in_movie = _properties(fly)["has_movie"] and 0 <= movie_time <= _movie_duration(fly)
+    try:
+        movie_time = _movie_time(fly, frame_number)
+    except ValueError:
+        movie_time = None
+    in_movie = (movie_time is not None and _properties(fly)["has_movie"]
+                and 0 <= movie_time <= _movie_duration(fly))
     return {
         "frame_number": int(frame_number),
         "zt": zt,
