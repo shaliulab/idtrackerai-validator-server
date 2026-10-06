@@ -20,8 +20,10 @@ from flask import session
 import h5py
 from pathlib import Path
 
+from flyhostel.data.human_validation.utils import check_if_validated
 from flyhostel.utils import (
     get_identities,
+    get_number_of_animals,
     get_square_width,
     get_square_height,    
 )
@@ -60,9 +62,30 @@ if SELECTED_EXPERIMENT_ is not None:
 else:
     SELECTED_EXPERIMENT = None
 
+# USE_VAL="True"/"False" forces the tracking source for every experiment; unset,
+# each loaded experiment starts from default_use_val() and the "Validated
+# tracking" box switches it until the next experiment is loaded.
 USE_VAL = os.environ.get("USE_VAL", None)
 if USE_VAL is not None:
     USE_VAL = USE_VAL == "True"
+
+
+def default_use_val(experiment):
+    """Validated tracking (the *_VAL tables) for groups, raw tracking for single
+    flies; never the validated tables when the experiment has none."""
+    if USE_VAL is not None:
+        return USE_VAL
+    try:
+        group = get_number_of_animals(experiment.replace("/", "_")) > 1
+    except Exception as error:
+        logger.warning("Could not count the animals of %s: %s", experiment, error)
+        group = True
+    if not group:
+        return False
+    validated = check_if_validated(generate_database_filename(experiment)) == "_VAL"
+    if not validated:
+        logger.warning("%s has no validated tables, showing raw tracking", experiment)
+    return validated
 
 lock = Lock()
 
@@ -104,7 +127,7 @@ IDTRACKERAI_CONFIG = None
 db_manager = None
 
 if SELECTED_EXPERIMENT is not None:
-    db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
+    db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=default_use_val(SELECTED_EXPERIMENT))
     print(f"Validation status: {db_manager.use_val}")
     with app.app_context():
         out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
@@ -300,7 +323,7 @@ def load():
         except (AttributeError, KeyError):
             pass
 
-        db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=USE_VAL)
+        db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=default_use_val(SELECTED_EXPERIMENT))
 
         out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
         if experiment_metadata is None:
@@ -322,7 +345,8 @@ def load():
     finally:
         lock.release()
 
-    return jsonify({"message": "success", "experiment": SELECTED_EXPERIMENT, "first_frame": first_chunk * CHUNKSIZE})
+    return jsonify({"message": "success", "experiment": SELECTED_EXPERIMENT, "first_frame": first_chunk * CHUNKSIZE,
+                    "use_val": bool(db_manager.use_val)})
 
 
 def row2dict(row):
@@ -750,7 +774,7 @@ def serve_frontend(path):
 @app.route("/api/use_val", methods=["GET"])
 def get_use_val():
     return jsonify({
-        "use_val": db_manager.use_val if db_manager is not None else USE_VAL
+        "use_val": bool(db_manager.use_val) if db_manager is not None else bool(USE_VAL)
     })
 
 @app.route("/api/current_experiment", methods=["GET"])
@@ -760,20 +784,22 @@ def current_experiment():
 
 @app.route("/api/use_val", methods=["POST"])
 def set_use_val():
-    global USE_VAL, db_manager
+    """Switch the loaded experiment's tracking source; the next /api/load starts
+    again from default_use_val()."""
+    global db_manager
     data = request.get_json() or {}
-    USE_VAL = bool(data.get("use_val"))
+    use_val = bool(data.get("use_val"))
 
     if SELECTED_EXPERIMENT is None:
-        return jsonify({"use_val": USE_VAL})
+        return jsonify({"error": "no experiment loaded"}), 400
 
     with lock:
         db_manager = DatabaseManager(
             app, db, with_fragments=WITH_FRAGMENTS,
-            experiment=SELECTED_EXPERIMENT, use_val=USE_VAL,
+            experiment=SELECTED_EXPERIMENT, use_val=use_val,
         )
     logger.info("Validation status: %s", db_manager.use_val)
-    return jsonify({"use_val": db_manager.use_val})
+    return jsonify({"use_val": bool(db_manager.use_val)})
 
 def shutdown_server():
     func = request.environ.get('werkzeug.server.shutdown')
