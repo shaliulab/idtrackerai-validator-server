@@ -14,6 +14,7 @@ INTEGRATION (see the chat message):
   3. set PE_BOUTS_DIR / PE_MEDIA_DIR / PE_DB below (or via env)
 """
 import os.path
+import json
 import logging
 import sqlite3
 import datetime
@@ -106,6 +107,35 @@ def _init_db():
             end_frame INTEGER NOT NULL, annotator TEXT, created_at TEXT NOT NULL,
             PRIMARY KEY (fly, start_frame, end_frame));
         """)
+
+# Tables holding what reviewers entered (verdicts and segmentation ground truth),
+# as opposed to the pipeline's auto_runs / auto_segments. Each maps to the WHERE
+# clause selecting one experiment's rows: pe_annotations is keyed on the
+# experiment (stored slash-separated, but accept the flat form too), the others
+# on the fly id "<flat experiment>__NN".
+_HUMAN_TABLES = {
+    "pe_annotations": "experiment IN (?, ?)",
+    "gt_segments": "substr(fly, 1, ?) = ?",
+    "gt_windows": "substr(fly, 1, ?) = ?",
+}
+
+
+def _slash_experiment(experiment):
+    # "FlyHostel4_2X_2025-06-28_16-00-00" or the slash form -> "FlyHostel4/2X/2025-06-28_16-00-00"
+    return experiment if "/" in experiment else experiment.replace("_", "/", 2)
+
+
+def _human_where_args(table, experiment):
+    flat = experiment.replace("/", "_")
+    if table == "pe_annotations":
+        return (_slash_experiment(experiment), flat)
+    prefix = f"{flat}__"
+    return (len(prefix), prefix)
+
+
+def _deleted_backup_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(PE_DB)), "pe_annotations_deleted")
+
 
 def _fly_id(experiment, identity):
     # experiment global is stored as "FlyHostel4/2X/2025-02-04"; the feather/media use
@@ -247,6 +277,52 @@ def register_pe_validation(app, get_selected_experiment):
                 "SELECT * FROM pe_annotations WHERE experiment=?", (exp,))]
         return jsonify(rows)
 
+
+    @app.route("/api/pe/human_annotations", methods=["GET"])
+    def pe_human_annotations_summary():
+        """How many human-made rows the loaded experiment has, per table."""
+        exp, err = _experiment_or_400()
+        if err:
+            return err
+        with sqlite3.connect(PE_DB) as c:
+            counts = {t: c.execute(f"SELECT COUNT(*) FROM {t} WHERE {where}",
+                                   _human_where_args(t, exp)).fetchone()[0]
+                      for t, where in _HUMAN_TABLES.items()}
+        return jsonify({"experiment": exp, "counts": counts})
+
+    @app.route("/api/pe/human_annotations", methods=["DELETE"])
+    def pe_human_annotations_delete():
+        """Delete every human-made row of the loaded experiment (verdicts, GT segments,
+        reviewed windows). The body must repeat the experiment ({"experiment": ...}),
+        so a stale page cannot wipe another experiment. The rows are first saved as
+        JSON under <db dir>/pe_annotations_deleted/."""
+        exp, err = _experiment_or_400()
+        if err:
+            return err
+        confirm = (request.get_json(silent=True) or {}).get("experiment", "")
+        if _slash_experiment(confirm.strip()) != _slash_experiment(exp):
+            return jsonify({"error": f"confirmation {confirm!r} does not match "
+                                     f"the loaded experiment {exp!r}"}), 409
+
+        with sqlite3.connect(PE_DB) as c:
+            c.row_factory = sqlite3.Row
+            rows = {t: [dict(r) for r in c.execute(f"SELECT * FROM {t} WHERE {where}",
+                                                   _human_where_args(t, exp))]
+                    for t, where in _HUMAN_TABLES.items()}
+            counts = {t: len(r) for t, r in rows.items()}
+            backup = None
+            if any(counts.values()):
+                os.makedirs(_deleted_backup_dir(), exist_ok=True)
+                stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                backup = os.path.join(_deleted_backup_dir(),
+                                      f"{exp.replace('/', '_')}_{stamp}.json")
+                with open(backup, "w") as fh:
+                    json.dump({"experiment": exp, "db": PE_DB, "deleted_at": stamp,
+                               "rows": rows}, fh, indent=1)
+                for t, where in _HUMAN_TABLES.items():
+                    c.execute(f"DELETE FROM {t} WHERE {where}", _human_where_args(t, exp))
+        logger.warning("Deleted human PE annotations of %s: %s (backup: %s)", exp, counts, backup)
+        return jsonify({"experiment": exp, "deleted": counts, "backup": backup})
 
     @app.route("/api/pe/trace", methods=["GET"])
     def pe_trace():
