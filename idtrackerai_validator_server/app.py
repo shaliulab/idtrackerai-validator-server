@@ -381,10 +381,28 @@ def get_animal_metadata():
             except (TypeError, ValueError):
                 return str(v) if v is not None else ''
 
+        # Match rows to flies on the `identity` column: the rows are not necessarily
+        # in identity order. Without that column (or with a single animal, whose
+        # identity is 0 here but usually 1 in the metadata), fall back to row order.
+        by_identity = {}
+        if 'identity' in df.columns and len(identities) > 1:
+            for _, r in df.iterrows():
+                try:
+                    by_identity[int(r['identity'])] = r
+                except (TypeError, ValueError):
+                    pass
+            if len(by_identity) != len(df):
+                logger.warning("ethoscope_metadata of %s: identity column missing or duplicated, "
+                               "matching flies by row order", experiment)
+                by_identity = {}
+
         result = {}
         for i, identity in enumerate(identities):
-            if i < len(df):
-                r = df.iloc[i]
+            if by_identity:
+                r = by_identity.get(int(identity))
+            else:
+                r = df.iloc[i] if i < len(df) else None
+            if r is not None:
                 entry = {}
                 if 'sex' in df.columns:
                     entry['sex'] = safe(r.get('sex'))
