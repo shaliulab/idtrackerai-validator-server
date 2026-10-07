@@ -382,6 +382,34 @@ def get_framerate():
     return framerate
 
 
+def _git_version():
+    """Commit of the root repository this server runs from, read once at start-up
+    (later checkouts do not change the code already running)."""
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", root, *args], capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    try:
+        return {
+            "commit": git("rev-parse", "--short", "HEAD"),
+            "date": git("log", "-1", "--format=%cs"),
+            "dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
+        }
+    except Exception as error:
+        logging.warning("Could not read the git commit of %s: %s", root, error)
+        return {"commit": None, "date": None, "dirty": False}
+
+
+GIT_VERSION = _git_version()
+
+
+@app.route("/api/version", methods=['GET'])
+def get_version():
+    return jsonify(GIT_VERSION)
+
+
 @app.route("/api/animal_metadata", methods=['GET'])
 def get_animal_metadata():
     if db_manager is None:
