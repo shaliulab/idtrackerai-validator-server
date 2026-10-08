@@ -43,6 +43,7 @@ from idtrackerai_validator_server.backend import (
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.jobs import register_jobs
+from idtrackerai_validator_server.overview import register_overview
 from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
 
 # Initialize logging
@@ -101,6 +102,7 @@ CORS(app)
 register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_jobs(app)
+register_overview(app)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
