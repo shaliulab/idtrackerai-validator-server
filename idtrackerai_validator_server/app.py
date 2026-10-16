@@ -44,6 +44,7 @@ from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.jobs import register_jobs
 from idtrackerai_validator_server.overview import register_overview
+from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
 
@@ -104,6 +105,7 @@ register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_jobs(app)
 register_overview(app)
+register_metadata_sync(app)
 register_validation_csv(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 
 # Clean up previous frames

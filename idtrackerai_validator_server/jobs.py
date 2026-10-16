@@ -37,6 +37,7 @@ class Job:
         self.result_path = None          # file to hand to the client, if any
         self.download_name = None
         self.workdir = None              # deleted when the job is forgotten / downloaded
+        self.result = None               # JSON-able result shown by the client, if any
         self._lock = threading.Lock()
 
     def update(self, index, **fields):
@@ -53,6 +54,7 @@ class Job:
                 "items": [dict(item) for item in self.items],
                 "directory": self.directory,
                 "download": self.result_path is not None,
+                "result": self.result,
             }
 
     def cleanup(self):
