@@ -38,7 +38,9 @@ npm run build
 | `VALIDATOR_EXPERIMENT` | Yes | Experiment path, e.g. `FlyHostel4/6X/2023-08-31_13-00-00` or underscore form `FlyHostel4_6X_2023-08-31_13-00-00` |
 | `FLYHOSTEL_VIDEOS` | Yes | Root directory containing all experiment folders and `index.txt` |
 | `BACKEND_PORT` | No | Flask port (default: 5000) |
-| `USE_VAL` | No | `"True"` or `"False"` — override auto-detection of validated DB tables |
+| `FLYHOSTEL_METADATA` | No | CSV exports of the metadata sheets, for not-analyzed experiments in the Overview (default: `/flyhostel_data/metadata`) |
+| `GOOGLEAPI_CONFIG` | No | Config listing the metadata sheets (`SHEETS`) (default: `~/.config/googleapi/config.yaml`) |
+| `USE_VAL` | No | `"True"` or `"False"` — force the tracking source for every experiment. Unset: each loaded experiment starts on validated tables (`_VAL`) when it has >1 fly and those tables exist, else raw tracking (`app.default_use_val`); the "Validated tracking" box switches it until the next experiment load |
 
 ## Installation
 
@@ -57,8 +59,11 @@ The `idtrackerai` and `flyhostel` packages are external dependencies not publish
 - **`backend.py`**: Loads experiments (`load_experiment`), reads idtrackerai config from SQLite, runs segmentation via `idtrackerai._process_frame`, and provides frame annotation/drawing utilities.
 - **`database.py`**: `DatabaseManager` dynamically creates Flask-SQLAlchemy models at runtime. Table names have a `_VAL` suffix when the experiment has been validated (e.g., `ROI_0_VAL`, `IDENTITY_VAL`). The suffix is auto-detected by `check_if_validated` or set via `USE_VAL`.
 - **`constants.py`**: Feature flags (`INCLUDE_POSE`, `WITH_FRAGMENTS`) and defaults (`first_chunk=50`, `FRAMES_DIR`).
-- **`utils.py`**: Loads rejection CSVs from `$FLYHOSTEL_VIDEOS/<experiment>/interactions/`.
-- **`pose_reader.py`**: `BehaviorReader`/`GroupBehaviorReader` for reading per-animal MP4 clips. Not currently used by the main app.
+- **`ethogram.py`**: `register_ethogram(app, ...)` adds `/api/ethogram/*` routes (merged from the behavior-viewer project). Serves pre-rendered plotly ethograms and HLS movies from `<basedir>/motionmapper/<NN>/` (`<fly>.json`, `<fly>.feather`, `movie/movie.m3u8`). The figure x axis is seconds since movie start; frame = `first_chunk*chunksize + t*framerate`, with `first_chunk` read from the feather.
+- **`overview.py`**: `register_overview(app)` adds `/api/overview`: reads `METADATA` (`ethoscope_metadata`, chunks) of every database in `index.txt` (thread pool, cached per file until its mtime changes) for the Overview tab. Fly columns are discovered, not hard-coded; junk columns (`" "`, `_`, `03-02`) and `NONE`/`nan` values are dropped. `merge_light_cycle` gathers the light cycle (LD/DD/LL), which older sheets wrote in `condition`, `experiment` or at the end of `vial`, into `light_cycle` (in the response only, databases untouched), with `light_cycle_source` per fly and `light_cycle_flags` per experiment (listed under "Non-standard light cycle encoding" in the Overview tab). `scan_not_analyzed` adds the experiments of the metadata sheets (latest `*metadata<N> - <sheet>.csv` in `$FLYHOSTEL_METADATA` of each sheet under `SHEETS` in `$GOOGLEAPI_CONFIG`) whose folder exists but has no `*db` other than `index.db`; `rebuild_index` runs the index command.
+- **`jobs.py`**: In-memory registry of background jobs (daemon threads) with per-item progress, polled by the frontend console. The last 50 finished jobs are kept.
+- **`utils.py`**: Loads rejection CSVs from `$FLYHOSTEL_VIDEOS/<experiment>/interactions/`, and per-fly asleep frames (`load_sleep_data`, cached in `SLEEP_CACHE`, cleared on experiment switch).
+- **`pose_reader.py`**: 
 - **`databasev1.py`**: Entirely commented out (deprecated).
 
 ### Database Schema (SQLite)
@@ -74,27 +79,53 @@ Tables accessed (with or without `_VAL` suffix based on validation status):
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/frame/<frame_number>` | Returns JPEG frame saved to `./frames/`; runs segmentation and updates `contours` |
+| `GET /api/frame/<frame_number>` | JPEG of the frame (encoded in memory; requests may overlap, only `cap.get_image` holds the lock) |
 | `GET /api/tracking/<frame_number>` | Returns centroid positions, identities, ZT time |
-| `GET /api/preprocess/<frame_number>` | Returns contours from last `process_frame` call |
+| `GET /api/preprocess/<frame_number>` | Contours of that frame, segmented on demand and cached (only requested by the client when `PRINT_CONTOUR`) |
 | `GET /api/framerate` | Returns recording framerate |
+| `GET /api/version` | Commit of the root repository (`commit`, `date`, `dirty`), read once at server start; shown in the app bar's top right corner |
 | `GET /api/next_error/<n>`, `prev_error/<n>` | Navigate to frames where `identity=0` |
 | `GET /api/next_ok/<n>`, `prev_ok/<n>` | Navigate to frames where all identities are non-zero |
 | `GET /api/next_rejection/<n>`, `prev_rejection/<n>` | Navigate to flagged rejection frames |
 | `GET /api/next_ai/<n>`, `prev_ai/<n>` | Navigate to frames with AI intervention |
+| `GET /api/sleep/<prev|next>/<identity>/<n>` | Start of the previous / next sleep bout of a fly (an ongoing bout is skipped) |
+| `GET /api/ethogram/flies` | Flies of the loaded experiment, with `available` = ethogram JSON exists |
+| `GET /api/ethogram/<fly>/figure`, `/properties`, `/movie/<file>` | Plotly figure JSON; framerate/chunksize/first_chunk/has_movie; HLS playlist and segments |
+| `GET /api/ethogram/<fly>/locate?frame_number=N` or `?zt=S` | Converts between frame number (since chunk 0), ZT seconds (since ZT0 of day 1, flyhostel convention) and movie time |
+| `GET /api/ethogram/<fly>/movie_frame?frame_number=N` or `?zt=S` | JPEG of the fly's movie at that time |
+| `GET /api/ethogram/<fly>/sleep_bout?frame_number=N` | Sleep bout ongoing at N, else the next one; 404 if none left |
+| `GET /api/ethogram/<fly>/sleep_bout/prev`, `/next?frame_number=N` | Start of the previous / next sleep bout; an ongoing bout is skipped in both directions (same logic as `/api/sleep/<dir>/...`, see `utils.find_sleep_bout`) |
+| `GET /api/ethogram/<fly>/sleep_bout/video?frame_number=N` | MP4 of that bout cut from the fly's movie (whole 10 s HLS segments, stream copy), named `<fly>_sleep_bout_t0-<ZT s>_t1-<ZT s>.mp4` |
+| `POST /api/ethogram/<fly>/sleep_bouts/videos` | Starts a job making one MP4 per sleep bout (or only the current/next one with `{"frame_number": N}`); `{"save": true}` writes them to `<basedir>/flyhostel/videos/<fly>/`, otherwise the result (mp4 or zip) is offered at `/api/jobs/<id>/download` |
+| `GET /api/ethogram/<fly>/saved_videos` | Sleep bout videos in `<basedir>/flyhostel/videos/<fly>/`, parsed from their `_t0-<ZT>_t1-<ZT>` names and placed on the movie's time axis (one jump button each in the Ethograms tab) |
+| `GET /api/pe/human_annotations`, `DELETE` same | Counts / deletes the loaded experiment's human-made rows in `pe_annotations.db` (`pe_annotations`, `gt_segments`, `gt_windows`; auto segmentation is kept). `DELETE` needs `{"experiment": <loaded experiment>}` and first dumps the rows to `<db dir>/pe_annotations_deleted/<experiment>_<timestamp>.json`. Button: "Delete human annotations…" in the PE tab (`DeletePEAnnotations.js`) |
+| `GET /api/overview[?refresh=1]` | Every experiment of `index.txt`: path fields (flyhostel, group size, date), `has_val`, `duration_h`, `flies` (one dict per `ethoscope_metadata` row), plus `fly_columns` ordered by coverage. Also the experiments of the metadata sheets with a folder but no database (`analyzed: false`, `sheets`, flies from the sheet rows), and `warnings` |
+| `POST /api/overview/reindex` | Job rewriting `$FLYHOSTEL_VIDEOS/index.txt` (`find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db`, replaced only if find listed something; one at a time, 409 otherwise); the count is in `items[0].count`. Button: "Rebuild index" in the Overview tab |
+| `GET /api/jobs/<id>`, `/api/jobs/<id>/download` | Progress of a background job (one item per video, progress 0–1); its result file, downloadable once |
 
 ### Frontend (`idtrackerai-validator-client/src/`)
 
+- **`index.css`**: theme tokens as CSS variables (`<html data-theme="light|dark">`, set by `App.js`) and the shared classes (`.card`, `.field`, `.toolbar`, `.icon-btn`, …). `THEMES` in `App.js` mirrors them for components still taking a `theme` prop.
 - **`constants.js`**: `BACKEND_SERVER` hostname must match the server (currently hardcoded to `"cv3"`). `BACKEND_PORT` can be overridden via `REACT_APP_BACKEND_PORT` env var.
-- **`App.js`**: Root component — fetches frame image, tracking data, and contours in parallel on each frame change. Manages playback loop.
-- **`FrameWithSquare.js`**: Canvas rendering (react-konva) of the video frame with overlaid tracking data, contours, and pose keypoints.
+- **`App.js`**: Root component — owns the `FramePlayer` (seeks on every `frameNumber` change, runs playback while `isPlaying`). The Group viewer frame is sized to fill the height left above the console (at most half the window width) until the splitter beside it is dragged (width saved as a share of the window in `fh-frame-width-share`; double click returns to auto-fit); the side panel fills the available height.
+- **`FrameWithSquare.js`**: Canvas rendering (react-konva) of the video frame with overlaid tracking data, contours, and pose keypoints. The hover magnifier's border takes the identity colour of the fly nearest the cursor, whose identity is shown in its top-left corner.
+- **App bar** (`App.js`): `VersionTag` (server commit, `*` = uncommitted changes) and `Logos`, two images loaded from `public/logos/logo1.png` and `logo2.png` (hidden while missing; see `LOGOS`).
+- **`layout.js`**: hooks `useFillHeight` (height down to the console), `useElementSize` (ResizeObserver), `useStoredNumber` (localStorage-backed number).
+- **`Splitter.js`**: Drag handle used to resize panels (frame | side panel, console).
 - **`buttons.js`**: Navigation buttons (prev/next by 1, 10, 30, chunk; prev/next error/ok/AI/rejection; play/pause).
 - **`slider.js`**: Scrubber bar for frame navigation.
-- **`queue.js`**: `RequestQueue` serializes image fetches (max 1 simultaneous) to avoid out-of-order frame display.
+- **`EthogramViewer.js`**: "Ethograms" tab (Ctrl+3), lazy-loaded because it bundles plotly. One fly at a time via dropdown / ◀ ▶ / ↑↓; ←/→ pan; syncs with the HLS movie; "Open frame in viewer" jumps the idtrackerai tab to the cursor frame. Its `request` prop ({fly, frameNumber}) opens a fly at a frame: used by the blobs table "etho" button.
+- **`PEValidator.js`**: PE tab. Fills the window down to the console: a controls card, the media card (video | pose | traces; square panels sized from its height, auto ≈60% of the room, draggable, `fh-pe-media-height`) and the bouts table; "Current media" is a resizable side panel (`fh-pe-side-width`). Styles: `.pe-*` in `index.css`. "Find PE near" a ZT (s) or frame number selects the closest PE bout (conversion via `/api/ethogram/<fly>/locate`); bursts are ordered by score or, with "sort chronologically", by first frame (audit mode keeps the audit order).
+- **`OverviewTab.js`**: "Overview" tab (Ctrl+4), dashboard of all experiments from `/api/overview` (fetched when first shown). Counting is client side on fly rows; clicking a bar toggles a filter (each chart ignores its own filter); a "Find experiments" query (genotype, living with another genotype / no one / only its own, optional exact number of flies of each of the two genotypes, date range; `applyQuery`, stored in `fh-overview-query`) applied before the bar filters, a derived `cohoused_with` property (other flies' genotypes), experiments/flies toggle, cross-tab, experiments table whose "Open" loads the experiment (`openExperiment` in `App.js`), CSV export. Chart choice in `fh-overview-*` localStorage. Styles: `.ov-*` in `index.css`.
+- **`HelpTab.js`**: "How to use" tab (Ctrl+5), static user guide with a contents sidebar and a shortcut table. Keep it in sync when buttons, shortcuts or workflows change.
+- **`blobs_table.js`**: `BlobsTable` (viewer's per-fly table; `readOnly` drops the editable frame/chunk inputs and the sleep/etho columns) and `FlyRow`, the read-only row of one fly at a given frame (fetched from `/api/tracking/<frame>`), shown in the PE tab (selected bout's start) and the Ethograms tab (cursor).
+- **`MessageConsole.js`**: Console docked at the bottom of the app. Its height is dragged from its top edge (`fh-console-height`). `ConsoleProvider` (in `index.js`) exposes `useConsole()` → `log(level, text)` and `trackJob(job)` (polls `/api/jobs/<id>`, shows a progress bar per item, downloads the result).
+- **`framePlayer.js`**: `FramePlayer` loads image + tracking (+ contours) per frame as one bundle and caches them. `seek(n)`: the latest request wins, frames are shown in request order (fast scrolling skips frames, never shows them out of order). `play()`: wall-clock playback that prefetches one frame ahead and drops frames when the server is slower than the requested speed. Mouse: wheel scrubs (pauses playback), middle click plays/pauses.
 
 ## Key Configuration Notes
 
 - **`BACKEND_SERVER` in `constants.js`** must be updated when deploying to a different host.
 - **`first_chunk` in `constants.py`** controls which video chunk loads at startup (default: 50).
 - `INCLUDE_POSE=False` in `constants.py` — pose support is disabled and not fully implemented (raises `NotImplementedError` if enabled).
-- Frames are cached to `./frames/` (relative to working directory) and wiped at each server start.
+- `./frames/` (`FRAMES_DIR`) is still wiped at server start but no longer written: frames are encoded in memory.
+- Sleep-bout video helpers live in flyhostel (`flyhostel/data/pose/loaders/sleep_videos.py`, also `FlyHostelLoader.record_all_sleep_bouts()`); `ethogram.py` and `utils.py` import them. The server env imports flyhostel from wherever it is installed, so that copy must contain the module.

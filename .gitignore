@@ -3,3 +3,7 @@ frames/
 __pycache__/
 server.log
 idtrackerai_validator_server/frontend/
+pe_bouts
+build/
+*whl
+*tar.gz
