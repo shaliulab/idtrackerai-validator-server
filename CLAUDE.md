@@ -42,6 +42,8 @@ npm run build
 | `DOWNLOAD_FLYHOSTEL_METADATA` | No | `download_flyhostel_metadata` executable for the Overview's metadata update (default: `~vibflysleep/mambaforge/envs/rapids-23.04/bin/…`) |
 | `GOOGLEAPI_CONFIG` | No | Config listing the metadata sheets (`SHEETS`) (default: `~/.config/googleapi/config.yaml`) |
 | `USE_VAL` | No | `"True"` or `"False"` — force the tracking source for every experiment. Unset: each loaded experiment starts on validated tables (`_VAL`) when it has >1 fly and those tables exist, else raw tracking (`app.default_use_val`); the "Validated tracking" box switches it until the next experiment load |
+| `CVAT_HOST`, `CVAT_USERNAME`, `CVAT_PASSWORD` | No | CVAT server (port 8080) for the Group viewer's CVAT buttons; without them the buttons stay grayed out |
+| `CVAT_PUBLIC_URL` | No | CVAT URL opened by the browser (default: `http://<CVAT_HOST>:8080`, or the host name the browser used to reach the server when `CVAT_HOST` is local) |
 
 ## Installation
 
@@ -64,6 +66,7 @@ The `idtrackerai` and `flyhostel` packages are external dependencies not publish
 - **`overview.py`**: `register_overview(app)` adds `/api/overview`: reads `METADATA` (`ethoscope_metadata`, chunks) of every database in `index.txt` (thread pool, cached per file until its mtime changes) for the Overview tab. Fly columns are discovered, not hard-coded; junk columns (`" "`, `_`, `03-02`) and `NONE`/`nan` values are dropped. `merge_light_cycle` gathers the light cycle (LD/DD/LL), which older sheets wrote in `condition`, `experiment` or at the end of `vial`, into `light_cycle` (in the response only, databases untouched), with `light_cycle_source` per fly and `light_cycle_flags` per experiment (listed under "Non-standard light cycle encoding" in the Overview tab). `scan_not_analyzed` adds the experiments of the metadata sheets (latest `*metadata<N> - <sheet>.csv` in `$FLYHOSTEL_METADATA` of each sheet under `SHEETS` in `$GOOGLEAPI_CONFIG`) whose folder exists but has no `*db` other than `index.db`; `rebuild_index` runs the index command.
 - **`metadata_sync.py`**: `register_metadata_sync(app)`: refresh an experiment's `ethoscope_metadata` from the Google sheets in two steps (preview job with checks, then apply), and `predownload` for many experiments (`download_metadata_batch.py`, standalone, reuses googleapi's own filtering so the CSVs equal the CLI's; ~30 s for all). Runs `$DOWNLOAD_FLYHOSTEL_METADATA` (default: the `rapids-23.04` env's `download_flyhostel_metadata`, which needs a valid token in `~/.config/googleapi/`; 300 s timeout).
 - **`jobs.py`**: In-memory registry of background jobs (daemon threads) with per-item progress, polled by the frontend console. A job may carry a JSON `result` for the client. The last 50 finished jobs are kept.
+- **`cvat.py`**: `register_cvat(app, ...)` adds `/api/cvat`: CVAT projects named after the loaded experiment (`FlyHostel1_3X_<date>`, optionally with a suffix such as `_long`; exact name first) and every frame of their tasks as `frame_number -> [task, job, task frame]` (image `<experiment>_<chunk>_<frame0>_<block>.png` = frame `frame0 + block`; the exact-name project's, then the newest task wins). Cached 5 min per experiment (~5 s to build).
 - **`utils.py`**: Loads rejection CSVs from `$FLYHOSTEL_VIDEOS/<experiment>/interactions/`, and per-fly asleep frames (`load_sleep_data`, cached in `SLEEP_CACHE`, cleared on experiment switch).
 - **`pose_reader.py`**: 
 - **`databasev1.py`**: Entirely commented out (deprecated).
@@ -107,6 +110,7 @@ Tables accessed (with or without `_VAL` suffix based on validation status):
 | `POST /api/metadata/predownload`, `GET /api/metadata/predownloaded` | `{"experiments": [...]}`: job downloading each sheet once (`download_metadata_batch.py`, run with the downloader env's python) and keeping every experiment's CSV in memory; previews then use it (`"fresh": true` in the preview downloads again). Result / GET: per experiment `status` (same, minor, filled, changes, error, failed), `key_changes`, `key_filled`, `errors`. Button: "Predownload sheet metadata" above the experiments table, which shows a Sheet column |
 | `POST /api/metadata/apply` | `{"experiment", "job_id", "force"}`: writes that preview to `METADATA.ethoscope_metadata` (and `metadata.csv` if present), old values backed up in `<experiment>/metadata_backups/`; failed checks need `force`; each preview can be written once. Dialog: `MetadataUpdate.js`, opened from the Overview tab |
 | `GET /api/jobs/<id>`, `/api/jobs/<id>/download` | Progress of a background job (one item per video, progress 0–1); its result file, downloadable once |
+| `GET /api/cvat[?refresh=1]` | `configured`, `base_url` (for the browser), `projects` (`id`, `name`, `tasks`), `frames` (frames selected for CVAT validation → `[task, job, task frame]`). Buttons: "CVAT project" / "Frame in CVAT" in the Group viewer (`CvatLinks.js`) |
 
 ### Frontend (`idtrackerai-validator-client/src/`)
 
@@ -117,6 +121,7 @@ Tables accessed (with or without `_VAL` suffix based on validation status):
 - **App bar** (`App.js`): `VersionTag` (server commit, `*` = uncommitted changes) and `Logos`, two images loaded from `public/logos/logo1.png` and `logo2.png` (hidden while missing; see `LOGOS`).
 - **`layout.js`**: hooks `useFillHeight` (height down to the console), `useElementSize` (ResizeObserver), `useStoredNumber` (localStorage-backed number).
 - **`Splitter.js`**: Drag handle used to resize panels (frame | side panel, console).
+- **`CvatLinks.js`**: Group viewer Navigation card: "CVAT project" (opens `/projects/<id>`) and "Frame in CVAT" (opens `/tasks/<t>/jobs/<j>?frame=<f>`, grayed out unless the displayed frame is one of the CVAT-selected frames, looked up client side in the `/api/cvat` index fetched once per experiment).
 - **`buttons.js`**: Navigation buttons (prev/next by 1, 10, 30, chunk; prev/next error/ok/AI/rejection; play/pause).
 - **`slider.js`**: Scrubber bar for frame navigation.
 - **`EthogramViewer.js`**: "Ethograms" tab (Ctrl+3), lazy-loaded because it bundles plotly. One fly at a time via dropdown / ◀ ▶ / ↑↓; ←/→ pan; syncs with the HLS movie; "Open frame in viewer" jumps the idtrackerai tab to the cursor frame. Its `request` prop ({fly, frameNumber}) opens a fly at a frame: used by the blobs table "etho" button.
