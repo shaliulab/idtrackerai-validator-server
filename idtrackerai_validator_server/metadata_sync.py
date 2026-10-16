@@ -11,6 +11,14 @@ POST /api/metadata/preview {"experiment"}
     matching the experiment path, identities present and unique, genotype filled in,
     and the light cycle encoding (overview.merge_light_cycle).
 
+POST /api/metadata/predownload {"experiments"}
+    Job downloading the metadata of many experiments at once (each sheet once, see
+    download_metadata_batch.py) and keeping it in memory: the preview of those then
+    uses it instead of downloading (`"fresh": true` downloads again). Its result, and
+    GET /api/metadata/predownloaded, give per experiment a status for the table:
+    same / minor (only non-key columns change) / filled (key values only fill empty
+    cells) / changes / error (a failed check) / failed (download).
+
 POST /api/metadata/apply {"experiment", "job_id", "force"}
     Writes the previewed CSV to METADATA.ethoscope_metadata. Refused when a check
     failed unless force. The old value is first saved to
@@ -23,10 +31,12 @@ shows without restarting the server.
 """
 import io
 import os
+import json
 import time
 import sqlite3
 import logging
 import tempfile
+import threading
 import subprocess
 
 import pandas as pd
@@ -42,6 +52,15 @@ DOWNLOADER = os.environ.get(
     "/home/vibflysleep/mambaforge/envs/rapids-23.04/bin/download_flyhostel_metadata",
 )
 DOWNLOAD_TIMEOUT = 300          # s; an expired Google token would otherwise wait for a browser login
+# Batch download (download_metadata_batch.py) with the Python of the downloader's environment.
+BATCH_PYTHON = os.path.join(os.path.dirname(DOWNLOADER), "python")
+BATCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_metadata_batch.py")
+BATCH_MARKER = "@@PROGRESS "
+BATCH_TIMEOUT = 3600
+# experiment -> {"csv", "downloaded_at", "status", ...}: the last download of its metadata,
+# used by the preview instead of downloading again. In memory: lost on restart.
+_predownloaded = {}
+_predownload_lock = threading.Lock()
 # Shown first in the preview, when present.
 KEY_COLUMNS = ["flyhostel_number", "flyhostel_date", "flyhostel_time", "number_of_animals",
                "identity", "wing", "genotype", "sex", "light_cycle"]
@@ -153,54 +172,167 @@ def _pair(new_rows, old_rows):
     return [old_rows[i] if i < len(old_rows) else None for i in range(len(new_rows))]
 
 
-def preview(experiment, job):
+def _download(experiment, workdir):
+    """CSV text written by download_flyhostel_metadata for one experiment ("" if none)."""
     info = _parse(experiment)
-    folder, dbfile = _paths(experiment)
-    if not os.path.exists(dbfile):
-        raise FileNotFoundError(f"{dbfile} does not exist")
     if not os.path.exists(DOWNLOADER):
         raise FileNotFoundError(f"{DOWNLOADER} not found (set DOWNLOAD_FLYHOSTEL_METADATA)")
-
-    job.update(0, status="running", progress=0.1)
-    job.workdir = tempfile.mkdtemp(prefix="metadata_")
-    output = os.path.join(job.workdir, "metadata.csv")
+    output = os.path.join(workdir, "metadata.csv")
     cmd = [DOWNLOADER, "--metadata", output, "--flyhostel-id", str(info["hostel"]),
            "--date-time", f"{info['date']}_{info['time']}", "--number-of-animals", str(info["animals"])]
     try:
-        result = subprocess.run(cmd, cwd=job.workdir, stdin=subprocess.DEVNULL, capture_output=True,
+        result = subprocess.run(cmd, cwd=workdir, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=DOWNLOAD_TIMEOUT)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"download_flyhostel_metadata took more than {DOWNLOAD_TIMEOUT} s "
                            "(is the Google token in ~/.config/googleapi still valid?)")
     if result.returncode != 0:
         raise RuntimeError(f"download_flyhostel_metadata failed: {(result.stderr or result.stdout).strip()[-1000:]}")
-    job.update(0, progress=0.8)
+    return open(output, encoding="utf8").read() if os.path.exists(output) else ""
 
-    csv_text = open(output, encoding="utf8").read() if os.path.exists(output) else ""
+
+def compare(experiment, csv_text):
+    """The preview of writing `csv_text`: new rows next to the database's, changes, checks."""
+    _, dbfile = _paths(experiment)
     new_rows, columns = _rows(csv_text)
     old_csv = _read_current(dbfile)
     old_rows, old_columns = _rows(old_csv)
     previous = _pair(new_rows, old_rows)
-
     changed = [c for c in dict.fromkeys(columns + old_columns)
                if len(new_rows) != len(old_rows)
                or any((r.get(c) if r else None) != (p.get(c) if p else None) for r, p in zip(new_rows, previous))]
-    key = [c for c in KEY_COLUMNS if c in columns or c in old_columns]
-    job.pending = {"experiment": experiment, "csv": csv_text}
-    job.result = {
+    return {
         "experiment": experiment,
         "rows": new_rows,
         "previous": previous,
         "n_previous": len(old_rows),
         "columns": columns,
-        "key_columns": key,
+        "key_columns": [c for c in KEY_COLUMNS if c in columns or c in old_columns],
         "changed_columns": changed,
         "unchanged": csv_text.strip() == old_csv.strip(),
         "checks": check_metadata(experiment, new_rows, columns),
     }
+
+
+def _status(result, downloaded_at):
+    """What the experiments table shows about a downloaded CSV. "changes": rows added or
+    removed, or a key value changes or disappears; "filled": key values only appear where
+    the database had none (e.g. light_cycle, added to the sheets after most databases
+    were made); "minor": only other columns change."""
+    levels = [c["level"] for c in result["checks"]]
+    rows_change = len(result["rows"]) != result["n_previous"]
+    # key column -> "changed" (a value differs or is gone) or "filled" (only empty cells get a value)
+    key_changes = {}
+    for row, old in zip(result["rows"], result["previous"]):
+        for column in KEY_COLUMNS:
+            new_value, old_value = row.get(column), (old or {}).get(column)
+            if new_value != old_value:
+                kind = "filled" if old is not None and old_value is None else "changed"
+                if key_changes.get(column) != "changed":
+                    key_changes[column] = kind
+    if "error" in levels:
+        status = "error"
+    elif result["unchanged"] or not result["changed_columns"]:
+        status = "same"
+    elif rows_change or "changed" in key_changes.values():
+        status = "changes"
+    else:
+        status = "filled" if key_changes else "minor"
+    return {
+        "downloaded_at": downloaded_at,
+        "status": status,
+        "key_changes": [c for c, kind in key_changes.items() if kind == "changed"] + (["rows"] if rows_change else []),
+        "key_filled": [c for c, kind in key_changes.items() if kind == "filled"],
+        "errors": [c["text"] for c in result["checks"] if c["level"] == "error"],
+        "warnings": levels.count("warning"),
+        "changed_columns": result["changed_columns"],
+    }
+
+
+def preview(experiment, job, fresh=False):
+    """Preview from the predownloaded CSV, or downloaded now when there is none or `fresh`."""
+    _, dbfile = _paths(experiment)
+    if not os.path.exists(dbfile):
+        raise FileNotFoundError(f"{dbfile} does not exist")
+    job.update(0, status="running", progress=0.1)
+    cached = None if fresh else _predownloaded.get(experiment)
+    if cached:
+        csv_text, downloaded_at = cached["csv"], cached["downloaded_at"]
+    else:
+        job.workdir = tempfile.mkdtemp(prefix="metadata_")
+        csv_text, downloaded_at = _download(experiment, job.workdir), time.time()
+    job.update(0, progress=0.8)
+
+    result = compare(experiment, csv_text)
+    result.update(downloaded_at=downloaded_at, predownloaded=cached is not None)
+    _predownloaded[experiment] = {"csv": csv_text, "downloaded_at": downloaded_at, **_status(result, downloaded_at)}
+    job.pending = {"experiment": experiment, "csv": csv_text}
+    job.result = result
     logger.info("New metadata of %s:\n%s", experiment,
-                pd.DataFrame(new_rows, columns=key or None).to_string() if new_rows else "(no rows)")
+                pd.DataFrame(result["rows"], columns=result["key_columns"] or None).to_string()
+                if result["rows"] else "(no rows)")
     job.update(0, status="done", progress=1.0)
+
+
+def predownload(experiments, job):
+    """Download the sheets once and keep the metadata of every experiment in _predownloaded."""
+    if not os.path.exists(BATCH_PYTHON):
+        raise FileNotFoundError(f"{BATCH_PYTHON} not found (python next to download_flyhostel_metadata)")
+    job.workdir = tempfile.mkdtemp(prefix="metadata_batch_")
+    todo = []
+    for experiment in experiments:
+        info = _parse(experiment)
+        todo.append({"experiment": experiment, "hostel": info["hostel"], "date_time": f"{info['date']}_{info['time']}"})
+
+    job.update(0, status="running", progress=0.0)
+    process = subprocess.Popen(
+        [BATCH_PYTHON, BATCH_SCRIPT], cwd=job.workdir, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    timer = threading.Timer(BATCH_TIMEOUT, process.kill)
+    timer.start()
+    failed = {}
+    try:
+        process.stdin.write(json.dumps({"outdir": job.workdir, "experiments": todo}))
+        process.stdin.close()
+        stderr = []
+        threading.Thread(target=lambda: stderr.extend(process.stderr), daemon=True).start()
+        for line in process.stdout:
+            if not line.startswith(BATCH_MARKER):
+                continue
+            step = json.loads(line[len(BATCH_MARKER):])
+            if step["error"]:
+                failed[step["experiment"]] = step["error"]
+            job.update(0, progress=step["done"] / max(1, step["total"]))
+        process.wait()
+    finally:
+        timer.cancel()
+    if process.returncode != 0:
+        raise RuntimeError(f"metadata download stopped (exit {process.returncode}): {''.join(stderr).strip()[-1000:]}")
+
+    downloaded_at = time.time()
+    summary = {}
+    for experiment in experiments:
+        if experiment in failed:
+            summary[experiment] = {"downloaded_at": downloaded_at, "status": "failed", "errors": [failed[experiment]],
+                                   "warnings": 0, "changed_columns": [], "key_changes": [], "key_filled": []}
+            continue
+        path = os.path.join(job.workdir, experiment.replace("/", "_") + ".csv")
+        csv_text = open(path, encoding="utf8").read() if os.path.exists(path) else ""
+        try:
+            status = _status(compare(experiment, csv_text), downloaded_at)
+        except Exception as error:     # e.g. a database that cannot be read
+            status = {"downloaded_at": downloaded_at, "status": "failed", "errors": [str(error)],
+                      "warnings": 0, "changed_columns": [], "key_changes": [], "key_filled": []}
+        else:
+            _predownloaded[experiment] = {"csv": csv_text, **status}
+        summary[experiment] = status
+    job.result = {"summary": summary}
+    job.update(0, status="done", progress=1.0)
+
+
+def predownloaded_status():
+    return {e: {k: v for k, v in entry.items() if k != "csv"} for e, entry in _predownloaded.items()}
 
 
 def apply(experiment, job_id, force=False):
@@ -233,6 +365,8 @@ def apply(experiment, job_id, force=False):
         replaced_csv = True
 
     job.pending = None                  # written once
+    if experiment in _predownloaded:
+        _predownloaded[experiment].update(status="same", errors=[], changed_columns=[], key_changes=[], key_filled=[])
     logger.info("ethoscope_metadata of %s updated from the sheets (backup %s)", experiment, backup)
     return {"experiment": experiment, "backup": backup, "metadata_csv": replaced_csv,
             "rows": len(job.result["rows"]), "forced": bool(errors)}
@@ -242,14 +376,47 @@ def register_metadata_sync(app):
 
     @app.route("/api/metadata/preview", methods=["POST"])
     def metadata_preview():
-        experiment = (request.get_json(silent=True) or {}).get("experiment")
+        body = request.get_json(silent=True) or {}
+        experiment, fresh = body.get("experiment"), bool(body.get("fresh"))
         try:
             _parse(experiment)
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
-        job = start_job(f"Metadata of {experiment}", ["download from the sheets"],
-                        lambda job: preview(experiment, job))
+        cached = experiment in _predownloaded and not fresh
+        job = start_job(f"Metadata of {experiment}", ["predownloaded" if cached else "download from the sheets"],
+                        lambda job: preview(experiment, job, fresh=fresh))
         return jsonify(job.to_dict())
+
+    @app.route("/api/metadata/predownload", methods=["POST"])
+    def metadata_predownload():
+        """{"experiments": [...]}: download the metadata of all of them, for instant previews."""
+        experiments = list(dict.fromkeys((request.get_json(silent=True) or {}).get("experiments") or []))
+        try:
+            for experiment in experiments:
+                _parse(experiment)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        if not experiments:
+            return jsonify({"error": "No experiment to download"}), 400
+        if not _predownload_lock.acquire(blocking=False):
+            return jsonify({"error": "The metadata is already being downloaded"}), 409
+
+        def work(job):
+            try:
+                predownload(experiments, job)
+            finally:
+                _predownload_lock.release()
+
+        try:
+            job = start_job(f"Download sheet metadata of {len(experiments)} experiments", ["sheets"], work)
+        except Exception:
+            _predownload_lock.release()
+            raise
+        return jsonify(job.to_dict())
+
+    @app.route("/api/metadata/predownloaded", methods=["GET"])
+    def metadata_predownloaded():
+        return jsonify(predownloaded_status())
 
     @app.route("/api/metadata/apply", methods=["POST"])
     def metadata_apply():
