@@ -41,6 +41,7 @@ install_requires = [
     "webcolors",
     "h5py",
     "waitress",
+    "pyyaml",
     vendored("flyhostel", HERE / "flyhostel", extras=["idtrackerai"]),
 ]
 
