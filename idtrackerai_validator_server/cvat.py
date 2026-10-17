@@ -38,7 +38,7 @@ _cache = {}     # experiment identifier -> (time, result)
 _cache_lock = Lock()
 
 
-def _configured():
+def configured():
     return all(os.environ.get(v) for v in ("CVAT_HOST", "CVAT_USERNAME", "CVAT_PASSWORD"))
 
 
@@ -46,13 +46,24 @@ def _api_base():
     return f"http://{os.environ['CVAT_HOST']}:{CVAT_PORT}/api"
 
 
-def _public_base():
+def public_base(browser_host=None):
+    """CVAT URL for a browser: CVAT_PUBLIC_URL, else CVAT_HOST
+    (replaced by browser_host, if given, when CVAT_HOST is local)."""
     if os.environ.get("CVAT_PUBLIC_URL"):
         return os.environ["CVAT_PUBLIC_URL"].rstrip("/")
     host = os.environ.get("CVAT_HOST", "localhost")
-    if host in LOCAL_HOSTS:
-        host = urlsplit(request.host_url).hostname or host
+    if host in LOCAL_HOSTS and browser_host:
+        host = browser_host
     return f"http://{host}:{CVAT_PORT}"
+
+
+def _public_base():
+    return public_base(urlsplit(request.host_url).hostname)
+
+
+def frame_url(base_url, task, job, task_frame):
+    """Link opening a frame of a task in the CVAT annotation view."""
+    return f"{base_url}/tasks/{task}/jobs/{job}?frame={task_frame}"
 
 
 def experiment_identifier(experiment):
@@ -155,7 +166,7 @@ def register_cvat(app, get_selected_experiment):
         experiment = get_selected_experiment()
         if not experiment:
             return jsonify({"error": "no experiment loaded"}), 503
-        if not _configured():
+        if not configured():
             return jsonify({"configured": False, "projects": [], "frames": {}})
 
         identifier = experiment_identifier(experiment)
