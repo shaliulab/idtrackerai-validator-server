@@ -50,6 +50,7 @@ from idtrackerai_validator_server.overview import register_overview, scan_not_an
 from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
+from idtrackerai_validator_server.data_management import register_data_management
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
 )
@@ -115,6 +116,7 @@ register_overview(app)
 register_metadata_sync(app)
 register_validation_csv(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_cvat(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+register_data_management(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
