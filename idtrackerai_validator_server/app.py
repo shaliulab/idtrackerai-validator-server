@@ -47,6 +47,7 @@ from idtrackerai_validator_server.overview import register_overview
 from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
+from idtrackerai_validator_server.blobs_collection import read_blobs, clear_cache as clear_blobs_cache
 from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
 
 # Initialize logging
@@ -343,6 +344,7 @@ def load():
         with _contours_lock:
             _contours_cache.clear()
         _sleep_cache.clear()
+        clear_blobs_cache()
         logger.info("Switched to experiment %s", SELECTED_EXPERIMENT)
 
     except Exception as error:
@@ -581,6 +583,18 @@ def project_to_absolute(pose, centroids):
     return pose_abs
 
 
+def _zt_fields(frame_time):
+    """t = seconds since ZT0 and its HH:MM:SS. frame_time is ms since the o'clock hour
+    the recording started in; offset is the seconds between ZT0 and that hour."""
+    if frame_time is None:
+        return {"t": None, "ZT": None}
+    t = frame_time / 1000 + offset
+    hours = str(int(t // 3600)).zfill(2)
+    minutes = str(int((t % 3600) // 60)).zfill(2)
+    seconds = str(int(t % 60)).zfill(2)
+    return {"t": t, "ZT": f"{hours}:{minutes}:{seconds}"}
+
+
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
     if db_manager is None:
@@ -591,18 +605,37 @@ def get_tracking(frame_number):
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables
  
+    # source=blobs: rows of idtrackerai's blobs_collection*.npy (e.g. of an ongoing run)
+    # instead of ROI_0/IDENTITY
+    source = request.args.get("source", "db")
+    blobs_info = None
+
     out = []
     number_of_animals_found = 0
     try:
         chunksize = int(float(tables["METADATA"].query.filter_by(field="chunksize").all()[0].value))
  
-        output = tables["ROI_0"].query.filter_by(frame_number=frame_number)
-        identity_table = tables["IDENTITY"].query.filter_by(frame_number=frame_number)
-         # frame_time (ms since the marked time) lives in STORE_INDEX, keyed by frame_number
-        store_row = tables["STORE_INDEX"].query.filter_by(frame_number=frame_number).first()
+        # frame_time (ms since the marked time) lives in STORE_INDEX, keyed by frame_number
+        try:
+            store_row = tables["STORE_INDEX"].query.filter_by(frame_number=frame_number).first()
+        except Exception as error:
+            app.logger.error(error)
+            store_row = None
         frame_time = store_row.frame_time if store_row is not None else None
+        zt_fields = _zt_fields(frame_time)
 
-        for row in output.all():
+        rows = []
+        if source == "blobs":
+            basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT)
+            blob_rows, blobs_info = read_blobs(basedir, frame_number, chunksize)
+            for row in blob_rows:
+                out.append({"frame_number": frame_number, **zt_fields, **row, "chunksize": chunksize})
+            number_of_animals_found = len(out)
+        else:
+            rows = tables["ROI_0"].query.filter_by(frame_number=frame_number).all()
+            identity_table = tables["IDENTITY"].query.filter_by(frame_number=frame_number).all()
+
+        for row in rows:
             identity = None
             local_identity = None
             hit = False
@@ -620,18 +653,9 @@ def get_tracking(frame_number):
             else:
                 modified = row.modified
             
-            # t = seconds since ZT0. frame_time is ms since the o'clock hour the recording
-            # started in; offset is the seconds between ZT0 and that hour.
-            t = frame_time / 1000 + offset
-            hours = str(int(t // 3600)).zfill(2)
-            minutes = str(int((t % 3600) // 60)).zfill(2)
-            seconds = str(int(t % 60)).zfill(2)
-            zt = f"{hours}:{minutes}:{seconds}"
-    
             data = {
                 "frame_number": frame_number,
-                "t": t,
-                "ZT": zt,
+                **zt_fields,
                 "x": row.x,
                 "y": row.y,
                 "in_frame_index": row.in_frame_index,
@@ -658,7 +682,7 @@ def get_tracking(frame_number):
     # ===== NEW: FETCH POSE DATA FOR EACH ANIMAL FROM H5 FILES =====
     
     pose_absolute = {}
-    include_pose = INCLUDE_POSE and request.args.get("pose", "1") != "0"
+    include_pose = INCLUDE_POSE and request.args.get("pose", "1") != "0" and source != "blobs"
     
     if include_pose:
         try:
@@ -713,6 +737,8 @@ def get_tracking(frame_number):
         "number_of_animals": number_of_animals,
         "pose": pose_absolute
     }
+    if blobs_info is not None:
+        data["blobs"] = blobs_info
 
     response=jsonify(data)
     response.headers['Content-Type'] = 'application/json; charset=utf-8'
