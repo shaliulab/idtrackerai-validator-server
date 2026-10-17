@@ -7,6 +7,7 @@ A ListOfBlobs takes seconds to unpickle, so the last few are kept in memory and
 reloaded when idtrackerai rewrites them (mtime changes).
 """
 import os
+import glob
 import logging
 from collections import OrderedDict
 from threading import Lock
@@ -37,6 +38,25 @@ def find_blobs_collection(basedir, chunk):
         if os.path.exists(path):
             return path
     return None
+
+
+def has_blobs_collections(basedir):
+    pattern = os.path.join(basedir, "idtrackerai", "session_*", "*", "blobs_collection*.npy")
+    return next(glob.iglob(pattern), None) is not None
+
+
+def session_chunks(basedir):
+    """Chunks with at least one blobs_collection file, sorted."""
+    sessions = glob.glob(os.path.join(basedir, "idtrackerai", "session_*"))
+    chunks = []
+    for session in sessions:
+        try:
+            chunk = int(os.path.basename(session).split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        if find_blobs_collection(basedir, chunk) is not None:
+            chunks.append(chunk)
+    return sorted(chunks)
 
 
 def _load(path):

@@ -288,6 +288,75 @@ def load_experiment(basedir_suffix, chunk, db_manager):
     return {"message": "success"}, cap , metadata, idtrackerai_config
 
 
+def has_database(experiment):
+    return os.path.exists(generate_database_filename(experiment))
+
+
+def load_experiment_without_database(basedir_suffix, chunk, reference_hour=None):
+    """For experiments not analyzed yet (no .db): the raw recording only.
+
+    Returns cap, (offset, chunksize, framerate), idtrackerai config (None if the
+    folder has no <date>.conf), store info {frame_min, frame_max, index_db}.
+    offset is None without reference_hour (no ZT then).
+    `chunk` is lowered to the last chunk recorded.
+    """
+    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], basedir_suffix)
+    store_path = os.path.join(basedir, "metadata.yaml")
+    if not os.path.exists(store_path):
+        raise FileNotFoundError(f"{store_path} not found: not a recording")
+
+    chunks = sorted(
+        int(os.path.splitext(os.path.basename(p))[0])
+        for p in glob.glob(os.path.join(basedir, "[0-9][0-9][0-9][0-9][0-9][0-9].*"))
+        if os.path.splitext(p)[1] in (".mp4", ".avi")
+    )
+    if not chunks:
+        raise FileNotFoundError(f"{basedir} has no video chunks")
+    if chunk not in chunks:
+        chunk = max([c for c in chunks if c <= chunk] or [chunks[0]])
+
+    # Opening a store without index.db makes imgstore write one (as for every analyzed experiment)
+    cap = VideoCapture(store_path, chunk)
+    store = cap._cap
+    chunksize = int(float(store._metadata["chunksize"]))
+    framerate = int(float(store._metadata["framerate"]))
+
+    # frame_time counts from the o'clock hour the recording started in, which is the
+    # hour in the folder name (as the date_time of analyzed experiments)
+    offset = None
+    match = re.search(r"_(\d{2})-\d{2}-\d{2}$", basedir_suffix.rstrip("/"))
+    if match and reference_hour is not None:
+        offset = int(match.group(1)) * 3600 - int(float(reference_hour) * 3600)
+
+    idtrackerai_config = None
+    conf = os.path.join(basedir, os.path.basename(basedir_suffix.rstrip("/")) + ".conf")
+    if os.path.exists(conf):
+        try:
+            with open(conf) as handle:
+                idtrackerai_config = json.load(handle)
+        except Exception as error:
+            logger.warning("Cannot read %s: %s", conf, error)
+
+    info = {
+        "frame_min": int(store.frame_min),
+        "frame_max": int(store.frame_max),
+        "index_db": store.index_db_path,
+        "chunk": chunk,
+    }
+    return cap, (offset, chunksize, framerate), idtrackerai_config, info
+
+
+def frame_time_from_index(index_db, frame_number):
+    """frame_time of imgstore's index.db (what STORE_INDEX holds in analyzed experiments)."""
+    try:
+        with sqlite3.connect(f"file:{index_db}?mode=ro", uri=True, timeout=5) as conn:
+            row = conn.execute("SELECT frame_time FROM frames WHERE frame_number = ?", (frame_number,)).fetchone()
+        return row[0] if row else None
+    except sqlite3.Error as error:
+        logger.warning("Cannot read %s: %s", index_db, error)
+        return None
+
+
 def load_experiment_metadata(table):
     out = table.query.filter_by(field="date_time")
     # imgstore frame_time counts from the o'clock hour in which the recording started,

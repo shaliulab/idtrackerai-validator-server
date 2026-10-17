@@ -38,16 +38,21 @@ from idtrackerai_validator_server.backend import (
     load_experiment,
     generate_database_filename,
     process_frame,
-    list_experiments
+    list_experiments,
+    has_database,
+    load_experiment_without_database,
+    frame_time_from_index,
 )
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.jobs import register_jobs
-from idtrackerai_validator_server.overview import register_overview
+from idtrackerai_validator_server.overview import register_overview, scan_not_analyzed, sheet_flies
 from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
-from idtrackerai_validator_server.blobs_collection import read_blobs, clear_cache as clear_blobs_cache
+from idtrackerai_validator_server.blobs_collection import (
+    read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
+)
 from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
 
 # Initialize logging
@@ -115,8 +120,9 @@ register_cvat(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 if os.path.exists(FRAMES_DIR):
     shutil.rmtree(FRAMES_DIR)
 
-# Use a placeholder URI until an experiment is loaded via POST /api/load
-if SELECTED_EXPERIMENT is not None:
+# Use a placeholder URI until an experiment is loaded via POST /api/load (and for
+# experiments without database: sqlite would create an empty one)
+if SELECTED_EXPERIMENT is not None and has_database(SELECTED_EXPERIMENT):
     database_file = generate_database_filename(SELECTED_EXPERIMENT)
     app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{database_file}"
     app.config['SQLALCHEMY_BINDS'] = {SELECTED_EXPERIMENT: f"sqlite:///{database_file}"}
@@ -134,13 +140,55 @@ CHUNKSIZE = None
 FRAMERATE = None
 IDTRACKERAI_CONFIG = None
 db_manager = None
+# Experiments without database (not analyzed yet, e.g. idtrackerai still running):
+# {frame_min, frame_max, index_db, chunk, flies (metadata sheet rows)}; None otherwise
+STORE_INFO = None
+HAS_BLOBS = False
+
+
+def _open_experiment(experiment):
+    """Open `experiment` (slash form) and set the globals. Without database, only its
+    recording (and the blobs_collections idtrackerai has written) can be shown."""
+    global SELECTED_EXPERIMENT, cap, db_manager, offset, CHUNKSIZE, FRAMERATE, IDTRACKERAI_CONFIG
+    global STORE_INFO, HAS_BLOBS
+    basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment)
+    if has_database(experiment):
+        manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=experiment, use_val=default_use_val(experiment))
+        logger.info("Validation status: %s", manager.use_val)
+        _, new_cap, experiment_metadata, config = load_experiment(experiment, first_chunk, manager)
+        if experiment_metadata is None:
+            raise RuntimeError(f"Failed to load experiment metadata for {experiment}")
+        store_info = None
+        blobs = has_blobs_collections(basedir)
+    else:
+        manager = None
+        chunks = session_chunks(basedir)
+        flies = sheet_flies(os.environ["FLYHOSTEL_VIDEOS"], experiment)
+        reference_hour = next((f["reference_hour"] for f in flies if f.get("reference_hour")), None)
+        if reference_hour is None:
+            logger.warning("No reference_hour for %s in the metadata sheets: no ZT", experiment)
+        # Start where idtrackerai started
+        chunk = first_chunk if first_chunk in chunks or not chunks else chunks[0]
+        new_cap, experiment_metadata, config, store_info = load_experiment_without_database(experiment, chunk, reference_hour)
+        store_info["flies"] = flies
+        blobs = bool(chunks)
+
+    SELECTED_EXPERIMENT = experiment
+    db_manager = manager
+    cap = new_cap
+    offset, CHUNKSIZE, FRAMERATE = experiment_metadata
+    IDTRACKERAI_CONFIG = config
+    STORE_INFO = store_info
+    HAS_BLOBS = blobs
+
+
+def _experiment_info():
+    return {"experiment": SELECTED_EXPERIMENT, "has_database": db_manager is not None, "has_blobs": HAS_BLOBS}
+
 
 if SELECTED_EXPERIMENT is not None:
-    db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=default_use_val(SELECTED_EXPERIMENT))
-    print(f"Validation status: {db_manager.use_val}")
     with app.app_context():
-        out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
-        offset, CHUNKSIZE, FRAMERATE = experiment_metadata
+        _open_experiment(SELECTED_EXPERIMENT)
 # Contours of the last frames segmented by /api/preprocess
 CONTOURS_CACHE_SIZE = 500
 _contours_cache = OrderedDict()
@@ -288,16 +336,24 @@ def _experiment_required():
 
 @app.route("/api/list", methods=["GET"])
 def list():
+    """experiments: with a database (index.txt, flat names); not_analyzed: experiments
+    of the metadata sheets whose folder has no database (as in the Overview)."""
     try:
-        return jsonify(list_experiments())
+        result = list_experiments()
     except Exception as error:
         logger.error("Error listing experiments: %s", error)
-        return jsonify({"experiments": [SELECTED_EXPERIMENT] if SELECTED_EXPERIMENT else []})
+        result = {"experiments": [SELECTED_EXPERIMENT] if SELECTED_EXPERIMENT else []}
+    try:
+        records, _ = scan_not_analyzed(os.environ["FLYHOSTEL_VIDEOS"], set())
+        result["not_analyzed"] = sorted(r["experiment"].replace("/", "_") for r in records)
+    except Exception as error:
+        logger.error("Error listing not-analyzed experiments: %s", error)
+        result["not_analyzed"] = []
+    return jsonify(result)
 
 @app.route("/api/load", methods=["POST"])
 def load():
-    global SELECTED_EXPERIMENT, cap, frame, contours, db_manager
-    global offset, CHUNKSIZE, FRAMERATE, IDTRACKERAI_CONFIG
+    global frame, contours
 
     data = request.get_json()
     if not data or "experiment" not in data:
@@ -308,37 +364,34 @@ def load():
         tokens = new_experiment.split("_")
         new_experiment = "/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
 
-    new_database_file = generate_database_filename(new_experiment)
-    if not os.path.exists(new_database_file):
-        return jsonify({"error": f"Experiment database not found: {new_database_file}"}), 404
+    if not os.path.exists(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], new_experiment, "metadata.yaml")):
+        return jsonify({"error": f"Experiment not found: {new_experiment}"}), 404
+
+    # Without database, an in-memory one: sqlite would create an empty file
+    if has_database(new_experiment):
+        uri = f"sqlite:///{generate_database_filename(new_experiment)}"
+    else:
+        uri = "sqlite:///:memory:"
 
     lock.acquire()
     try:
-        SELECTED_EXPERIMENT = new_experiment
-
         db.session.remove()
 
-        app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{new_database_file}"
-        app.config["SQLALCHEMY_BINDS"] = {new_experiment: f"sqlite:///{new_database_file}"}
+        app.config["SQLALCHEMY_DATABASE_URI"] = uri
+        app.config["SQLALCHEMY_BINDS"] = {new_experiment: uri}
 
         try:
             engines_dict = db._app_engines[app]
             for eng in engines_dict.values():
                 eng.dispose()
             engines_dict.clear()
-            new_engine = create_engine(f"sqlite:///{new_database_file}")
+            new_engine = create_engine(uri)
             engines_dict[None] = new_engine
             engines_dict[new_experiment] = new_engine
         except (AttributeError, KeyError):
             pass
 
-        db_manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=SELECTED_EXPERIMENT, use_val=default_use_val(SELECTED_EXPERIMENT))
-
-        out, cap, experiment_metadata, IDTRACKERAI_CONFIG = load_experiment(SELECTED_EXPERIMENT, first_chunk, db_manager)
-        if experiment_metadata is None:
-            return jsonify({"error": f"Failed to load experiment metadata for {new_experiment}"}), 500
-
-        offset, CHUNKSIZE, FRAMERATE = experiment_metadata
+        _open_experiment(new_experiment)
         frame = None
         contours = []
         with _contours_lock:
@@ -355,8 +408,9 @@ def load():
     finally:
         lock.release()
 
-    return jsonify({"message": "success", "experiment": SELECTED_EXPERIMENT, "first_frame": first_chunk * CHUNKSIZE,
-                    "use_val": bool(db_manager.use_val)})
+    first_frame = (STORE_INFO["chunk"] if STORE_INFO else first_chunk) * CHUNKSIZE
+    return jsonify({"message": "success", "first_frame": first_frame,
+                    "use_val": bool(db_manager is not None and db_manager.use_val), **_experiment_info()})
 
 
 def row2dict(row):
@@ -368,6 +422,8 @@ def row2dict(row):
 
 @app.route('/api/frame_range', methods=['GET'])
 def get_frame_range():
+    if STORE_INFO is not None:
+        return jsonify({"min_frame": STORE_INFO["frame_min"], "max_frame": STORE_INFO["frame_max"]})
     if db_manager is None:
         return _experiment_required()
     tables = db_manager.tables
@@ -385,6 +441,8 @@ def get_frame_range():
 
 @app.route("/api/framerate", methods=['GET'])
 def get_framerate():
+    if STORE_INFO is not None:
+        return str(FRAMERATE)
     if db_manager is None:
         return _experiment_required()
     tables = db_manager.tables
@@ -422,6 +480,18 @@ def get_version():
 
 @app.route("/api/animal_metadata", methods=['GET'])
 def get_animal_metadata():
+    if STORE_INFO is not None:
+        # Not analyzed: the metadata sheet rows
+        result = {}
+        flies = STORE_INFO["flies"]
+        for i, fly in enumerate(flies):
+            identity = fly.get("identity") if len(flies) > 1 else None
+            try:
+                key = str(int(float(identity))) if identity is not None else str(i if len(flies) == 1 else i + 1)
+            except ValueError:
+                key = str(i + 1)
+            result[key] = {k: fly[k] for k in ("sex", "genotype") if k in fly}
+        return jsonify(result)
     if db_manager is None:
         return _experiment_required()
     tables = db_manager.tables
@@ -586,7 +656,7 @@ def project_to_absolute(pose, centroids):
 def _zt_fields(frame_time):
     """t = seconds since ZT0 and its HH:MM:SS. frame_time is ms since the o'clock hour
     the recording started in; offset is the seconds between ZT0 and that hour."""
-    if frame_time is None:
+    if frame_time is None or offset is None:
         return {"t": None, "ZT": None}
     t = frame_time / 1000 + offset
     hours = str(int(t // 3600)).zfill(2)
@@ -597,14 +667,13 @@ def _zt_fields(frame_time):
 
 @app.route('/api/tracking/<int:frame_number>', methods=['GET'])
 def get_tracking(frame_number):
-    if db_manager is None:
+    if SELECTED_EXPERIMENT is None or cap is None:
         return _experiment_required()
-    
-    global SELECTED_EXPERIMENT
+
     number_of_animals = int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
-    tables = db_manager.tables
- 
+    tables = db_manager.tables if db_manager is not None else None
+
     # source=blobs: rows of idtrackerai's blobs_collection*.npy (e.g. of an ongoing run)
     # instead of ROI_0/IDENTITY
     source = request.args.get("source", "db")
@@ -613,15 +682,19 @@ def get_tracking(frame_number):
     out = []
     number_of_animals_found = 0
     try:
-        chunksize = int(float(tables["METADATA"].query.filter_by(field="chunksize").all()[0].value))
- 
-        # frame_time (ms since the marked time) lives in STORE_INDEX, keyed by frame_number
-        try:
-            store_row = tables["STORE_INDEX"].query.filter_by(frame_number=frame_number).first()
-        except Exception as error:
-            app.logger.error(error)
-            store_row = None
-        frame_time = store_row.frame_time if store_row is not None else None
+        chunksize = CHUNKSIZE
+
+        # frame_time (ms since the marked time) lives in STORE_INDEX, keyed by frame_number;
+        # without database, in imgstore's index.db
+        if tables is None:
+            frame_time = frame_time_from_index(STORE_INFO["index_db"], frame_number)
+        else:
+            try:
+                store_row = tables["STORE_INDEX"].query.filter_by(frame_number=frame_number).first()
+            except Exception as error:
+                app.logger.error(error)
+                store_row = None
+            frame_time = store_row.frame_time if store_row is not None else None
         zt_fields = _zt_fields(frame_time)
 
         rows = []
@@ -631,7 +704,7 @@ def get_tracking(frame_number):
             for row in blob_rows:
                 out.append({"frame_number": frame_number, **zt_fields, **row, "chunksize": chunksize})
             number_of_animals_found = len(out)
-        else:
+        elif tables is not None:
             rows = tables["ROI_0"].query.filter_by(frame_number=frame_number).all()
             identity_table = tables["IDENTITY"].query.filter_by(frame_number=frame_number).all()
 
@@ -682,7 +755,7 @@ def get_tracking(frame_number):
     # ===== NEW: FETCH POSE DATA FOR EACH ANIMAL FROM H5 FILES =====
     
     pose_absolute = {}
-    include_pose = INCLUDE_POSE and request.args.get("pose", "1") != "0" and source != "blobs"
+    include_pose = INCLUDE_POSE and request.args.get("pose", "1") != "0" and source != "blobs" and tables is not None
     
     if include_pose:
         try:
@@ -841,7 +914,7 @@ def get_use_val():
 
 @app.route("/api/current_experiment", methods=["GET"])
 def current_experiment():
-    return jsonify({"experiment": SELECTED_EXPERIMENT})
+    return jsonify(_experiment_info())
 
 
 @app.route("/api/use_val", methods=["POST"])
@@ -854,6 +927,8 @@ def set_use_val():
 
     if SELECTED_EXPERIMENT is None:
         return jsonify({"error": "no experiment loaded"}), 400
+    if db_manager is None:
+        return jsonify({"error": f"{SELECTED_EXPERIMENT} has no database"}), 400
 
     with lock:
         db_manager = DatabaseManager(

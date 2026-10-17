@@ -253,6 +253,19 @@ def scan_not_analyzed(root, known):
     return list(records.values()), warnings
 
 
+def sheet_flies(root, experiment):
+    """Fly rows of a not-analyzed experiment (slash form) from the metadata sheets, [] if none."""
+    try:
+        records, _ = scan_not_analyzed(root, set())
+    except Exception as error:
+        logger.warning("Could not read the metadata sheets: %s", error)
+        return []
+    for record in records:
+        if record["experiment"] == experiment:
+            return record["flies"]
+    return []
+
+
 def rebuild_index(root):
     """Rewrite index.txt; returns the number of databases listed. The old file is only
     replaced once find has produced a list."""
