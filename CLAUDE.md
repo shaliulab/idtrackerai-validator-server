@@ -67,6 +67,7 @@ The `idtrackerai` and `flyhostel` packages are external dependencies not publish
 - **`metadata_sync.py`**: `register_metadata_sync(app)`: refresh an experiment's `ethoscope_metadata` from the Google sheets in two steps (preview job with checks, then apply), and `predownload` for many experiments (`download_metadata_batch.py`, standalone, reuses googleapi's own filtering so the CSVs equal the CLI's; ~30 s for all). Runs `$DOWNLOAD_FLYHOSTEL_METADATA` (default: the `rapids-23.04` env's `download_flyhostel_metadata`, which needs a valid token in `~/.config/googleapi/`; 300 s timeout).
 - **`jobs.py`**: In-memory registry of background jobs (daemon threads) with per-item progress, polled by the frontend console. A job may carry a JSON `result` for the client. The last 50 finished jobs are kept.
 - **`cvat.py`**: `register_cvat(app, ...)` adds `/api/cvat`: CVAT projects named after the loaded experiment (`FlyHostel1_3X_<date>`, optionally with a suffix such as `_long`; exact name first) and every frame of their tasks as `frame_number -> [task, job, task frame]` (image `<experiment>_<chunk>_<frame0>_<block>.png` = frame `frame0 + block`; the exact-name project's, then the newest task wins). Cached 5 min per experiment (~5 s to build). `build_index`, `configured`, `public_base` and `frame_url` are also used outside Flask by flyhostel's `integrate-human-annotations` to print the CVAT links of frames that still have problems.
+- **`blobs_collection.py`**: `read_blobs` gives `/api/tracking?source=blobs` its rows from idtrackerai's ListOfBlobs of the frame's chunk (`<basedir>/idtrackerai/session_<chunk:06d>/`, most advanced of `tracking/blobs_collection_no_gaps.npy`, `tracking/blobs_collection.npy`, `preprocessing/blobs_collection{_interpolated,,_segmented}.npy`), one row per final centroid, identity 0 when unassigned. Unpickling takes ~4 s, so the last 3 files are cached and reloaded when their mtime changes (ongoing runs rewrite them).
 - **`utils.py`**: Loads rejection CSVs from `$FLYHOSTEL_VIDEOS/<experiment>/interactions/`, and per-fly asleep frames (`load_sleep_data`, cached in `SLEEP_CACHE`, cleared on experiment switch).
 - **`pose_reader.py`**: 
 - **`databasev1.py`**: Entirely commented out (deprecated).
@@ -85,7 +86,7 @@ Tables accessed (with or without `_VAL` suffix based on validation status):
 | Endpoint | Description |
 |---|---|
 | `GET /api/frame/<frame_number>` | JPEG of the frame (encoded in memory; requests may overlap, only `cap.get_image` holds the lock) |
-| `GET /api/tracking/<frame_number>` | Returns centroid positions, identities, ZT time |
+| `GET /api/tracking/<frame_number>[?source=blobs]` | Returns centroid positions, identities, ZT time. `source=blobs` reads them from the chunk's `blobs_collection*.npy` instead of the database (no pose) and adds `blobs` (`chunk`, `path`, `mtime` or `error`). Selector: "Tracking" in the app bar (Database / blobs_collection, reset to Database on experiment load) |
 | `GET /api/preprocess/<frame_number>` | Contours of that frame, segmented on demand and cached (only requested by the client when `PRINT_CONTOUR`) |
 | `GET /api/framerate` | Returns recording framerate |
 | `GET /api/version` | Commit of the root repository (`commit`, `date`, `dirty`), read once at server start; shown in the app bar's top right corner |
