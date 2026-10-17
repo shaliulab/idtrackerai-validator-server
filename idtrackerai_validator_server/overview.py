@@ -21,8 +21,10 @@ taken from the metadata sheets: the CSV exports in $FLYHOSTEL_METADATA of every
 sheet listed under SHEETS in the googleapi config. They come with `analyzed: False`
 and their flies from the sheet rows.
 
-POST /api/overview/reindex rewrites index.txt in a background job (jobs.py), with
-the same command as by hand: find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db
+POST /api/overview/reindex rewrites index.txt in a background job (jobs.py) with
+experiments.INDEX_COMMAND: the databases of the experiment folders, as by hand with
+find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db, and those
+of their arenas (FlyHostel<N>/<X>X/<date>/arenas/<n>/*db, multi-arena recordings).
 """
 import io
 import os
@@ -41,6 +43,8 @@ import pandas as pd
 from flask import jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
+from idtrackerai_validator_server.experiments import INDEX_COMMAND
+from flyhostel.utils.experiment import normalize_arena
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +55,7 @@ COLUMN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
 # Per-experiment, path-derived or redundant with the experiment record.
 SKIP_COLUMNS = {"Dropbox_link", "basedir", "flyhostel_number", "flyhostel_date", "flyhostel_time", "row_id"}
 PATH_RE = re.compile(r"(FlyHostel\d+)/(\d+)X/(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})")
+ARENA_RE = re.compile(r"/arenas/(\d+)$")
 
 # Where the light cycle may be written, in order of trust. Outside `light_cycle`
 # the value is taken as a whole word, so "LD+2blob" and "normal food vial DD" count.
@@ -62,7 +67,6 @@ GOOGLEAPI_CONFIG = os.path.expanduser(os.environ.get("GOOGLEAPI_CONFIG", "~/.con
 METADATA_DIR = os.environ.get("FLYHOSTEL_METADATA", "/flyhostel_data/metadata")
 # CSV export of a sheet: "ethoscope&flyhostel_metadata<version> - <sheet>.csv", latest version wins
 SHEET_FILE_RE = re.compile(r"metadata(\d+) - (.+)\.csv$")
-INDEX_COMMAND = ["find", "-L", "-maxdepth", "4", "-mindepth", "4", "-regex", ".*FlyHostel.*db", "-not", "-name", "index.db"]
 
 _cache = {}                 # db path -> (mtime, record)
 _scan_lock = threading.Lock()
@@ -145,6 +149,7 @@ def _base_record(experiment):
         "group_size": int(match.group(2)) if match else None,
         "date": match.group(3) if match else None,
         "start_time": match.group(4).replace("-", ":") if match else None,
+        "arena": int(arena.group(1)) if (arena := ARENA_RE.search(experiment)) else None,
         "has_val": False,
         "duration_h": None,
         "flies": [],
@@ -213,12 +218,30 @@ def sheet_files():
 
 
 def _has_database(folder):
-    """Same rule as the index command: a *db file in the folder other than index.db."""
-    return any(os.path.basename(p) != "index.db" for p in glob.glob(os.path.join(folder, "*db")))
+    """Same rule as the index command: a *db file in the folder (or one of its arenas) other than index.db."""
+    return any(os.path.basename(p) != "index.db"
+               for pattern in ("*db", "arenas/*/*db") for p in glob.glob(os.path.join(folder, pattern)))
+
+
+def _sheet_experiment(root, basedir, arena):
+    """Folder (relative to `root`) of a sheet row: the experiment of its basedir or, for a
+    row with an arena, that arena of the recording. The basedir of an arena row has the
+    arena's NX (FlyHostel1/1X/<date>), the folder the whole hostel's (FlyHostel1/4X/<date>/arenas/1)."""
+    match = PATH_RE.search(basedir)
+    if not match:
+        return None
+    arena = normalize_arena(arena)
+    if arena is None:
+        return match.group(0)
+    hostel, _, date, time = match.groups()
+    folders = sorted(glob.glob(os.path.join(root, hostel, "*X", f"{date}_{time}", "arenas", str(arena))))
+    if len(folders) != 1:
+        return None
+    return os.path.relpath(folders[0], root)
 
 
 def scan_not_analyzed(root, known):
-    """Experiments of the metadata sheets with a folder in `root` but no database.
+    """Experiments (or arenas) of the metadata sheets with a folder in `root` but no database.
 
     `known`: experiments already read from index.txt. An experiment in several sheets
     takes its flies from the first one (config order) and lists them all in `sheets`.
@@ -236,7 +259,9 @@ def scan_not_analyzed(root, known):
         if "basedir" not in df.columns:
             warnings.append(f"{os.path.basename(path)} has no basedir column")
             continue
-        experiments = df["basedir"].fillna("").map(lambda b: (m := PATH_RE.search(b)) and m.group(0))
+        arenas = df["arena"] if "arena" in df.columns else pd.Series(None, index=df.index)
+        keys = {key: _sheet_experiment(root, *key) for key in set(zip(df["basedir"].fillna(""), arenas))}
+        experiments = pd.Series([keys[key] for key in zip(df["basedir"].fillna(""), arenas)], index=df.index)
         for experiment, rows in df.groupby(experiments, sort=False):
             if not experiment or experiment in known:
                 continue

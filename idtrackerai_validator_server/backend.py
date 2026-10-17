@@ -19,6 +19,8 @@ from imgstore.interface import VideoCapture
 from idtrackerai.utils.py_utils import get_spaced_colors_util
 from idtrackerai.animals_detection.segmentation import _process_frame
 
+from idtrackerai_validator_server.experiments import to_flat, to_relpath, experiment_folder
+
 logger=logging.getLogger(__name__)
 
 RED=webcolors.name_to_rgb("red")[::-1]
@@ -205,7 +207,8 @@ def update_experiments(root=None, output="index.txt"):
     root = Path(root or os.environ["FLYHOSTEL_VIDEOS"])
 
     entries = []
-    for path in root.glob("*/*/*/*"):          # exactly 4 levels: -mindepth 4 -maxdepth 4
+    # experiment folders (4 levels) and their arenas (FlyHostel<N>/<X>X/<date>/arenas/<n>/)
+    for path in [*root.glob("*/*/*/*"), *root.glob("*/*/*/arenas/*/*")]:
         rel = path.relative_to(root).as_posix()
         if path.name == "index.db":            # -not -name index.db
             continue
@@ -218,7 +221,7 @@ def update_experiments(root=None, output="index.txt"):
 
 def list_experiments():
     # cd $FLYHOSTEL_VIDEOS
-    # find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db > index.txt
+    # experiments.INDEX_COMMAND > index.txt (Overview tab: "Rebuild index")
     # update_experiments
     index=pd.read_csv(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), header=None)
     dbfiles=index[0]
@@ -228,13 +231,13 @@ def list_experiments():
 
 def generate_database_filename(experiment):
     sqlite_file=os.path.join(
-        os.environ["FLYHOSTEL_VIDEOS"], experiment, experiment.replace("/", "_") + ".db"
+        os.environ["FLYHOSTEL_VIDEOS"], to_relpath(experiment), to_flat(experiment) + ".db"
     )
     return sqlite_file
 
 
 def load_idtrackerai_config(basedir):
-    dbfile = os.path.join(basedir, "_".join(basedir.split(os.path.sep)[-3:]) + ".db")
+    dbfile = os.path.join(basedir, to_flat(basedir) + ".db")
     with sqlite3.connect(dbfile) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM METADATA WHERE field = 'idtrackerai_conf';")
@@ -324,12 +327,13 @@ def load_experiment_without_database(basedir_suffix, chunk, reference_hour=None)
     # frame_time counts from the o'clock hour the recording started in, which is the
     # hour in the folder name (as the date_time of analyzed experiments)
     offset = None
-    match = re.search(r"_(\d{2})-\d{2}-\d{2}$", basedir_suffix.rstrip("/"))
+    date_time = os.path.basename(experiment_folder(basedir_suffix))
+    match = re.search(r"_(\d{2})-\d{2}-\d{2}$", date_time)
     if match and reference_hour is not None:
         offset = int(match.group(1)) * 3600 - int(float(reference_hour) * 3600)
 
     idtrackerai_config = None
-    conf = os.path.join(basedir, os.path.basename(basedir_suffix.rstrip("/")) + ".conf")
+    conf = os.path.join(basedir, date_time + ".conf")
     if os.path.exists(conf):
         try:
             with open(conf) as handle:

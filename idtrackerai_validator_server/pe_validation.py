@@ -21,6 +21,8 @@ import datetime
 import pandas as pd
 from flask import jsonify, request, send_from_directory
 
+from idtrackerai_validator_server.experiments import to_flat, to_relpath
+
 from flyhostel.utils import (
     get_basedir,
     get_chunksize,
@@ -67,7 +69,7 @@ def _load_traces_cached(traces_file, fly):
 def _media_dir(experiment):
     # parent of both plots/ and videos/, so a request for "videos/xxx.mp4" or
     # "plots/xxx.png" resolves as a subpath. send_from_directory blocks ../ escapes.
-    return os.path.join(get_basedir(experiment.replace("/", "_")),
+    return os.path.join(get_basedir(to_flat(experiment)),
                         "flyhostel", "proboscis_extensions")
 
 
@@ -122,11 +124,11 @@ _HUMAN_TABLES = {
 
 def _slash_experiment(experiment):
     # "FlyHostel4_2X_2025-06-28_16-00-00" or the slash form -> "FlyHostel4/2X/2025-06-28_16-00-00"
-    return experiment if "/" in experiment else experiment.replace("_", "/", 2)
+    return to_relpath(experiment)
 
 
 def _human_where_args(table, experiment):
-    flat = experiment.replace("/", "_")
+    flat = to_flat(experiment)
     if table == "pe_annotations":
         return (_slash_experiment(experiment), flat)
     prefix = f"{flat}__"
@@ -140,7 +142,7 @@ def _deleted_backup_dir():
 def _fly_id(experiment, identity):
     # experiment global is stored as "FlyHostel4/2X/2025-02-04"; the feather/media use
     # the flat "FlyHostel4_2X_2025-02-04__01" form.
-    flat = experiment.replace("/", "_")
+    flat = to_flat(experiment)
     return f"{flat}__{str(int(identity)).zfill(2)}"
 
 
@@ -172,7 +174,7 @@ def register_pe_validation(app, get_selected_experiment):
         basedir=get_basedir(experiment)
         pe_bouts_dir=f"{basedir}/flyhostel/proboscis_extensions/pe_bouts"
 
-        chunksize=get_chunksize(exp.replace("/", "_"))
+        chunksize=get_chunksize(to_flat(exp))
         feather = os.path.join(pe_bouts_dir, f"{fly}_pe_bouts.feather")
         if not os.path.exists(feather):
             return jsonify({"error": f"no bouts feather for {fly}"}), 404
@@ -338,7 +340,7 @@ def register_pe_validation(app, get_selected_experiment):
         experiment, identity = fly.split("__")
         identity = int(identity)
 
-        fps = get_framerate(exp.replace("/", "_"))
+        fps = get_framerate(to_flat(exp))
 
         traces_file = os.path.join(_media_dir(exp), f"{fly}_traces.feather")   # the extract_burst_traces output
         if not os.path.exists(traces_file):
@@ -400,7 +402,7 @@ def register_pe_validation(app, get_selected_experiment):
         if win is None:
             return jsonify({"auto": [], "gt": [], "done": False, "params": None})
         f0, f1 = win
-        fps = get_framerate(exp.replace("/", "_"))
+        fps = get_framerate(to_flat(exp))
         t = lambda f: round((f - f0) / fps, 4)
         with sqlite3.connect(RESEG_DB) as c:
             auto = c.execute("SELECT start_frame, end_frame FROM auto_segments "
@@ -455,7 +457,7 @@ def register_pe_validation(app, get_selected_experiment):
 
     def _flat_to_slash(exp_flat):
         # "FlyHostel4_2X_2025-06-28_16-00-00" -> "FlyHostel4/2X/2025-06-28_16-00-00"
-        return exp_flat.replace("_", "/", 2)
+        return to_relpath(exp_flat)
 
     @app.route("/api/pe/audit", methods=["GET"])
     def pe_audit():

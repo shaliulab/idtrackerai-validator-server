@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 import requests
 from flask import jsonify, request
 
+from idtrackerai_validator_server.experiments import to_flat
+
 logger = logging.getLogger(__name__)
 
 CVAT_PORT = 8080
@@ -67,8 +69,9 @@ def frame_url(base_url, task, job, task_frame):
 
 
 def experiment_identifier(experiment):
-    """FlyHostel1/3X/2026-09-22_14-00-00 -> FlyHostel1_3X_2026-09-22_14-00-00"""
-    return experiment.strip("/").replace("/", "_")
+    """FlyHostel1/3X/2026-09-22_14-00-00 -> FlyHostel1_3X_2026-09-22_14-00-00
+    (FlyHostel1/4X/<date>/arenas/1 -> FlyHostel1_4X_<date>_arena1)"""
+    return to_flat(experiment)
 
 
 def frame_number_of(image_name):

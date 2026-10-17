@@ -49,6 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
+from idtrackerai_validator_server.experiments import experiment_folder
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +319,12 @@ def _remove_from_index(root, experiment):
     path = os.path.join(root, "index.txt")
     with open(path) as handle:
         lines = handle.read().splitlines()
-    kept = [line for line in lines if os.path.normpath(line).split(os.sep)[-4:-1] != experiment.split("/")]
+    def of_experiment(line):
+        # <experiment>/*.db, and the databases of its arenas (<experiment>/arenas/<n>/*.db)
+        parts = os.path.normpath(line).split(os.sep)
+        return parts[-4:-1] == experiment.split("/") or (
+            len(parts) >= 6 and parts[-3] == "arenas" and parts[-6:-3] == experiment.split("/"))
+    kept = [line for line in lines if not of_experiment(line)]
     if len(kept) != len(lines):
         tmp = path + ".tmp"
         with open(tmp, "w") as handle:
@@ -364,7 +370,8 @@ def register_data_management(app, get_selected_experiment):
             "disks": disks(root),
             "backup_root": BACKUP_ROOT,
             "backup_chunks": BACKUP_CHUNKS,
-            "loaded": get_selected_experiment(),
+            # its experiment folder when an arena is loaded
+            "loaded": experiment_folder(get_selected_experiment()) if get_selected_experiment() else None,
             "scanning": _scan_lock.locked(),
         })
 
@@ -427,7 +434,7 @@ def register_data_management(app, get_selected_experiment):
         if body.get("confirm") != experiment:
             return jsonify({"error": "Type the experiment name to confirm"}), 400
         loaded = get_selected_experiment()
-        if loaded and flat_name(loaded) == flat_name(experiment):
+        if loaded and experiment_folder(loaded) == experiment:
             return jsonify({"error": f"{experiment} is loaded in the viewer: load another experiment first"}), 409
         if experiment in _deleting:
             return jsonify({"error": f"{experiment} is already being deleted"}), 409

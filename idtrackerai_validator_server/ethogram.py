@@ -12,6 +12,9 @@ under the experiment tree:
 The x axis of the figure is seconds since the start of the movie, which itself
 starts at the first chunk present in the feather file.
 
+A fly with the feather but no JSON gets its figure drawn on first request (first 24 h,
+as behavior-viewer intended), written next to the feather.
+
 Time conventions (same as flyhostel's sleep tables and the ethogram's ZT ticks):
     frame_number   frames since the beginning of the recording (chunk 0)
     zt             seconds since ZT0 of the first day of recording
@@ -29,6 +32,7 @@ import re
 import sqlite3
 import logging
 import tempfile
+import threading
 import zipfile
 from contextlib import closing
 from functools import lru_cache
@@ -56,6 +60,7 @@ from flyhostel.data.pose.loaders.sleep_videos import (
 )
 
 from idtrackerai_validator_server.jobs import start_job
+from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.utils import sleep_bouts as _sleep_bouts, find_sleep_bout as _find_sleep_bout
 
 logger = logging.getLogger(__name__)
@@ -63,7 +68,11 @@ logger = logging.getLogger(__name__)
 # <fly>_sleep_bout_t0-XXXX_t1-YYYY.mp4 (see flyhostel's bout_video_name), t0 / t1 in s since ZT0
 SAVED_VIDEO_PATTERN = re.compile(r"^(?P<fly>.+)_sleep_bout_t0-(?P<t0>-?\d+)_t1-(?P<t1>-?\d+)\.mp4$")
 
-FLY_PATTERN = re.compile(r"^FlyHostel\d+_\d+X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}__\d{2}$")
+FLY_PATTERN = re.compile(r"^FlyHostel\d+_\d+X_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(_arena\d+)?__\d{2}$")
+# hours of the feather drawn when the figure has to be made here
+FIGURE_HOURS = 24
+_figure_locks = {}
+_figure_locks_lock = threading.Lock()
 
 
 
@@ -74,6 +83,37 @@ def _fly_dir(fly):
 
 def _figure_path(fly):
     return os.path.join(_fly_dir(fly), f"{fly}.json")
+
+
+def _feather_path(fly):
+    return os.path.join(_fly_dir(fly), f"{fly}.feather")
+
+
+def _ensure_figure(fly):
+    """Path of the fly's figure JSON, drawn from its feather first if missing."""
+    path = _figure_path(fly)
+    if os.path.exists(path):
+        return path
+    with _figure_locks_lock:
+        lock = _figure_locks.setdefault(fly, threading.Lock())
+    with lock:
+        if os.path.exists(path):
+            return path
+        feather = _feather_path(fly)
+        if not os.path.exists(feather):
+            raise FileNotFoundError(f"ethogram not found: {path} (and no {os.path.basename(feather)} to draw it)")
+        from flyhostel.data.pose.ethogram.plot import draw_ethogram   # plotly, sklearn: only when needed
+        props = _properties(fly)
+        df = pd.read_feather(feather)
+        # x = seconds since the start of the movie, as the movie and the pre-rendered figures
+        t0 = props["first_chunk"] * props["chunksize"]
+        df = df.loc[df["frame_number"] < df["frame_number"].iloc[0] + FIGURE_HOURS * 3600 * props["framerate"]]
+        logger.info("Drawing the ethogram of %s from %s", fly, feather)
+        fig = draw_ethogram(df, props["chunksize"], props["framerate"], x_var="seconds", t0=t0)
+        tmp = path + ".tmp"
+        fig.write_json(tmp)
+        os.replace(tmp, path)
+    return path
 
 
 def _saved_videos_dir(fly):
@@ -241,10 +281,11 @@ def register_ethogram(app, get_selected_experiment):
         exp = get_selected_experiment()
         if not exp:
             return jsonify([])
-        experiment = exp.replace("/", "_")
+        experiment = to_flat(exp)
         flies = [f"{experiment}__{str(identity).zfill(2)}" for identity in get_identities(experiment)]
         return jsonify([
-            {"fly": fly, "available": os.path.exists(_figure_path(fly))}
+            {"fly": fly, "available": os.path.exists(_figure_path(fly)) or os.path.exists(_feather_path(fly)),
+             "drawn": os.path.exists(_figure_path(fly))}
             for fly in flies
         ])
 
@@ -253,9 +294,13 @@ def register_ethogram(app, get_selected_experiment):
         err = _check_fly(fly)
         if err:
             return err
-        path = _figure_path(fly)
-        if not os.path.exists(path):
-            return jsonify({"error": f"ethogram not found: {path}"}), 404
+        try:
+            path = _ensure_figure(fly)
+        except FileNotFoundError as error:
+            return jsonify({"error": str(error)}), 404
+        except Exception as error:
+            logger.exception("Could not draw the ethogram of %s", fly)
+            return jsonify({"error": f"could not draw the ethogram: {error}"}), 500
         return send_from_directory(os.path.dirname(path), os.path.basename(path), mimetype="application/json")
 
     @app.route("/api/ethogram/<fly>/properties", methods=["GET"])

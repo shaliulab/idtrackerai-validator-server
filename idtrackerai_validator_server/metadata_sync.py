@@ -5,7 +5,8 @@ Two steps, so nothing is written before it has been looked at:
 
 POST /api/metadata/preview {"experiment"}
     Job running `download_flyhostel_metadata` (googleapi, from flyhostel) for the
-    experiment's FlyHostel number and date. Its result is the new metadata (every row,
+    experiment's FlyHostel number and date (and `--arena` for an arena of a
+    multi-arena recording, FlyHostel<N>/<X>X/<date>/arenas/<n>). Its result is the new metadata (every row,
     with the row now in the database for the same identity), the columns that change,
     and checks: one row per animal, flyhostel_number / flyhostel_date / flyhostel_time
     matching the experiment path, identities present and unique, genotype filled in,
@@ -30,6 +31,7 @@ The database is read again on every request (tracking, overview), so the change
 shows without restarting the server.
 """
 import io
+import re
 import os
 import json
 import time
@@ -41,8 +43,10 @@ import subprocess
 
 import pandas as pd
 from flask import jsonify, request
+from flyhostel.utils import get_number_of_animals
 
 from idtrackerai_validator_server.jobs import start_job, _jobs
+from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.overview import PATH_RE, _clean, _fly_rows, merge_light_cycle
 
 logger = logging.getLogger(__name__)
@@ -62,25 +66,39 @@ BATCH_TIMEOUT = 3600
 _predownloaded = {}
 _predownload_lock = threading.Lock()
 # Shown first in the preview, when present.
+ARENA_PATH_RE = re.compile(PATH_RE.pattern + r"(?:/arenas/(\d+))?")
 KEY_COLUMNS = ["flyhostel_number", "flyhostel_date", "flyhostel_time", "number_of_animals",
                "identity", "wing", "genotype", "sex", "light_cycle"]
 
 
 def _parse(experiment):
-    match = PATH_RE.fullmatch(experiment or "")
+    """Fields of an experiment folder, FlyHostel<N>/<X>X/<date> or an arena of one
+    (FlyHostel<N>/<X>X/<date>/arenas/<n>, the sheet rows of that arena)."""
+    match = ARENA_PATH_RE.fullmatch(experiment or "")
     if not match:
         raise ValueError(f"Not an experiment path: {experiment!r}")
+    arena = int(match.group(5)) if match.group(5) else None
+    animals = int(match.group(2))
+    if arena is not None:
+        # the NX of the folder counts the whole hostel; the arena's are in its idtrackerai
+        # conf or database (None when it has neither yet)
+        try:
+            animals = int(get_number_of_animals(to_flat(experiment)))
+        except Exception as error:
+            logger.warning("Number of animals of %s unknown: %s", experiment, error)
+            animals = None
     return {
         "hostel": int(match.group(1)[len("FlyHostel"):]),
-        "animals": int(match.group(2)),
+        "animals": animals,
         "date": match.group(3),
         "time": match.group(4),
+        "arena": arena,
     }
 
 
 def _paths(experiment):
     folder = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment)
-    return folder, os.path.join(folder, experiment.replace("/", "_") + ".db")
+    return folder, os.path.join(folder, to_flat(experiment) + ".db")
 
 
 def _read_current(dbfile):
@@ -106,10 +124,14 @@ def check_metadata(experiment, rows, columns):
     add = lambda level, text: checks.append({"level": level, "text": text})
 
     n = len(rows)
-    add("ok" if n == info["animals"] else "error",
-        f"{n} row{'s' if n != 1 else ''} for {info['animals']} animal{'s' if info['animals'] != 1 else ''} ({info['animals']}X)")
+    if info["animals"] is None:
+        add("warning", f"{n} row{'s' if n != 1 else ''}, number of animals of the arena unknown")
+    else:
+        add("ok" if n == info["animals"] else "error",
+            f"{n} row{'s' if n != 1 else ''} for {info['animals']} animal{'s' if info['animals'] != 1 else ''} ({info['animals']}X)")
     if n == 0:
-        add("error", "no row of the sheets has this flyhostel_number and flyhostel_date")
+        add("error", "no row of the sheets has this flyhostel_number and flyhostel_date"
+            + (f" (and arena {info['arena']})" if info["arena"] is not None else ""))
         return checks
 
     def column_check(column, expected, level, label):
@@ -126,7 +148,10 @@ def check_metadata(experiment, rows, columns):
     column_check("flyhostel_number", str(info["hostel"]), "error", "flyhostel_number")
     column_check("flyhostel_date", info["date"], "error", "flyhostel_date")
     column_check("flyhostel_time", info["time"], "warning", "flyhostel_time")
-    column_check("number_of_animals", str(info["animals"]), "warning", "number_of_animals")
+    if info["animals"] is not None:
+        column_check("number_of_animals", str(info["animals"]), "warning", "number_of_animals")
+    if info["arena"] is not None:
+        column_check("arena", str(info["arena"]), "error", "arena")
 
     if "identity" not in columns:
         add("error" if info["animals"] > 1 else "warning", "no identity column")
@@ -179,7 +204,11 @@ def _download(experiment, workdir):
         raise FileNotFoundError(f"{DOWNLOADER} not found (set DOWNLOAD_FLYHOSTEL_METADATA)")
     output = os.path.join(workdir, "metadata.csv")
     cmd = [DOWNLOADER, "--metadata", output, "--flyhostel-id", str(info["hostel"]),
-           "--date-time", f"{info['date']}_{info['time']}", "--number-of-animals", str(info["animals"])]
+           "--date-time", f"{info['date']}_{info['time']}"]
+    if info["animals"] is not None:
+        cmd += ["--number-of-animals", str(info["animals"])]
+    if info["arena"] is not None:
+        cmd += ["--arena", str(info["arena"])]
     try:
         result = subprocess.run(cmd, cwd=workdir, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=DOWNLOAD_TIMEOUT)
@@ -282,7 +311,8 @@ def predownload(experiments, job):
     todo = []
     for experiment in experiments:
         info = _parse(experiment)
-        todo.append({"experiment": experiment, "hostel": info["hostel"], "date_time": f"{info['date']}_{info['time']}"})
+        todo.append({"experiment": experiment, "hostel": info["hostel"], "date_time": f"{info['date']}_{info['time']}",
+                     "arena": info["arena"]})
 
     job.update(0, status="running", progress=0.0)
     process = subprocess.Popen(

@@ -9,7 +9,8 @@ download_flyhostel_metadata downloads every sheet for each experiment (~10 s). H
 each sheet is downloaded once and then filtered per experiment with googleapi's own
 functions, so every CSV is what download_flyhostel_metadata would have written.
 
-stdin: {"outdir": ..., "experiments": [{"experiment", "hostel", "date_time"}]}
+stdin: {"outdir": ..., "experiments": [{"experiment", "hostel", "date_time", "arena"}]}
+("arena": rows of that arena only, as download_flyhostel_metadata --arena; null for all)
 Writes <outdir>/<experiment with _ for />.csv (none when nothing matched, as the
 original for old v1/v2 sheets) and prints one line per experiment:
 @@PROGRESS {"done", "total", "experiment", "error"}
@@ -44,19 +45,21 @@ def main():
     for i, experiment in enumerate(experiments):
         output = os.path.join(outdir, experiment["experiment"].replace("/", "_") + ".csv")
         date = experiment["date_time"][:10]
+        arena = experiment.get("arena")
         error = None
         try:
             spreadsheet_id, version = choose_flyhostel_metadata_sheet(date)
             if version in ["v1", "v2"]:
                 data = sheet(spreadsheet_id, date)
                 if data is not None:
-                    save_flyhostel_metadata(data.copy(), flyhostel_number=experiment["hostel"], date=date, output=output)
+                    save_flyhostel_metadata(data.copy(), flyhostel_number=experiment["hostel"], date=date, output=output,
+                                            arena=arena)
             else:
                 parts = []
                 for title in SHEETS:
                     data = sheet(spreadsheet_id, title)
                     parts.append(None if data is None else save_flyhostel_metadata_v3(
-                        data.copy(), flyhostel_number=experiment["hostel"], date=date, output=junk))
+                        data.copy(), flyhostel_number=experiment["hostel"], date=date, output=junk, arena=arena))
                 pd.concat(parts, axis=0).to_csv(output)
         except Exception as exc:     # one bad experiment (or sheet row) must not stop the others
             error = f"{type(exc).__name__}: {exc}"

@@ -27,13 +27,14 @@ from flyhostel.utils import (
     get_square_width,
     get_square_height,    
 )
-from flyhostel.utils.pose_export import recreate_pose_file
+from flyhostel.utils.pose_export import recreate_pose_file, get_pose_file_path
 
 
 from idtrackerai_validator_server.constants import (
     WITH_FRAGMENTS, first_chunk, FRAMES_DIR, INCLUDE_POSE
 )
 from idtrackerai_validator_server.database import DatabaseManager
+from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.backend import (
     load_experiment,
     generate_database_filename,
@@ -63,15 +64,9 @@ logging.getLogger("idtrackerai_validator_server.backend").setLevel(logging.DEBUG
 logging.getLogger("imgstore").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers").setLevel(logging.WARNING)
 
+# Folder relative to $FLYHOSTEL_VIDEOS (FlyHostel1/4X/<date>/arenas/1 for an arena)
 SELECTED_EXPERIMENT_ = os.environ.get("VALIDATOR_EXPERIMENT", None)
-if SELECTED_EXPERIMENT_ is not None:
-    if "/" not in SELECTED_EXPERIMENT_:
-        tokens = SELECTED_EXPERIMENT_.split("_")
-        SELECTED_EXPERIMENT = "/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
-    else:
-        SELECTED_EXPERIMENT = SELECTED_EXPERIMENT_
-else:
-    SELECTED_EXPERIMENT = None
+SELECTED_EXPERIMENT = to_relpath(SELECTED_EXPERIMENT_) if SELECTED_EXPERIMENT_ else None
 
 # USE_VAL="True"/"False" forces the tracking source for every experiment; unset,
 # each loaded experiment starts from default_use_val() and the "Validated
@@ -87,7 +82,7 @@ def default_use_val(experiment):
     if USE_VAL is not None:
         return USE_VAL
     try:
-        group = get_number_of_animals(experiment.replace("/", "_")) > 1
+        group = get_number_of_animals(to_flat(experiment)) > 1
     except Exception as error:
         logger.warning("Could not count the animals of %s: %s", experiment, error)
         group = True
@@ -146,13 +141,26 @@ db_manager = None
 # {frame_min, frame_max, index_db, chunk, flies (metadata sheet rows)}; None otherwise
 STORE_INFO = None
 HAS_BLOBS = False
+NUMBER_OF_ANIMALS = None
+
+
+def _number_of_animals(experiment, flies=None):
+    """Animals tracked: the NX of the name, except in an arena (its idtrackerai conf or
+    database; else its rows in the metadata sheets, `flies`)."""
+    try:
+        return int(get_number_of_animals(to_flat(experiment)))
+    except Exception as error:
+        logger.warning("Could not count the animals of %s: %s", experiment, error)
+        if flies:
+            return len(flies)
+        return int(re.search(r"(\d+)X", experiment).group(1))
 
 
 def _open_experiment(experiment):
     """Open `experiment` (slash form) and set the globals. Without database, only its
     recording (and the blobs_collections idtrackerai has written) can be shown."""
     global SELECTED_EXPERIMENT, cap, db_manager, offset, CHUNKSIZE, FRAMERATE, IDTRACKERAI_CONFIG
-    global STORE_INFO, HAS_BLOBS
+    global STORE_INFO, HAS_BLOBS, NUMBER_OF_ANIMALS
     basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment)
     if has_database(experiment):
         manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=experiment, use_val=default_use_val(experiment))
@@ -182,6 +190,7 @@ def _open_experiment(experiment):
     IDTRACKERAI_CONFIG = config
     STORE_INFO = store_info
     HAS_BLOBS = blobs
+    NUMBER_OF_ANIMALS = _number_of_animals(experiment, store_info["flies"] if store_info else None)
 
 
 def _experiment_info():
@@ -222,39 +231,36 @@ BODYPART_NAMES = {
 }
 
 def get_h5_file(fly_id_str, experiment):
-    """Get or open H5 file with caching"""
+    """Get or open H5 file with caching. The file is in the experiment's basedir
+    (<basedir>/motionmapper/NN/pose_raw/<experiment>__NN/), recreated when missing
+    or unreadable; None (cached, not retried) if that fails too."""
+    experiment = to_flat(experiment)
     cache_key = f"{experiment}__{fly_id_str}"
-    
+
     with _h5_cache_lock:
         if cache_key in _h5_file_cache:
             return _h5_file_cache[cache_key]
-        
-        folder=os.path.join(os.environ["FLYHOSTEL_VIDEOS"], f"{experiment}/motionmapper/{fly_id_str}/pose_raw")
-        pose_file = f"{folder}/{cache_key}/{cache_key}.h5"
-        
-        if not Path(pose_file).exists():
-            print(f"INFO {pose_file} not found")
-            recreate_pose_file(experiment, int(fly_id_str), output=folder)
-            return None
-        
+
+        pose_file = get_pose_file_path(experiment, int(fly_id_str), "raw")
+        # recreate_pose_file writes <output>/<experiment>__NN/<experiment>__NN.h5
+        folder = os.path.dirname(os.path.dirname(pose_file))
+        f = None
         try:
-            f = h5py.File(pose_file, 'r')
-            _h5_file_cache[cache_key] = f
-            logger.debug(f"Opened pose file: {pose_file}")
-            return f
-        except Exception as e:
-            logger.warning(f"Failed to open pose file {pose_file}: {e}. Attempting to recreate...")
+            if not Path(pose_file).exists():
+                logger.info("%s not found, recreating it", pose_file)
+                recreate_pose_file(experiment, int(fly_id_str), output=folder)
             try:
-                print(f"INFO {pose_file} invalid")
+                f = h5py.File(pose_file, 'r')
+            except OSError as e:
+                logger.warning("Failed to open pose file %s: %s. Recreating it", pose_file, e)
                 os.remove(pose_file)
                 recreate_pose_file(experiment, int(fly_id_str), output=folder)
                 f = h5py.File(pose_file, 'r')
-                _h5_file_cache[cache_key] = f
-                logger.info(f"Successfully recreated and opened pose file: {pose_file}")
-                return f
-            except Exception as e2:
-                logger.error(f"Failed to recreate and open pose file {pose_file}: {e2}")
-                return None
+            logger.debug("Opened pose file: %s", pose_file)
+        except Exception as e:
+            logger.error("No pose for %s: %s", cache_key, e)
+        _h5_file_cache[cache_key] = f
+        return f
 
 
 def close_h5_files():
@@ -262,7 +268,8 @@ def close_h5_files():
     with _h5_cache_lock:
         for f in _h5_file_cache.values():
             try:
-                f.close()
+                if f is not None:
+                    f.close()
             except:
                 pass
         _h5_file_cache.clear()
@@ -347,7 +354,7 @@ def list():
         result = {"experiments": [SELECTED_EXPERIMENT] if SELECTED_EXPERIMENT else []}
     try:
         records, _ = scan_not_analyzed(os.environ["FLYHOSTEL_VIDEOS"], set())
-        result["not_analyzed"] = sorted(r["experiment"].replace("/", "_") for r in records)
+        result["not_analyzed"] = sorted(to_flat(r["experiment"]) for r in records)
     except Exception as error:
         logger.error("Error listing not-analyzed experiments: %s", error)
         result["not_analyzed"] = []
@@ -361,10 +368,10 @@ def load():
     if not data or "experiment" not in data:
         return jsonify({"error": "experiment field required"}), 400
 
-    new_experiment = data["experiment"]
-    if "/" not in new_experiment:
-        tokens = new_experiment.split("_")
-        new_experiment = "/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
+    try:
+        new_experiment = to_relpath(data["experiment"])
+    except Exception:
+        return jsonify({"error": f"Not an experiment: {data['experiment']}"}), 400
 
     if not os.path.exists(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], new_experiment, "metadata.yaml")):
         return jsonify({"error": f"Experiment not found: {new_experiment}"}), 404
@@ -400,6 +407,7 @@ def load():
             _contours_cache.clear()
         _sleep_cache.clear()
         clear_blobs_cache()
+        close_h5_files()
         logger.info("Switched to experiment %s", SELECTED_EXPERIMENT)
 
     except Exception as error:
@@ -503,7 +511,7 @@ def get_animal_metadata():
             return jsonify({})
         df = pd.read_csv(io.StringIO(row.value), index_col=0)
 
-        experiment = SELECTED_EXPERIMENT.replace("/", "_")
+        experiment = to_flat(SELECTED_EXPERIMENT)
         try:
             identities = get_identities(experiment)
         except Exception:
@@ -562,7 +570,7 @@ def navigate_sleep(direction, identity, frame_number):
     if direction not in ('prev', 'next'):
         return jsonify({"error": "direction must be prev or next"}), 400
 
-    experiment = SELECTED_EXPERIMENT.replace("/", "_")
+    experiment = to_flat(SELECTED_EXPERIMENT)
     bout = find_sleep_bout(sleep_bouts(experiment, identity, FRAMERATE), frame_number, direction)
     return jsonify({"frame_number": int(bout[0]) if bout else None})
 
@@ -629,7 +637,7 @@ def get_preprocess(frame_number):
 
 
 def get_pose(db_manager, frame_number):
-    identities=get_identities(SELECTED_EXPERIMENT.replace("/", "_"))
+    identities=get_identities(to_flat(SELECTED_EXPERIMENT))
     pose={}
     for identity in identities:
         pose[str(identity)]=db_manager.get_pose_for_animal(identity, frame_number)
@@ -672,7 +680,7 @@ def get_tracking(frame_number):
     if SELECTED_EXPERIMENT is None or cap is None:
         return _experiment_required()
 
-    number_of_animals = int(re.search(".*/(.*)X/.*", SELECTED_EXPERIMENT).group(1))
+    number_of_animals = NUMBER_OF_ANIMALS
     logger.debug("Loading tracking data for %s", SELECTED_EXPERIMENT)
     tables = db_manager.tables if db_manager is not None else None
 
@@ -762,7 +770,7 @@ def get_tracking(frame_number):
     if include_pose:
         try:
             # Get list of fly identities
-            experiment=SELECTED_EXPERIMENT.replace("/", "_")
+            experiment=to_flat(SELECTED_EXPERIMENT)
             square_width=get_square_width(experiment)
             square_height=get_square_height(experiment)
 
@@ -879,7 +887,7 @@ def get_flies():
     if SELECTED_EXPERIMENT is None:
         return jsonify([])
     else:
-        experiment=SELECTED_EXPERIMENT.replace("/", "_")
+        experiment=to_flat(SELECTED_EXPERIMENT)
         logger.warning(experiment)
         identities=get_identities(experiment)
         flies = [
@@ -998,7 +1006,7 @@ def get_ok(frame_number, direction):
 def get_rejection(frame_number, direction):
 
     global SELECTED_EXPERIMENT
-    experiment=SELECTED_EXPERIMENT.replace("/", "_")
+    experiment=to_flat(SELECTED_EXPERIMENT)
 
     fn=frame_number
     
