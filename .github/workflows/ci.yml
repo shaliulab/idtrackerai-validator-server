@@ -17,10 +17,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check out submodules needed to build
-        env:
-          GH_PAT: ${{ secrets.SUBMODULE_PAT }}
         run: |
-          git config --global --add url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
           # Non-recursive: setup.py only needs flyhostel/setup.py to exist.
           # Its own submodules are resolved at install time, not build time.
           git submodule update --init idtrackerai-validator-client flyhostel
@@ -86,27 +83,19 @@ jobs:
           python-version: '3.10'
 
       - name: Install runtime dependencies
-        env:
-          GH_PAT: ${{ secrets.SUBMODULE_PAT }}
         run: |
           set -euo pipefail
 
-          if [ -z "${GH_PAT}" ]; then
-            echo "SUBMODULE_PAT is not set. Add it under"
-            echo "Settings > Secrets and variables > Actions."
-            exit 1
-          fi
-
-          # flyhostel's nested submodules are private (flyhostel-modelling,
-          # zeitgeber, googleapi, flyhostel-validation). This rewrite lets git
-          # authenticate to them with the token. --add keeps both entries:
-          # a second `git config` without it would replace the first.
-          git config --global --add url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
-          git config --global --add url."https://${GH_PAT}@github.com/".insteadOf "git@github.com:"
-
-          # Recursive: flyhostel's setup.py resolves idtrackerai and ethoscopy
-          # from its own libraries/ directory, so those must be populated.
-          git submodule update --init --recursive
+          # Only public repositories are needed: the validator client, flyhostel
+          # and, of flyhostel's own submodules, the two its setup.py installs
+          # from libraries/ (ethoscopy, and idtrackerai for the [idtrackerai]
+          # extra). The others (flyhostel-modelling, zeitgeber, googleapi,
+          # flyhostel-validation, yolov7tools) are private and not needed to
+          # serve; zeitgeber comes from PyPI. .gitmodules uses ssh URLs, which
+          # need a key, so fetch them over https instead.
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init idtrackerai-validator-client flyhostel
+          git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai
 
           python -m venv /tmp/testenv
           /tmp/testenv/bin/pip install --upgrade pip
