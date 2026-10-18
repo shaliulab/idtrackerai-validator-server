@@ -42,6 +42,15 @@ install_requires = [
     "h5py",
     "waitress",
     "pyyaml",
+    # Imported at startup through flyhostel but declared by neither it
+    # (plotly: flyhostel.data.pose.ethogram.plot) nor ethoscopy (tabulate and
+    # hmmlearn: behavpy_HMM_class; astropy: behavpy_periodogram_class;
+    # PyWavelets: misc.periodogram_functions).
+    "plotly",
+    "tabulate",
+    "hmmlearn",
+    "astropy",
+    "PyWavelets",
     vendored("flyhostel", HERE / "flyhostel", extras=["idtrackerai"]),
 ]
 
