@@ -52,6 +52,7 @@ from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
 from idtrackerai_validator_server.data_management import register_data_management
+from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
 )
@@ -143,6 +144,8 @@ db_manager = None
 STORE_INFO = None
 HAS_BLOBS = False
 NUMBER_OF_ANIMALS = None
+# Incubator temperature / humidity of the loaded experiment
+ENVIRONMENT = IncubatorEnvironment()
 
 
 def _number_of_animals(experiment, flies=None):
@@ -192,6 +195,7 @@ def _open_experiment(experiment):
     STORE_INFO = store_info
     HAS_BLOBS = blobs
     NUMBER_OF_ANIMALS = _number_of_animals(experiment, store_info["flies"] if store_info else None)
+    ENVIRONMENT.open(basedir)
 
 
 def _experiment_info():
@@ -735,7 +739,7 @@ def get_tracking(frame_number):
                 app.logger.error(error)
                 store_row = None
             frame_time = store_row.frame_time if store_row is not None else None
-        zt_fields = _zt_fields(frame_time)
+        zt_fields = {**_zt_fields(frame_time), **ENVIRONMENT.at(frame_time)}
 
         rows = []
         if source == "blobs":

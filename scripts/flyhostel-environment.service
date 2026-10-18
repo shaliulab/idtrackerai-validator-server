@@ -1,0 +1,9 @@
+[Unit]
+Description=Copy the incubator temperature/humidity logs into /flyhostel_data/environment/environment.db
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/vibflysleep/mambaforge/envs/idtrackerai-viewer/bin/python -m flyhostel.data.environment sync
+WorkingDirectory=%h
+SyslogIdentifier=flyhostel-environment
