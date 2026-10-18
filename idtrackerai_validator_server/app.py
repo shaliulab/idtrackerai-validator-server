@@ -55,6 +55,7 @@ from idtrackerai_validator_server.data_management import register_data_managemen
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
 )
+from idtrackerai_validator_server import rois as roi_sources
 from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
 
 # Initialize logging
@@ -609,31 +610,60 @@ def get_frame(frame_number):
     return response
 
 
+def _roi_sources():
+    return roi_sources.list_sources(
+        os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT), SELECTED_EXPERIMENT,
+        IDTRACKERAI_CONFIG if db_manager is not None else None,
+    )
+
+
+@app.route('/api/rois', methods=['GET'])
+def get_rois():
+    """ROIs and segmentation settings of the loaded experiment: its database's idtrackerai
+    config, <date>.toml, landmarks.toml and <date>.conf (those present), read-only."""
+    if SELECTED_EXPERIMENT is None:
+        return _experiment_required()
+    return jsonify({"experiment": SELECTED_EXPERIMENT,
+                    "sources": [roi_sources.public(s) for s in _roi_sources()]})
+
+
 @app.route('/api/preprocess/<int:frame_number>', methods=['GET'])
 def get_preprocess(frame_number):
     """Contours of `frame_number`, from idtrackerai's segmentation (computed on demand, cached).
-    Segmentation takes ~40% of a frame's cost, so /api/frame does not do it."""
+    Segmentation takes ~40% of a frame's cost, so /api/frame does not do it.
+    ?source=<id of /api/rois> segments with that source's settings (contours and areas)."""
     global contours
 
     if cap is None:
         return jsonify({'error': 'Cap could not be loaded'}), 404
+    source_id = request.args.get("source")
+    source = None
+    if source_id:
+        source = next((s for s in _roi_sources() if s["id"] == source_id), None)
+        if source is None or "error" in source:
+            return jsonify({"contours": [], "error": (source or {}).get("error", f"No source {source_id}")}), 404
+    # an edited file invalidates its contours
+    key = ((source_id, source.get("mtime")) if source else None, frame_number)
     with _contours_lock:
-        frame_contours = _contours_cache.get(frame_number)
-    if frame_contours is None:
+        cached = _contours_cache.get(key)
+    if cached is None:
         image, _ = _read_frame(frame_number)
         if image is None:
             return jsonify({"contours": [], "error": f"Frame {frame_number} cannot be read"}), 404
         try:
-            frame_contours = process_frame(image, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
+            if source is None:
+                cached = process_frame(image, session.get("idtrackerai_config", IDTRACKERAI_CONFIG)), None
+            else:
+                cached = roi_sources.segment(image, source)
         except Exception as error:
             logger.error(error)
-            frame_contours = []
+            cached = [], None
         with _contours_lock:
-            _contours_cache[frame_number] = frame_contours
+            _contours_cache[key] = cached
             while len(_contours_cache) > CONTOURS_CACHE_SIZE:
                 _contours_cache.popitem(last=False)
-    contours = frame_contours
-    return jsonify({"contours": frame_contours})
+    contours, areas = cached
+    return jsonify({"contours": contours, "areas": areas, "source": source_id})
 
 
 def get_pose(db_manager, frame_number):
