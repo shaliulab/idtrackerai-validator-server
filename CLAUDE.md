@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is a full-stack web application for visualizing and validating animal tracking data from FlyHostel experiments (fly behavior research at Liu Lab @ VIB-KU Leuven). It displays identity assignments produced by YOLOv7+idtrackerai, allowing researchers to review and correct them frame-by-frame.
 
 - **Backend**: Python Flask API (`idtrackerai_validator_server/`)
-- **Frontend**: React 18 app (`idtrackerai-validator-client/`, git submodule)
+- **Frontend**: React 18 app built with Vite (`idtrackerai-validator-client/`, git submodule)
 
 ## Running the Server
 
@@ -27,8 +27,8 @@ VALIDATOR_EXPERIMENT=FlyHostel4/6X/2023-08-31_13-00-00 BACKEND_PORT=5000 \
 **Frontend:**
 ```bash
 cd idtrackerai-validator-client
-npm start   # dev server on port 3000
-npm run build
+npm start   # Vite dev server on port 3000, /api proxied to $REACT_APP_BACKEND_PORT (5000)
+npm run build   # -> build/ (static/js/main.<hash>.js, as the server and CI expect)
 ```
 
 ## Required Environment Variables
@@ -129,16 +129,18 @@ Tables accessed (with or without `_VAL` suffix based on validation status):
 ### Frontend (`idtrackerai-validator-client/src/`)
 
 - **`index.css`**: theme tokens as CSS variables (`<html data-theme="light|dark">`, set by `App.js`) and the shared classes (`.card`, `.field`, `.toolbar`, `.icon-btn`, …). `THEMES` in `App.js` mirrors them for components still taking a `theme` prop.
-- **`constants.js`**: `BACKEND_SERVER` hostname must match the server (currently hardcoded to `"cv3"`). `BACKEND_PORT` can be overridden via `REACT_APP_BACKEND_PORT` env var.
+- **`vite.config.js`**: components are JSX in `.js` files (esbuild `jsx` loader); `REACT_APP_*` env vars are exposed as `import.meta.env.REACT_APP_*` (`REACT_APP_API_BASE` in `api.js`); SVGs are imported as components with `?react` (`icons.js`); `react` and `hls` get their own chunks.
+- **`plotly.js`**: `loadPlotly()` adds the prebuilt `plotly.min.js` as a `<script>` (not bundled: re-minifying it was most of the build time); the Ethograms tab's lazy import waits for it, then `Plotly` is set.
+- **`constants.js`**: frontend constants (framerate, chunk length, label fields, …).
 - **`App.js`**: Root component — owns the `FramePlayer` (seeks on every `frameNumber` change, runs playback while `isPlaying`). `experimentInfo` (`has_database`, `has_blobs` from `/api/current_experiment`) sets the tracking source and grays out the PE and Ethograms tabs (and Ctrl+2/3) for experiments without database. The Group viewer frame is sized to fill the height left above the console (at most half the window width) until the splitter beside it is dragged (width saved as a share of the window in `fh-frame-width-share`; double click returns to auto-fit); the side panel fills the available height.
-- **`FrameWithSquare.js`**: Canvas rendering (react-konva) of the video frame with overlaid tracking data, contours, and pose keypoints. The hover magnifier's border takes the identity colour of the fly nearest the cursor, whose identity is shown in its top-left corner.
+- **`FrameWithSquare.js`**: Canvas rendering of the video frame with overlaid tracking data, contours, and pose keypoints. The hover magnifier's border takes the identity colour of the fly nearest the cursor, whose identity is shown in its top-left corner.
 - **App bar** (`App.js`): `VersionTag` (server commit, `*` = uncommitted changes) and `Logos`, two images loaded from `public/logos/logo1.png` and `logo2.png` (hidden while missing; see `LOGOS`).
 - **`layout.js`**: hooks `useFillHeight` (height down to the console), `useElementSize` (ResizeObserver), `useStoredNumber` (localStorage-backed number).
 - **`Splitter.js`**: Drag handle used to resize panels (frame | side panel, console).
 - **`CvatLinks.js`**: Group viewer Navigation card: "CVAT project" (opens `/projects/<id>`) and "Frame in CVAT" (opens `/tasks/<t>/jobs/<j>?frame=<f>`, grayed out unless the displayed frame is one of the CVAT-selected frames, looked up client side in the `/api/cvat` index fetched once per experiment).
 - **`buttons.js`**: Navigation buttons (prev/next by 1, 10, 30, chunk; prev/next error/ok/AI/rejection; play/pause).
 - **`slider.js`**: Scrubber bar for frame navigation.
-- **`EthogramViewer.js`**: "Ethograms" tab (Ctrl+3), lazy-loaded because it bundles plotly. One fly at a time via dropdown / ◀ ▶ / ↑↓; ←/→ pan; syncs with the HLS movie; "Open frame in viewer" jumps the idtrackerai tab to the cursor frame. Its `request` prop ({fly, frameNumber}) opens a fly at a frame: used by the blobs table "etho" button.
+- **`EthogramViewer.js`**: "Ethograms" tab (Ctrl+3), lazy-loaded after plotly (`plotly.js`); the movie plays with `hls.js/light`. One fly at a time via dropdown / ◀ ▶ / ↑↓; ←/→ pan; syncs with the HLS movie; "Open frame in viewer" jumps the idtrackerai tab to the cursor frame. Its `request` prop ({fly, frameNumber}) opens a fly at a frame: used by the blobs table "etho" button.
 - **`PEValidator.js`**: PE tab. Fills the window down to the console: a controls card, the media card (video | pose | traces; square panels sized from its height, auto ≈60% of the room, draggable, `fh-pe-media-height`) and the bouts table; "Current media" is a resizable side panel (`fh-pe-side-width`). Styles: `.pe-*` in `index.css`. "Find PE near" a ZT (s) or frame number selects the closest PE bout (conversion via `/api/ethogram/<fly>/locate`); bursts are ordered by score or, with "sort chronologically", by first frame (audit mode keeps the audit order).
 - **`OverviewTab.js`**: "Overview" tab (Ctrl+4), dashboard of all experiments from `/api/overview` (fetched when first shown). Counting is client side on fly rows; clicking a bar toggles a filter (each chart ignores its own filter); a "Find experiments" query (genotype, living with another genotype / no one / only its own, optional exact number of flies of each of the two genotypes, date range; `applyQuery`, stored in `fh-overview-query`) applied before the bar filters, a derived `cohoused_with` property (other flies' genotypes), experiments/flies toggle, cross-tab, experiments table whose "Open" loads the experiment (`openExperiment` in `App.js`), CSV export. Chart choice in `fh-overview-*` localStorage. Styles: `.ov-*` in `index.css`.
 - **`DataManagementTab.js`**: "Data management" tab (Ctrl+6): experiment folders with size on disk / in backup / not in backup, backup status (▸ lists missing or changed critical files), Dropbox (top-level files by size) and "Outside tracking" (raw chunk files outside the tracked chunks, verified on Dropbox by content with "verify contents"; "Check Dropbox" for the experiments shown, ☁ per row), free space per drive; "Scan all" / ↻ start scan jobs; "Delete" (only for `ok`, not loaded) opens a dialog that needs the experiment name typed.
@@ -149,7 +151,6 @@ Tables accessed (with or without `_VAL` suffix based on validation status):
 
 ## Key Configuration Notes
 
-- **`BACKEND_SERVER` in `constants.js`** must be updated when deploying to a different host.
 - **`first_chunk` in `constants.py`** controls which video chunk loads at startup (default: 50).
 - `INCLUDE_POSE=False` in `constants.py` — pose support is disabled and not fully implemented (raises `NotImplementedError` if enabled).
 - `./frames/` (`FRAMES_DIR`) is still wiped at server start but no longer written: frames are encoded in memory.

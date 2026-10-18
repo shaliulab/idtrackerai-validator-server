@@ -146,8 +146,8 @@ cd idtrackerai-validator-client
 npm start
 ```
 
-This starts the CRA dev server on port 3000 and proxies API calls to the backend
-on port 5000, so run the Python server alongside it. Forward both ports if you
+This starts the Vite dev server on port 3000 and proxies API calls to the backend
+on port 5000 (`REACT_APP_BACKEND_PORT` to change it), so run the Python server alongside it. Forward both ports if you
 are working remotely.
 
 The compiled interface in `idtrackerai_validator_server/frontend/` is a build

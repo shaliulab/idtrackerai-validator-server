@@ -34,7 +34,7 @@ jobs:
 
       - name: Build the React client
         run: |
-          npm --prefix idtrackerai-validator-client ci
+          npm --prefix idtrackerai-validator-client ci --no-audit --no-fund
           npm --prefix idtrackerai-validator-client run build
           rm -rf idtrackerai_validator_server/frontend
           cp -r idtrackerai-validator-client/build idtrackerai_validator_server/frontend
