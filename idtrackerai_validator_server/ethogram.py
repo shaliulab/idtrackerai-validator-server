@@ -26,6 +26,7 @@ Time conventions (same as flyhostel's sleep tables and the ethogram's ZT ticks):
                    = (frame_number - first_chunk * chunksize) / framerate
 """
 import io
+import json
 import os
 import os.path
 import re
@@ -37,6 +38,7 @@ import zipfile
 from contextlib import closing
 from functools import lru_cache
 
+import numpy as np
 import pandas as pd
 from flask import jsonify, request, send_file, send_from_directory
 
@@ -114,6 +116,103 @@ def _ensure_figure(fly):
         fig.write_json(tmp)
         os.replace(tmp, path)
     return path
+
+
+# Rows of the browsable ethogram (/track), bottom to top. The other inactive
+# labels count as inactive; background (and anything else) is left blank.
+TRACK_BEHAVIORS = ["inactive", "inactive+micromovement", "feed", "groom", "walk"]
+TRACK_MERGED = {"inactive+pe": "inactive", "inactive+rejection": "inactive"}
+
+
+def _track_from_feather(fly, path):
+    """Winner behavior of every second of movie (most frequent prediction2, ties to
+    the first of TRACK_BEHAVIORS) and the mean score of its frames."""
+    props = _properties(fly)
+    df = pd.read_feather(path, columns=["frame_number", "prediction2", "score"])
+    labels = df["prediction2"].replace(TRACK_MERGED)
+    # 0 = none of TRACK_BEHAVIORS, 1.. = TRACK_BEHAVIORS
+    codes = pd.Categorical(labels, categories=TRACK_BEHAVIORS).codes.astype(np.int64) + 1
+    t0 = props["first_chunk"] * props["chunksize"]
+    bins = np.floor((df["frame_number"].to_numpy() - t0) / props["framerate"]).astype(np.int64)
+    keep = bins >= 0
+    bins, codes = bins[keep], codes[keep]
+    score = np.nan_to_num(df["score"].to_numpy(dtype=float)[keep])
+    n_bins = int(bins.max()) + 1 if len(bins) else 0
+    n_codes = len(TRACK_BEHAVIORS) + 1
+    index = bins * n_codes + codes
+    counts = np.bincount(index, minlength=n_bins * n_codes).reshape(n_bins, n_codes)
+    sums = np.bincount(index, weights=score, minlength=n_bins * n_codes).reshape(n_bins, n_codes)
+    # behaviors before "none": a second is blank only when most of it is
+    winner = np.argmax(np.roll(counts, -1, axis=1), axis=1) + 1
+    winner[winner == n_codes] = 0
+    rows = np.arange(n_bins)
+    winner_counts = counts[rows, winner]
+    winner[winner_counts == 0] = 0
+    scores = np.where(winner_counts > 0, sums[rows, winner] / np.maximum(winner_counts, 1), 0)
+    return winner - 1, scores
+
+
+def _track_from_figure(path):
+    """Same as _track_from_feather, read from a pre-rendered figure (1 s markers whose
+    alpha is the score) when the feather is gone."""
+    with open(path) as handle:
+        figure = json.load(handle)
+    points = []
+    for trace in figure["data"]:
+        if trace.get("type") != "scattergl" or not trace.get("x"):
+            continue
+        behavior = TRACK_MERGED.get(trace.get("name"), trace.get("name"))
+        if behavior not in TRACK_BEHAVIORS:
+            continue
+        colors = trace.get("marker", {}).get("color")
+        if not isinstance(colors, list):
+            colors = [None] * len(trace["x"])
+        for x, color in zip(trace["x"], colors):
+            try:
+                score = float(color.rsplit(",", 1)[1].rstrip(")"))
+            except (AttributeError, IndexError, ValueError):
+                score = 1.0
+            points.append((int(x), TRACK_BEHAVIORS.index(behavior), score))
+    n_bins = max(p[0] for p in points) + 1 if points else 0
+    codes = np.full(n_bins, -1, dtype=np.int64)
+    scores = np.zeros(n_bins)
+    for x, code, score in sorted(points, key=lambda p: -p[1]):   # ties to the first behavior
+        if x >= 0:
+            codes[x], scores[x] = code, score
+    return codes, scores
+
+
+@lru_cache(maxsize=16)
+def _track(fly, source, mtime):
+    """`mtime` keys the cache: a redrawn feather / figure is read again."""
+    experiment = fly.split("__")[0]
+    if source.endswith(".feather"):
+        codes, scores = _track_from_feather(fly, source)
+    else:
+        codes, scores = _track_from_figure(source)
+    props = _properties(fly)
+    zt0 = None
+    if props["first_chunk"] is not None:
+        try:
+            zt0 = frame_to_zt(experiment, props["first_chunk"] * props["chunksize"])
+        except Exception as error:   # no STORE_INDEX row / metadata: ticks fall back to movie time
+            logger.warning("No ZT for the movie start of %s: %s", fly, error)
+    return {
+        "behaviors": TRACK_BEHAVIORS,
+        "bin": 1,
+        "codes": codes.tolist(),
+        "scores": np.round(scores * 100).astype(int).tolist(),   # %
+        "zt0": zt0,
+        "source": os.path.basename(source),
+    }
+
+
+def track(fly):
+    """Per-second behavior of the fly (see _track_from_feather), x = movie time."""
+    for source in (_feather_path(fly), _figure_path(fly)):
+        if os.path.exists(source):
+            return _track(fly, source, os.path.getmtime(source))
+    raise FileNotFoundError(f"no {os.path.basename(_feather_path(fly))} or {os.path.basename(_figure_path(fly))} for {fly}")
 
 
 def _saved_videos_dir(fly):
@@ -302,6 +401,21 @@ def register_ethogram(app, get_selected_experiment):
             logger.exception("Could not draw the ethogram of %s", fly)
             return jsonify({"error": f"could not draw the ethogram: {error}"}), 500
         return send_from_directory(os.path.dirname(path), os.path.basename(path), mimetype="application/json")
+
+    @app.route("/api/ethogram/<fly>/track", methods=["GET"])
+    def ethogram_track(fly):
+        """Per-second behavior codes (index in `behaviors`, -1 = none) and scores (%), x = movie time."""
+        err = _check_fly(fly)
+        if err:
+            return err
+        try:
+            # compact: jsonify indents in debug mode, doubling the size
+            return app.response_class(json.dumps(track(fly), separators=(",", ":")), mimetype="application/json")
+        except FileNotFoundError as error:
+            return jsonify({"error": str(error)}), 404
+        except Exception as error:
+            logger.exception("Could not read the ethogram of %s", fly)
+            return jsonify({"error": f"could not read the ethogram: {error}"}), 500
 
     @app.route("/api/ethogram/<fly>/properties", methods=["GET"])
     def ethogram_properties(fly):
