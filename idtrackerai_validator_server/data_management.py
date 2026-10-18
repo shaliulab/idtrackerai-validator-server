@@ -27,7 +27,13 @@ Chunks must be consecutive: `tracking_gaps` (chunks without rows in ROI_0 betwee
 its first and last chunk) and `raw_gaps` (missing NNNNNN.mp4 between the first and
 last one) are listed as `problems`, shown apart from the backup status.
 `local_only_bytes` is what is not in the backup at all (critical or not): chunks
->= 400, idtrackerai sessions, ... and is lost on delete (raw chunks are on Dropbox).
+>= 400, idtrackerai sessions, ... and is lost on delete.
+
+Dropbox (dropbox.py) is checked apart, by a job (POST /api/data_management/dropbox),
+kept in dropbox.json next to $DATA_MANAGEMENT_CACHE: every top-level file of the
+experiment folder by size, and the raw chunk files (NNNNNN.mp4/.npz/.png/.avi) outside
+the chunks tracked in the database, which no analysis uses: with "verify" their
+contents too. Those verified are `deletable_bytes`.
 
 Walking ~800 folders takes minutes on the HDDs, so it runs as a job (one thread per
 FlyHostel) and the result is kept in $DATA_MANAGEMENT_CACHE until rescanned.
@@ -48,6 +54,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from flask import jsonify, request
 
+from idtrackerai_validator_server import dropbox
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.experiments import experiment_folder
 
@@ -56,6 +63,9 @@ logger = logging.getLogger(__name__)
 BACKUP_ROOT = os.environ.get("FLYHOSTEL_BACKUP", "/flyhostel_data/backup")
 CACHE_FILE = os.path.expanduser(os.environ.get(
     "DATA_MANAGEMENT_CACHE", "~/.cache/idtrackerai-validator/data_management.json"))
+DROPBOX_CACHE = os.path.join(os.path.dirname(CACHE_FILE), "dropbox.json")
+# rclone calls to Dropbox at once
+DROPBOX_WORKERS = 8
 # chunks=list(range(0, 400)) in flyhostel/scripts/main.py
 BACKUP_CHUNKS = 400
 # mtimes on different file systems may be rounded
@@ -66,12 +76,16 @@ HOSTEL_RE = re.compile(r"FlyHostel\d+$")
 GROUP_RE = re.compile(r"\d+X$")
 DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 CHUNK_RE = re.compile(r"(\d{6})\.(mp4|npz|png)$")
+# every file of a raw chunk (the .avi has the chunk's first frame)
+RAW_RE = re.compile(r"(\d{6})\.(mp4|npz|png|avi)$")
 POSE_RE = re.compile(r"flyhostel/single_animal/[^/]+/(\d{6})\.mp4(\.predictions\.(slp|h5))?$")
 
 _results = {}               # experiment (slash form) -> record
 _results_lock = threading.Lock()
 _scan_lock = threading.Lock()
 _deleting = set()
+_dropbox = {}               # experiment -> last Dropbox check
+_dropbox_lock = threading.Lock()
 
 
 def flat_name(experiment):
@@ -158,17 +172,6 @@ def _walk(top):
     return files
 
 
-def _dropbox_index(root, hostel):
-    """Folders listed in $FLYHOSTEL_VIDEOS/<hostel>_dropbox_index.txt ("6X/<date>/"), and its date."""
-    path = os.path.join(root, f"{hostel}_dropbox_index.txt")
-    try:
-        with open(path) as handle:
-            entries = {line.strip().rstrip("/") for line in handle if line.strip()}
-        return entries, os.path.getmtime(path)
-    except OSError:
-        return None, None
-
-
 def tracked_chunks(dbfile):
     """(first, last) chunk with rows in ROI_0 and the chunks without rows in between,
     or (None, []) when there is no tracking. min and max are separate queries so that
@@ -186,7 +189,7 @@ def tracked_chunks(dbfile):
     return (first, last), gaps
 
 
-def scan_experiment(root, experiment, dropbox=None):
+def scan_experiment(root, experiment):
     folder = os.path.join(root, experiment)
     backup = os.path.join(BACKUP_ROOT, experiment)
     local = _walk(folder)
@@ -239,10 +242,6 @@ def scan_experiment(root, experiment, dropbox=None):
         status = "ok"
 
     hostel, group, date = experiment.split("/")
-    in_dropbox = None
-    if dropbox is not None and dropbox[0] is not None:
-        in_dropbox = f"{group}/{date}" in dropbox[0]
-
     return {
         "experiment": experiment,
         "flyhostel": hostel,
@@ -269,27 +268,89 @@ def scan_experiment(root, experiment, dropbox=None):
         "missing": sorted(missing)[:MAX_LISTED],
         "changed": sorted(changed)[:MAX_LISTED],
         "status": status,
-        "in_dropbox_index": in_dropbox,
         "scanned_at": time.time(),
     }
 
 
-def _load_cache():
+def dropbox_check(root, experiment, verify=False):
+    """Top-level files of the experiment folder against their copy on Dropbox, and
+    the raw chunk files outside the tracked chunks (contents compared when `verify`)."""
+    folder = os.path.join(root, experiment)
+    remote = dropbox.list_remote(experiment)
+    tracked = None
+    dbfile = os.path.join(folder, f"{flat_name(experiment)}.db")
+    if os.path.exists(dbfile):
+        tracked, _ = tracked_chunks(dbfile)
+
+    statuses = {}
+    outside = []                       # (name, chunk, bytes on disk, status)
+    for entry in os.scandir(folder):
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        match = RAW_RE.fullmatch(entry.name)
+        chunk = int(match.group(1)) if match else None
+        is_outside = chunk is not None and tracked is not None and not tracked[0] <= chunk <= tracked[1]
+        status = dropbox.compare(entry.path, (remote or {}).get(entry.name), verify=verify and is_outside)
+        statuses[entry.name] = status
+        if is_outside:
+            outside.append((entry.name, chunk, entry.stat(follow_symlinks=False).st_blocks * 512, status))
+
+    def counts(values):
+        result = defaultdict(int)
+        for value in values:
+            result[value] += 1
+        return dict(result)
+
+    not_backed_up = sorted(name for name, status in statuses.items()
+                           if status not in (dropbox.SAME_SIZE, dropbox.VERIFIED))
+    return {
+        "checked_at": time.time(),
+        "remote": f"{dropbox.REMOTE}/{experiment}",
+        "on_dropbox": remote is not None,
+        "verified": verify,
+        "n_files": len(statuses),
+        "counts": counts(statuses.values()),
+        "n_not_backed_up": len(not_backed_up),
+        "not_backed_up": not_backed_up[:MAX_LISTED],
+        "tracked_chunks": list(tracked) if tracked else None,
+        "outside": {
+            "chunks": compact_ranges({chunk for _, chunk, _, _ in outside}),
+            "n_files": len(outside),
+            "bytes": sum(used for _, _, used, _ in outside),
+            "counts": counts(status for _, _, _, status in outside),
+            # contents identical on Dropbox: can go without touching any analysis
+            "deletable_bytes": sum(used for _, _, used, status in outside if status == dropbox.VERIFIED),
+            "not_on_dropbox": sorted(name for name, _, _, status in outside
+                                     if status not in (dropbox.SAME_SIZE, dropbox.VERIFIED))[:MAX_LISTED],
+        },
+    }
+
+
+def _load_json(path, into):
     try:
-        with open(CACHE_FILE) as handle:
-            _results.update(json.load(handle))
+        with open(path) as handle:
+            into.update(json.load(handle))
     except (OSError, ValueError):
         pass
 
 
-def _save_cache():
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    tmp = CACHE_FILE + ".tmp"
-    with _results_lock:
-        data = dict(_results)
+def _save_json(path, data, lock):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with lock:
+        data = dict(data)
     with open(tmp, "w") as handle:
         json.dump(data, handle)
-    os.replace(tmp, CACHE_FILE)
+    os.replace(tmp, path)
+
+
+def _load_cache():
+    _load_json(CACHE_FILE, _results)
+    _load_json(DROPBOX_CACHE, _dropbox)
+
+
+def _save_cache():
+    _save_json(CACHE_FILE, _results, _results_lock)
 
 
 def disks(root):
@@ -361,9 +422,10 @@ def register_data_management(app, get_selected_experiment):
             known = set(experiments)
             for gone in [e for e in _results if e not in known]:
                 del _results[gone]
-            records = [_results.get(e) or {"experiment": e, "flyhostel": e.split("/")[0],
-                                           "group_size": int(e.split("/")[1][:-1]),
-                                           "date": e.split("/")[2], "status": None}
+            records = [dict(_results.get(e) or {"experiment": e, "flyhostel": e.split("/")[0],
+                                                "group_size": int(e.split("/")[1][:-1]),
+                                                "date": e.split("/")[2], "status": None},
+                            dropbox=_dropbox.get(e))
                        for e in experiments]
         return jsonify({
             "experiments": records,
@@ -373,6 +435,8 @@ def register_data_management(app, get_selected_experiment):
             # its experiment folder when an arena is loaded
             "loaded": experiment_folder(get_selected_experiment()) if get_selected_experiment() else None,
             "scanning": _scan_lock.locked(),
+            "dropbox_remote": dropbox.REMOTE,
+            "dropbox_checking": _dropbox_lock.locked(),
         })
 
     @app.route("/api/data_management/scan", methods=["POST"])
@@ -394,12 +458,11 @@ def register_data_management(app, get_selected_experiment):
 
             def run(index):
                 hostel = hostels[index]
-                dropbox = _dropbox_index(root, hostel)
                 job.update(index, status="running")
                 todo = by_hostel[hostel]
                 for i, experiment in enumerate(todo):
                     try:
-                        record = scan_experiment(root, experiment, dropbox)
+                        record = scan_experiment(root, experiment)
                         with _results_lock:
                             _results[experiment] = record
                     except Exception as error:
@@ -421,6 +484,60 @@ def register_data_management(app, get_selected_experiment):
             job = start_job(title, [f"{h} ({len(by_hostel[h])})" for h in hostels], work)
         except Exception:
             _scan_lock.release()
+            raise
+        return jsonify(job.to_dict())
+
+    @app.route("/api/data_management/dropbox", methods=["POST"])
+    def check_dropbox():
+        """{"experiments": [...] (default: all), "verify": bool}: job comparing them with Dropbox."""
+        body = request.get_json(silent=True) or {}
+        experiments = list_experiments(root)
+        if body.get("experiments"):
+            experiments = [e for e in experiments if e in set(body["experiments"])]
+        verify = bool(body.get("verify"))
+        by_hostel = defaultdict(list)
+        for experiment in experiments:
+            by_hostel[experiment.split("/")[0]].append(experiment)
+        hostels = sorted(by_hostel)
+        if not _dropbox_lock.acquire(blocking=False):
+            return jsonify({"error": "A Dropbox check is already running"}), 409
+
+        def work(job):
+            errors = []
+            done = defaultdict(int)
+            progress_lock = threading.Lock()
+
+            def run(experiment):
+                hostel = experiment.split("/")[0]
+                index = hostels.index(hostel)
+                job.update(index, status="running")
+                try:
+                    result = dropbox_check(root, experiment, verify=verify)
+                    with _results_lock:
+                        _dropbox[experiment] = result
+                except Exception as error:
+                    logger.exception("Could not check %s on Dropbox", experiment)
+                    errors.append(f"{experiment}: {error}")
+                with progress_lock:
+                    done[hostel] += 1
+                    finished = done[hostel] == len(by_hostel[hostel])
+                    job.update(index, progress=done[hostel] / len(by_hostel[hostel]),
+                               **({"status": "done"} if finished else {}))
+
+            try:
+                with ThreadPoolExecutor(max_workers=DROPBOX_WORKERS) as pool:
+                    list(pool.map(run, experiments))
+                _save_json(DROPBOX_CACHE, _dropbox, _results_lock)
+                job.result = {"checked": len(experiments), "errors": errors, "verify": verify}
+            finally:
+                _dropbox_lock.release()
+
+        title = (f"Check {experiments[0]} on Dropbox" if len(experiments) == 1
+                 else f"Check {len(experiments)} experiments on Dropbox") + (" (verify contents)" if verify else "")
+        try:
+            job = start_job(title, [f"{h} ({len(by_hostel[h])})" for h in hostels], work)
+        except Exception:
+            _dropbox_lock.release()
             raise
         return jsonify(job.to_dict())
 
@@ -453,7 +570,7 @@ def register_data_management(app, get_selected_experiment):
                 if not DATE_RE.match(os.path.basename(target)):
                     raise RuntimeError(f"{target} does not look like an experiment folder")
 
-                record = scan_experiment(root, experiment, _dropbox_index(root, experiment.split("/")[0]))
+                record = scan_experiment(root, experiment)
                 with _results_lock:
                     _results[experiment] = record
                 if record["status"] != "ok":
