@@ -20,6 +20,11 @@ POST /api/metadata/predownload {"experiments"}
     same / minor (only non-key columns change) / filled (key values only fill empty
     cells) / changes / error (a failed check) / failed (download).
 
+POST /api/metadata/download_sheets
+    Job running `download_metadata_sheets` (googleapi, next to the downloader): the
+    tabs listed under SHEETS in the googleapi config, as CSV, into $FLYHOSTEL_METADATA,
+    where the Overview reads the experiments not analyzed yet. Result: the files saved.
+
 POST /api/metadata/apply {"experiment", "job_id", "force"}
     Writes the previewed CSV to METADATA.ethoscope_metadata. Refused when a check
     failed unless force. The old value is first saved to
@@ -47,7 +52,7 @@ from flyhostel.utils import get_number_of_animals
 
 from idtrackerai_validator_server.jobs import start_job, _jobs
 from idtrackerai_validator_server.experiments import to_flat
-from idtrackerai_validator_server.overview import PATH_RE, _clean, _fly_rows, merge_light_cycle
+from idtrackerai_validator_server.overview import PATH_RE, METADATA_DIR, _clean, _fly_rows, merge_light_cycle
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,10 @@ DOWNLOAD_TIMEOUT = 300          # s; an expired Google token would otherwise wai
 BATCH_PYTHON = os.path.join(os.path.dirname(DOWNLOADER), "python")
 BATCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_metadata_batch.py")
 BATCH_MARKER = "@@PROGRESS "
+# Whole sheets as CSV (the browser's File > Download), for the Overview's not-analyzed experiments.
+SHEETS_DOWNLOADER = os.path.join(os.path.dirname(DOWNLOADER), "download_metadata_sheets")
+SAVED_RE = re.compile(r"Saved (.+\.csv)\s*$", re.M)
+_sheets_lock = threading.Lock()
 BATCH_TIMEOUT = 3600
 # experiment -> {"csv", "downloaded_at", "status", ...}: the last download of its metadata,
 # used by the preview instead of downloading again. In memory: lost on restart.
@@ -361,6 +370,26 @@ def predownload(experiments, job):
     job.update(0, status="done", progress=1.0)
 
 
+def download_sheets(job):
+    """Run download_metadata_sheets into METADATA_DIR; job.result = {"files", "output"}."""
+    if not os.path.exists(SHEETS_DOWNLOADER):
+        raise FileNotFoundError(f"{SHEETS_DOWNLOADER} not found (googleapi too old?)")
+    job.update(0, status="running", progress=0.2)
+    try:
+        result = subprocess.run([SHEETS_DOWNLOADER, "--output", METADATA_DIR], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"download_metadata_sheets took more than {DOWNLOAD_TIMEOUT} s "
+                           "(is the Google token in ~/.config/googleapi still valid?)")
+    output = (result.stderr or "") + (result.stdout or "")
+    if result.returncode != 0:
+        raise RuntimeError(f"download_metadata_sheets failed: {output.strip()[-1000:]}")
+    files = SAVED_RE.findall(output)
+    logger.info("Metadata sheets downloaded to %s: %s", METADATA_DIR, files)
+    job.result = {"files": files, "output": METADATA_DIR}
+    job.update(0, status="done", progress=1.0, count=len(files))
+
+
 def predownloaded_status():
     return {e: {k: v for k, v in entry.items() if k != "csv"} for e, entry in _predownloaded.items()}
 
@@ -441,6 +470,25 @@ def register_metadata_sync(app):
             job = start_job(f"Download sheet metadata of {len(experiments)} experiments", ["sheets"], work)
         except Exception:
             _predownload_lock.release()
+            raise
+        return jsonify(job.to_dict())
+
+    @app.route("/api/metadata/download_sheets", methods=["POST"])
+    def metadata_download_sheets():
+        """Download the SHEETS tabs as CSV into $FLYHOSTEL_METADATA (one at a time)."""
+        if not _sheets_lock.acquire(blocking=False):
+            return jsonify({"error": "The metadata sheets are already being downloaded"}), 409
+
+        def work(job):
+            try:
+                download_sheets(job)
+            finally:
+                _sheets_lock.release()
+
+        try:
+            job = start_job("Download metadata sheets", ["sheets"], work)
+        except Exception:
+            _sheets_lock.release()
             raise
         return jsonify(job.to_dict())
 

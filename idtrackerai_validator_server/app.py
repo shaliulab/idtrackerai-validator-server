@@ -199,7 +199,10 @@ def _open_experiment(experiment):
 
 
 def _experiment_info():
-    return {"experiment": SELECTED_EXPERIMENT, "has_database": db_manager is not None, "has_blobs": HAS_BLOBS}
+    basedir = None if SELECTED_EXPERIMENT is None else os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT)
+    return {"experiment": SELECTED_EXPERIMENT, "has_database": db_manager is not None, "has_blobs": HAS_BLOBS,
+            # the folder, and where it really is (FlyHostel<N> links point to other drives)
+            "basedir": basedir, "realpath": basedir and os.path.realpath(basedir)}
 
 
 if SELECTED_EXPERIMENT is not None:
