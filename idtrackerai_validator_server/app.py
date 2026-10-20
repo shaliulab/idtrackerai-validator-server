@@ -52,6 +52,7 @@ from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
 from idtrackerai_validator_server.data_management import register_data_management
+from idtrackerai_validator_server.restore import register_restore
 from idtrackerai_validator_server.qc import register_qc
 from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
@@ -115,6 +116,7 @@ register_metadata_sync(app)
 register_validation_csv(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_cvat(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_data_management(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+register_restore(app)
 
 
 def _qc_state():
