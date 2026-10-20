@@ -52,6 +52,7 @@ from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
 from idtrackerai_validator_server.data_management import register_data_management
+from idtrackerai_validator_server.qc import register_qc
 from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
@@ -114,6 +115,17 @@ register_metadata_sync(app)
 register_validation_csv(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_cvat(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_data_management(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+
+
+def _qc_state():
+    if db_manager is None:
+        return None
+    return {"experiment": SELECTED_EXPERIMENT, "dbfile": db_manager.dbfile,
+            "table": db_manager.tables["IDENTITY"].__tablename__,
+            "n_animals": NUMBER_OF_ANIMALS, "chunksize": int(CHUNKSIZE), "framerate": float(FRAMERATE)}
+
+
+register_qc(app, get_state=_qc_state)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
