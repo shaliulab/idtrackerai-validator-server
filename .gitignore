@@ -7,3 +7,4 @@ pe_bouts
 build/
 *whl
 *tar.gz
+*pyc
