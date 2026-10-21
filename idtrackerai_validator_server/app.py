@@ -27,7 +27,6 @@ from flyhostel.utils import (
     get_square_width,
     get_square_height,    
 )
-from flyhostel.utils.pose_export import recreate_pose_file, get_pose_file_path
 
 
 from idtrackerai_validator_server.constants import (
@@ -55,6 +54,7 @@ from idtrackerai_validator_server.data_management import register_data_managemen
 from idtrackerai_validator_server.restore import register_restore
 from idtrackerai_validator_server.dropbox_files import register_dropbox_files
 from idtrackerai_validator_server.qc import register_qc
+from idtrackerai_validator_server.pose import register_pose, get_h5_file, close_h5_files
 from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
@@ -130,6 +130,26 @@ def _qc_state():
 
 
 register_qc(app, get_state=_qc_state)
+
+
+def _fly_centroid(frame_number, identity):
+    """(x, y) of the fly with that identity at that frame (with 1 fly, its only row)."""
+    tables = db_manager.tables
+    rows = tables["ROI_0"].query.filter_by(frame_number=frame_number).all()
+    if NUMBER_OF_ANIMALS == 1:
+        return (rows[0].x, rows[0].y) if rows else None
+    ids = {r.in_frame_index: r.identity for r in tables["IDENTITY"].query.filter_by(frame_number=frame_number).all()}
+    return next(((r.x, r.y) for r in rows if ids.get(r.in_frame_index) == identity), None)
+
+
+def _pose_state():
+    if db_manager is None:
+        return None
+    return {"experiment": SELECTED_EXPERIMENT, "chunksize": int(CHUNKSIZE), "framerate": float(FRAMERATE),
+            "centroid": _fly_centroid}
+
+
+register_pose(app, get_state=_pose_state)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
@@ -229,10 +249,6 @@ CONTOURS_CACHE_SIZE = 500
 _contours_cache = OrderedDict()
 _contours_lock = Lock()
 
-# H5 file handle cache
-_h5_file_cache = {}
-_h5_cache_lock = Lock()
-
 # Bodypart indices to keep (figure this out from step 1)
 BODYPARTS_TO_IGNORE = [12, 13, 14, 15, 16, 17]  # ← UPDATE THIS
 BODYPARTS_TO_KEEP = [i for i in range(18) if i not in BODYPARTS_TO_IGNORE]
@@ -253,51 +269,6 @@ BODYPART_NAMES = {
     11: 'rW',
     
 }
-
-def get_h5_file(fly_id_str, experiment):
-    """Get or open H5 file with caching. The file is in the experiment's basedir
-    (<basedir>/motionmapper/NN/pose_raw/<experiment>__NN/), recreated when missing
-    or unreadable; None (cached, not retried) if that fails too."""
-    experiment = to_flat(experiment)
-    cache_key = f"{experiment}__{fly_id_str}"
-
-    with _h5_cache_lock:
-        if cache_key in _h5_file_cache:
-            return _h5_file_cache[cache_key]
-
-        pose_file = get_pose_file_path(experiment, int(fly_id_str), "raw")
-        # recreate_pose_file writes <output>/<experiment>__NN/<experiment>__NN.h5
-        folder = os.path.dirname(os.path.dirname(pose_file))
-        f = None
-        try:
-            if not Path(pose_file).exists():
-                logger.info("%s not found, recreating it", pose_file)
-                recreate_pose_file(experiment, int(fly_id_str), output=folder)
-            try:
-                f = h5py.File(pose_file, 'r')
-            except OSError as e:
-                logger.warning("Failed to open pose file %s: %s. Recreating it", pose_file, e)
-                os.remove(pose_file)
-                recreate_pose_file(experiment, int(fly_id_str), output=folder)
-                f = h5py.File(pose_file, 'r')
-            logger.debug("Opened pose file: %s", pose_file)
-        except Exception as e:
-            logger.error("No pose for %s: %s", cache_key, e)
-        _h5_file_cache[cache_key] = f
-        return f
-
-
-def close_h5_files():
-    """Close all cached H5 file handles"""
-    with _h5_cache_lock:
-        for f in _h5_file_cache.values():
-            try:
-                if f is not None:
-                    f.close()
-            except:
-                pass
-        _h5_file_cache.clear()
-
 
 def get_pose_from_h5(fly_id_str, frame_number, experiment, chunksize):
     """
