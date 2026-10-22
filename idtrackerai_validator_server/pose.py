@@ -18,7 +18,10 @@ every part found with full confidence (SLEAP's peaks can exceed 1 a little).
                                             none or its pose file changed) and its job
     POST /api/pose/qc                       start that job (one item per fly)
     GET  /api/pose/flies                    flies of the loaded experiment, `available`
-                                            = pose file exists
+                                            = pose file exists, `compiled_at` its mtime
+    POST /api/pose/<fly>/recompile          job compiling the fly's pose file again from
+                                            the chunks' .predictions.h5 (after the pose
+                                            pipeline ran again)
     GET  /api/pose/<fly>/frame/<n>          body parts (absolute x, y, confidence) and
                                             scores of the fly at frame n
     GET  /api/pose/<fly>/trace?start=&end=  per-frame parts detected, mean confidence
@@ -31,6 +34,7 @@ CACHE_VERSION are unchanged).
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from threading import Lock
@@ -61,6 +65,7 @@ H5_CACHE_BYTES = 64 * 1024 ** 2
 
 _cache = {}                 # pose file -> result
 _running = {}               # experiment -> job id
+_recompiling = {}           # fly -> job id
 _lock = Lock()
 
 # Open pose files of the loaded experiment: <experiment>__NN -> h5py.File (None: no pose)
@@ -103,6 +108,28 @@ def get_h5_file(fly_id_str, experiment):
             logger.error("No pose for %s: %s", cache_key, e)
         _h5_file_cache[cache_key] = f
         return f
+
+
+def recompile_pose_file(experiment, fly_id_str):
+    """Compile the fly's pose file again, next to the current one, then swap it in:
+    the current one stays readable until the new one is complete."""
+    experiment = to_flat(experiment)
+    pose_file = pose_path(experiment, fly_id_str)
+    folder = os.path.dirname(os.path.dirname(pose_file))
+    tmp = os.path.join(folder, f".recompile-{fly_id_str}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        recreate_pose_file(experiment, int(fly_id_str), output=tmp)
+        new_file = os.path.join(tmp, os.path.basename(os.path.dirname(pose_file)), os.path.basename(pose_file))
+        with _h5_cache_lock:
+            f = _h5_file_cache.pop(f"{experiment}__{fly_id_str}", None)
+            if f is not None:
+                f.close()
+            os.makedirs(os.path.dirname(pose_file), exist_ok=True)
+            os.replace(new_file, pose_file)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return pose_file
 
 
 def close_h5_files():
@@ -343,8 +370,33 @@ def register_pose(app, get_state):
         state = get_state()
         if state is None:
             return jsonify([])
-        return jsonify([{"fly": fly, "identity": int(nn), "available": os.path.exists(pose_path(state["experiment"], nn))}
+        return jsonify([{"fly": fly, "identity": int(nn), "available": os.path.exists(pose_path(state["experiment"], nn)),
+                         "compiled_at": _mtime(pose_path(state["experiment"], nn))}
                         for fly, nn in _flies(state["experiment"])])
+
+    @app.route("/api/pose/<fly>/recompile", methods=["POST"])
+    def recompile(fly):
+        state, nn = fly_of(fly)
+        if nn is None:
+            return jsonify({"error": f"Not a fly of the loaded experiment: {fly}"}), 404
+        with _lock:
+            job = _jobs.get(_recompiling.get(fly, ""))
+            if job is not None and job.status == "running":
+                return jsonify(job.to_dict())
+
+            def work(job):
+                job.update(0, status="running")
+                try:
+                    recompile_pose_file(state["experiment"], nn)
+                except Exception as error:
+                    job.update(0, status="failed", error=str(error))
+                    raise
+                job.update(0, status="done", progress=1.0)
+
+            # compiling takes minutes (every chunk's .predictions.h5 is read)
+            job = start_job(f"Recompile pose {fly}", [fly], work)
+            _recompiling[fly] = job.id
+        return jsonify(job.to_dict())
 
     @app.route("/api/pose/qc", methods=["GET"])
     def get_pose_qc():
