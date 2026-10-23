@@ -55,6 +55,7 @@ from idtrackerai_validator_server.restore import register_restore
 from idtrackerai_validator_server.dropbox_files import register_dropbox_files
 from idtrackerai_validator_server.qc import register_qc
 from idtrackerai_validator_server.pose import register_pose, get_h5_file, close_h5_files
+from idtrackerai_validator_server.monitor import register_monitor
 from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
@@ -119,6 +120,7 @@ register_cvat(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_data_management(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_restore(app)
 register_dropbox_files(app)
+register_monitor(app)
 
 
 def _qc_state():
