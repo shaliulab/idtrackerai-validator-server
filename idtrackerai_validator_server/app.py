@@ -45,6 +45,7 @@ from idtrackerai_validator_server.backend import (
 )
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
+from idtrackerai_validator_server.deg_labels import register_deg_labels
 from idtrackerai_validator_server.jobs import register_jobs
 from idtrackerai_validator_server.overview import register_overview, scan_not_analyzed, sheet_flies
 from idtrackerai_validator_server.metadata_sync import register_metadata_sync
@@ -112,6 +113,7 @@ CORS(app)
 
 register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+register_deg_labels(app)
 register_jobs(app)
 register_overview(app)
 register_metadata_sync(app)
