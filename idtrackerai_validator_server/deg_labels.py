@@ -18,8 +18,9 @@ seconds [start, end) writes the `framerate` rows of each of them. A label is one
 PRESETS (the RF classes, as flyhostel.data.deg.apply_semantic_rules reads them back) or
 any set of the project's columns; the given columns are set to 1, the others to 0.
 Clearing sets the rows back to -1. Missing folders and label files are made with
-deepethogram (deg_add_video.py, run with $DEG_PYTHON). Every write is logged to
-$DEG_LABELS_LOG.
+deepethogram (deg_add_video.py, run with $DEG_PYTHON, ~30 s each): a write that needs
+one runs as a job (one item per new folder, progress in the console). Every write is
+logged to $DEG_LABELS_LOG.
 """
 import json
 import logging
@@ -37,24 +38,26 @@ from flask import jsonify, request
 from flyhostel.utils import get_basedir, get_local_identities_from_experiment
 
 from idtrackerai_validator_server.ethogram import FLY_PATTERN, _properties, track
+from idtrackerai_validator_server.jobs import start_job
 
 logger = logging.getLogger(__name__)
 
 DEG_ROOT = os.path.join(os.environ.get("DEG_PROJECTS", "/flyhostel_data/fiftyone/FlyBehaviors"), "DEG")
 DEG_PYTHON = os.environ.get("DEG_PYTHON", os.path.expanduser("~/mambaforge/envs/rapids-23.04/bin/python"))
 ADD_VIDEO_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deg_add_video.py")
+PROGRESS_MARKER = "@@PROGRESS "   # deg_add_video.MARKER (the script must not be imported here)
 LOG_PATH = os.environ.get("DEG_LABELS_LOG", os.path.expanduser("~/.cache/idtrackerai-validator/deg_labels.jsonl"))
 # Longest range labelled at once (s): every chunk it touches may need a new video folder (~5 s each)
 MAX_RANGE = 3600
 
-# RF class -> DEG columns set to 1
+# RF class -> DEG columns set to 1, in the order of the client's keys 1, 2, ...
 PRESETS = {
-    "inactive": ["inactive"],
-    "inactive+micromovement": ["inactive", "micromovement"],
-    "inactive+pe": ["inactive", "pe"],
-    "feed": ["feed"],
-    "groom": ["groom"],
     "walk": ["walk"],
+    "groom": ["groom"],
+    "feed": ["feed"],
+    "inactive+micromovement": ["inactive", "micromovement"],
+    "inactive": ["inactive"],
+    "inactive+pe": ["inactive", "pe"],
     "background": ["background"],
 }
 # codes of the label track: PRESETS, then any other combination, then seconds whose frames disagree
@@ -188,17 +191,48 @@ def label_runs(fly):
     return runs, len(files)
 
 
-def ensure_label_file(fly, chunk):
-    """Labels file of the fly's chunk, with its video folder made by deepethogram if missing.
-    Returns (path, created)."""
+def _chunk_label_file(fly, chunk):
+    """(key, labels path, local identity) of the fly's chunk; the file may not exist yet."""
     experiment, identity = fly.split("__")
     props = _properties(fly)
     local_identity = _local_identities(experiment, chunk, props["chunksize"]).get(int(identity))
     if local_identity is None:
         raise ValueError(f"{fly} has no local identity in chunk {chunk}")
-    project = project_dir(fly)
     key = _folder_key(experiment, chunk, local_identity)
-    path = _labels_path(project, key, chunk)
+    return key, _labels_path(project_dir(fly), key, chunk), local_identity
+
+
+def _frame_range(fly, start, end):
+    """Frames [first, last) of the movie seconds [start, end)."""
+    props = _properties(fly)
+    if props["first_chunk"] is None:
+        raise ValueError(f"Cannot place frames in the movie of {fly}: no feather file")
+    origin = props["first_chunk"] * props["chunksize"]
+    return origin + int(round(start * props["framerate"])), origin + int(round(end * props["framerate"]))
+
+
+def _chunks(fly, start, end):
+    first, last = _frame_range(fly, start, end)
+    chunksize = _properties(fly)["chunksize"]
+    return range(first // chunksize, (last - 1) // chunksize + 1)
+
+
+def missing_folders(fly, start, end):
+    """(chunk, key) of the chunks of [start, end) whose labels file has to be made first."""
+    missing = []
+    for chunk in _chunks(fly, start, end):
+        key, path, _ = _chunk_label_file(fly, chunk)
+        if not os.path.exists(path):
+            missing.append((chunk, key))
+    return missing
+
+
+def ensure_label_file(fly, chunk, on_progress=None):
+    """Labels file of the fly's chunk, with its video folder made by deepethogram if missing.
+    on_progress(fraction) is called while it is made. Returns (path, created)."""
+    experiment = fly.split("__")[0]
+    project = project_dir(fly)
+    key, path, local_identity = _chunk_label_file(fly, chunk)
     if os.path.exists(path):
         return path, False
 
@@ -207,28 +241,39 @@ def ensure_label_file(fly, chunk):
     if not os.path.exists(video):
         raise FileNotFoundError(f"No single-animal video of {fly} in chunk {chunk}: {video}")
     logger.info("Adding %s to %s", video, project)
+    process = subprocess.Popen([DEG_PYTHON, ADD_VIDEO_SCRIPT, project, video, key], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # stderr is drained by a thread so that a chatty deepethogram cannot block stdout
+    stderr = []
+    reader = threading.Thread(target=lambda: stderr.extend(process.stderr), daemon=True)
+    reader.start()
+    timer = threading.Timer(600, process.kill)
+    timer.start()
+    last = None
     try:
-        result = subprocess.run([DEG_PYTHON, ADD_VIDEO_SCRIPT, project, video, key], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, timeout=600)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"deepethogram took too long to add {video}")
-    if result.returncode != 0:
-        tail = "\n".join(result.stderr.strip().splitlines()[-5:])
-        raise RuntimeError(f"deepethogram could not add {video}: {tail}")
-    out = json.loads(result.stdout.strip().splitlines()[-1])
+        for line in process.stdout:
+            if line.startswith(PROGRESS_MARKER):
+                if on_progress:
+                    on_progress(float(line[len(PROGRESS_MARKER):]))
+            elif line.strip():
+                last = line
+        process.wait()
+    finally:
+        timer.cancel()
+    reader.join(5)
+    if process.returncode != 0:
+        tail = "".join(stderr[-5:]).strip()
+        raise RuntimeError(f"deepethogram could not add {video}: {tail or f'exit code {process.returncode}'}")
+    out = json.loads(last)
     return out["labels"], out["created"]
 
 
 def write_labels(fly, start, end, behaviors):
     """Label the movie seconds [start, end) with `behaviors` (DEG columns set to 1, the
-    others 0), or clear them (-1) when behaviors is None. Returns one dict per file written."""
-    props = _properties(fly)
-    if props["first_chunk"] is None:
-        raise ValueError(f"Cannot place frames in the movie of {fly}: no feather file")
-    chunksize, framerate = props["chunksize"], props["framerate"]
-    origin = props["first_chunk"] * chunksize
-    first = origin + int(round(start * framerate))
-    last = origin + int(round(end * framerate))     # exclusive
+    others 0), or clear them (-1) when behaviors is None; clearing makes no new folder.
+    Returns one dict per file written."""
+    chunksize = _properties(fly)["chunksize"]
+    first, last = _frame_range(fly, start, end)
 
     project = project_dir(fly)
     columns = class_names(project)
@@ -238,10 +283,12 @@ def write_labels(fly, start, end, behaviors):
             raise ValueError(f"Unknown behaviors {unknown}: the project's are {columns}" if unknown else "No behavior given")
 
     written = []
-    for chunk in range(first // chunksize, (last - 1) // chunksize + 1):
+    for chunk in _chunks(fly, start, end):
         a = max(first, chunk * chunksize) - chunk * chunksize
         b = min(last, (chunk + 1) * chunksize) - chunk * chunksize
         with _lock((fly, chunk)):
+            if behaviors is None and not os.path.exists(_chunk_label_file(fly, chunk)[1]):
+                continue   # nothing labelled there
             path, created = ensure_label_file(fly, chunk)
             df = pd.read_csv(path, index_col=0)
             missing = [c for c in (behaviors or []) if c not in df.columns]
@@ -287,6 +334,22 @@ def register_deg_labels(app):
             "runs": runs,
         }
 
+    def _write_job(fly, start, end, behaviors, missing):
+        """Make the missing folders (one job item each, ~30 s), then write: 202 + the job,
+        whose result is the response of a write without new folders."""
+        def work(job):
+            for i, (chunk, key) in enumerate(missing):
+                job.update(i, status="running")
+                with _lock((fly, chunk)):
+                    ensure_label_file(fly, chunk, on_progress=lambda p, i=i: job.update(i, progress=p))
+                job.update(i, status="done", progress=1.0)
+            written = write_labels(fly, start, end, behaviors)
+            job.result = {**_payload(fly), "written": written}
+
+        names = [f"DEG video {key}" for _, key in missing]
+        job = start_job(f"{fly}: DEG video{'s' if len(missing) > 1 else ''} for labelling", names, work)
+        return jsonify(job.to_dict()), 202
+
     @app.route("/api/ethogram/<fly>/deg_labels", methods=["GET"])
     def deg_labels_get(fly):
         """The fly's DEG labels as runs of movie seconds ([start, end, index in classes])."""
@@ -319,6 +382,9 @@ def register_deg_labels(app):
         if end > n:
             return jsonify({"error": f"The ethogram of {fly} ends at {n} s"}), 400
         try:
+            missing = missing_folders(fly, start, end) if behaviors is not None else []
+            if missing:
+                return _write_job(fly, start, end, behaviors, missing)
             written = write_labels(fly, start, end, behaviors)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 400

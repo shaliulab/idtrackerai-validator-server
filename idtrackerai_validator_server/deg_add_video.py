@@ -16,7 +16,9 @@ add_video_to_project would rewrite the whole config with the paths of this machi
 Then makes <chunk>_labels.csv if missing: one row per frame of the video, one column
 per class of the project, all -1 (not labelled), and lists it in record.yaml.
 Today's index_<date>.pkl (the shaliulab fork's cache of the records) is removed so the
-GUI sees the new folder. Prints {"folder", "labels", "created", "frames"} as JSON.
+GUI sees the new folder. Prints @@PROGRESS <fraction> lines while it works (the video
+statistics are most of the time, ~30 s), then {"folder", "labels", "created", "frames"}
+as JSON.
 """
 import datetime
 import json
@@ -26,9 +28,27 @@ import sys
 
 import numpy as np
 import pandas as pd
-from deepethogram import projects, utils
+from deepethogram import projects, utils, zscore
 from deepethogram.file_io import VideoReader
 from deepethogram.zscore import get_video_statistics
+
+MARKER = "@@PROGRESS "
+
+
+def progress(fraction):
+    print(f"{MARKER}{fraction:.3f}", flush=True)
+
+
+def _reporting(iterable, *args, **kwargs):
+    """Stands in for the tqdm of get_video_statistics: its frames are 5–95 % of the work."""
+    items = list(iterable)
+    for i, item in enumerate(items):
+        if i % 20 == 0:
+            progress(0.05 + 0.9 * i / max(1, len(items)))
+        yield item
+
+
+zscore.tqdm = _reporting
 
 
 def main(project_dir, video, key):
@@ -45,6 +65,7 @@ def main(project_dir, video, key):
         shutil.rmtree(partial, ignore_errors=True)
         os.makedirs(partial)
         shutil.copy(video, os.path.join(partial, basename))
+        progress(0.05)
         utils.save_dict_to_yaml(
             {"normalization": get_video_statistics(os.path.join(partial, basename), 10)},
             os.path.join(partial, "stats.yaml"),
@@ -67,6 +88,7 @@ def main(project_dir, video, key):
         if os.path.exists(cache):
             os.remove(cache)
 
+    progress(1.0)
     print(json.dumps({"folder": folder, "labels": labels, "created": created, "frames": frames}))
 
 
