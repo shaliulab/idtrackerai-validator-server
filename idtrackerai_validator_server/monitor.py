@@ -166,6 +166,46 @@ def _process_start(pid):
         return None
 
 
+# outputs of a fly in behavior_prediction, in the order the pipeline makes them
+# (relative to the basedir; {e} experiment, {i} identity, {f} fly = {e}__{i})
+FLY_OUTPUTS = [
+    ("pose", "motionmapper/{i}/pose_raw/{f}/{f}.h5", "compiled pose (Pose tab)"),
+    ("movie", "motionmapper/{i}/movie/movie.m3u8", "movie of the fly (Ethograms tab)"),
+    ("pe", "flyhostel/proboscis_extensions/{f}_traces.feather", "proboscis extension traces (PE tab)"),
+    ("behavior", "motionmapper/{i}/{f}.feather", "behavior predictions (Ethograms tab)"),
+    ("sleep", "sleep/{i}/{f}_sleep5min.feather", "sleep"),
+    ("ethogram", "motionmapper/{i}/{f}.json", "ethogram figure, published last"),
+]
+
+
+def fly_outputs(basedir, experiment, identity, since):
+    """Outputs of a fly: stage -> {mtime, new} (new: written after `since`), None if missing,
+    and its state: done (ethogram figure and sleep new), explorable (behavior predictions new:
+    the Ethograms tab works), pending."""
+    fly = f"{experiment}__{identity}"
+    outputs = {}
+    for stage, pattern, _ in FLY_OUTPUTS:
+        try:
+            mtime = os.path.getmtime(os.path.join(basedir, pattern.format(e=experiment, i=identity, f=fly)))
+        except OSError:
+            outputs[stage] = None
+            continue
+        outputs[stage] = {"mtime": mtime, "new": since is not None and mtime >= since}
+    new = {stage for stage, o in outputs.items() if o and o["new"]}
+    state = "done" if {"ethogram", "sleep"} <= new else "explorable" if "behavior" in new else "pending"
+    return {"fly": fly, "outputs": outputs, "state": state}
+
+
+def _batch_time(batch):
+    """Launch time of a batch from its stamp (date, or date_HH-MM)."""
+    for fmt in ("%Y-%m-%d_%H-%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(batch, fmt).timestamp()
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def queue_runner(folder):
     """run_queue.sh processes running in this folder, and the end of run_queue.log."""
     script = os.path.join(folder, "run_queue.sh")
@@ -352,6 +392,22 @@ def pipeline_status(spec):
             batches.setdefault(r["mark"], []).append(r)
     recent = [{"batch": b, "rows": _rows_public(batches[b]), "completed": completed(b)}
               for b in sorted(batches, reverse=True)[:RECENT_BATCHES]]
+
+    # per fly: what is on disk, compared with the start of its batch
+    if spec["identity"] is not None:
+        def annotate(public_rows, since):
+            for r in public_rows:
+                if r["identity"]:
+                    r.update(fly_outputs(r["basedir"], r["experiment"], r["identity"], since))
+        in_run_public = _rows_public(in_run)
+        annotate(in_run_public, run["started"] if run and run["pid"] else None)
+        for b in recent:
+            since = run["started"] if run and run["pid"] and b["batch"] == run["batch"] else _batch_time(b["batch"])
+            annotate(b["rows"], since)
+        queued_public = _rows_public(queued)
+        annotate(queued_public, None)
+    else:
+        in_run_public, queued_public = _rows_public(in_run), _rows_public(queued)
     if run is not None and run.get("batch"):
         run["completed"] = completed(run["batch"])
 
@@ -364,8 +420,10 @@ def pipeline_status(spec):
         "running": bool(runs),
         "runs": [{k: r[k] for k in ("pid", "args", "batch", "started")} for r in runs],
         "run": run,
-        "in_run": _rows_public(in_run),
-        "queued": _rows_public(queued),
+        "in_run": in_run_public,
+        "queued": queued_public,
+        "fly_outputs": [{"stage": stage, "path": pattern, "description": d} for stage, pattern, d in FLY_OUTPUTS]
+        if spec["identity"] is not None else None,
         "recent_batches": recent,
     }
 
