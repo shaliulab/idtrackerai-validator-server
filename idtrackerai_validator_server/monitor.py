@@ -561,7 +561,9 @@ def pipeline_status(spec):
             (k or ""): {"summary": _summary(ts),
                         "processes": [{"process": p, **_summary([t for t in ts if t["process"] == p])}
                                       for p in dict.fromkeys(t["process"] for t in ts)],
-                        "failed": [t["name"] for t in ts if t["status"] == "failed"][:20]}
+                        "failed": [{"name": t["name"], "process": t["process"], "exit": t["exit"],
+                                    "work_dir": t.get("work_dir")}
+                                   for t in ts if t["status"] == "failed"][:20]}
             for k, ts in per_experiment.items()
         }
         run["failed_tasks"] = [{"name": t["name"], "exit": t["exit"], "work_dir": t.get("work_dir")}
