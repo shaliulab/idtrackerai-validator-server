@@ -173,7 +173,18 @@ def check_metadata(experiment, rows, columns):
             add("error" if info["animals"] > 1 else "warning", f"identity missing in {missing} row(s)")
         if duplicated:
             add("error", f"identity repeated: {', '.join(duplicated)}")
-        if not missing and not duplicated:
+        # idtrackerai's identities: 0 for a fly alone, 1..N in a group
+        expected = {0} if info["animals"] == 1 else set(range(1, info["animals"] + 1)) if info["animals"] else None
+        try:
+            numbers = {int(float(i)) for i in present}
+        except ValueError:
+            numbers = None
+        unexpected = expected is not None and not missing and not duplicated and numbers != expected
+        if unexpected:
+            add("error", f"identities {', '.join(sorted(present, key=lambda v: (len(v), v)))} "
+                         f"(expected {', '.join(map(str, sorted(expected)))} for {info['animals']} "
+                         f"animal{'s' if info['animals'] > 1 else ''})")
+        elif not missing and not duplicated:
             add("ok", f"identities {', '.join(sorted(present, key=lambda v: (len(v), v)))}")
 
     no_genotype = sum(r.get("genotype") is None for r in rows)

@@ -20,7 +20,19 @@ Its tasks come from the folder's .nextflow.log (Submitted / Cached process, Task
 completed lines, parsed again when the file changes) and each task is attributed to
 an experiment of the run by the longest experiment name or basedir found in its
 .command.sh (cached per work dir: they do not change).
+
+Relaunching failed tasks (pipelines with a queue): the profiles use errorStrategy
+"ignore", so a run ends OK even when tasks failed, and their fly / experiment stops
+there. `relaunch` gathers, over the rotated logs (.nextflow.log, .nextflow.log.1, ...),
+the latest run of every batch with failed tasks whose rows still hold that batch (a row
+re-queued gets a new stamp), with the end of each task's .command.err, and two ways of
+running them again, both resuming the nextflow session so completed tasks are cached:
+re-queue the rows (mark them 1 again: run_queue.sh takes them in its next round, as a
+new batch; POST /api/monitor/<pipeline>/requeue does it, `requeue` is the same as a
+shell command) or run the batch again by hand with -resume <session> (not started from
+here: a run started by the server would die with it).
 """
+import shlex
 import os
 import re
 import csv
@@ -30,7 +42,10 @@ import logging
 import datetime
 import threading
 
-from flask import jsonify
+import fcntl
+import signal
+
+from flask import jsonify, request
 
 from idtrackerai_validator_server.experiments import to_flat
 
@@ -85,7 +100,8 @@ def parse_log(path):
         return cached[2]
 
     year = datetime.datetime.fromtimestamp(stat.st_mtime).year
-    run = {"command": None, "run_name": None, "work_dir": None, "started": None, "ended": None, "last_line": None}
+    run = {"command": None, "run_name": None, "session": None, "work_dir": None, "started": None, "ended": None,
+           "last_line": None}
     tasks = {}      # hash -> task
     by_name = {}    # name -> hash (the last submission of a name: retries reuse it)
     last = ""
@@ -116,6 +132,8 @@ def parse_log(path):
                 if match:
                     run["command"] = match.group(1).strip()
                     run["started"] = _log_time(line, year)
+            elif "Session UUID:" in line and run["session"] is None:
+                run["session"] = line.rsplit("Session UUID:", 1)[1].strip()
             elif "Run name:" in line and run["run_name"] is None:
                 run["run_name"] = line.rsplit("Run name:", 1)[1].strip()
             elif "Work-dir:" in line and run["work_dir"] is None:
@@ -225,12 +243,35 @@ def queue_runner(folder):
             continue
         pids.append(int(pid))
     log_path = os.path.join(folder, "run_queue.log")
+    sleeping = _queue_sleep(pids)
     lines, log_mtime = [], None
     if os.path.exists(log_path):
         with open(log_path, errors="replace") as fh:
             lines = [l.rstrip("\n") for l in fh.readlines()[-QUEUE_LOG_LINES:]]
         log_mtime = os.path.getmtime(log_path)
-    return {"pids": pids, "log": lines, "log_mtime": log_mtime}
+    return {"pids": pids, "log": lines, "log_mtime": log_mtime,
+            # polling: when run_queue.sh looks at the CSV again (null while it waits for a run)
+            "next_check": sleeping["until"] if sleeping else None}
+
+
+def _queue_sleep(runner_pids):
+    """The `sleep N` run_queue.sh polls with (a child of one of runner_pids): pid and when it ends."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+            if ppid not in runner_pids:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = [a for a in fh.read().decode(errors="replace").split("\0") if a]
+        except (OSError, ValueError, IndexError):
+            continue
+        if len(argv) == 2 and os.path.basename(argv[0]) == "sleep" and argv[1].isdigit():
+            started = _process_start(pid)
+            return {"pid": int(pid), "until": started + int(argv[1]) if started else None}
+    return None
 
 
 def _experiment_name(spec, row):
@@ -288,6 +329,163 @@ def _attribute(task, work_root, candidates):
     with _cache_lock:
         _task_experiment[work_dir] = key
     return key
+
+
+# lines of a failed task's .command.err kept
+ERROR_LINES = 15
+# a run's failed tasks listed in `relaunch`
+MAX_FAILED = 100
+IDENTITY_RE = re.compile(r"--identity[ =]+(\S+)")
+EXCEPTION_RE = re.compile(r"^(\w+\.)*\w*(Error|Exception|Interrupt)\b")
+FRAME_RE = re.compile(r'^\s*File "([^"]+)", line \d+')
+SAFE_RE = re.compile(r"^[\w.\-]+$")
+_task_details = {}      # work dir -> {"identity", "error"}
+
+
+def _task_details_of(work_dir):
+    """Identity in a finished task's .command.sh (--identity) and the end of its .command.err
+    (else .command.log), cached: a finished task's files do not change."""
+    with _cache_lock:
+        if work_dir in _task_details:
+            return _task_details[work_dir]
+    details = {"identity": None, "error": [], "exception": None, "where": None}
+    try:
+        with open(os.path.join(work_dir, ".command.sh"), errors="replace") as fh:
+            match = IDENTITY_RE.search(fh.read())
+            details["identity"] = match.group(1).strip("'\"") if match else None
+    except OSError:
+        pass
+    for name in (".command.err", ".command.log"):
+        try:
+            with open(os.path.join(work_dir, name), errors="replace") as fh:
+                lines = [l.rstrip() for l in fh.readlines()[-200:] if l.strip()]
+        except OSError:
+            continue
+        if lines:
+            details["error"] = lines[-ERROR_LINES:]
+            # the exception raised, and the deepest frame outside site-packages (where to look)
+            # with the lines after it: multi-line messages (ethoscopy names the flies at fault there)
+            k = next((k for k in range(len(lines) - 1, -1, -1) if EXCEPTION_RE.match(lines[k].strip())), None)
+            details["exception"] = "\n".join(l.rstrip() for l in lines[k:k + 6]) if k is not None else None
+            for i in range(len(lines) - 1, -1, -1):
+                match = FRAME_RE.match(lines[i])
+                if match and "site-packages" not in match.group(1):
+                    details["where"] = [lines[i].strip()] + ([lines[i + 1].strip()] if i + 1 < len(lines) else [])
+                    break
+            break
+    with _cache_lock:
+        _task_details[work_dir] = details
+    return details
+
+
+def _resume_args(command, session):
+    """The run's nextflow arguments with -resume <session> (in place of a bare -resume)."""
+    args = shlex.split(command)
+    if args and args[0] == "nextflow":
+        args = args[1:]
+    if "-resume" in args:
+        i = args.index("-resume")
+        if i + 1 < len(args) and not args[i + 1].startswith("-"):
+            args[i + 1] = session
+        else:
+            args.insert(i + 1, session)
+    else:
+        args += ["-resume", session]
+    return args
+
+
+def relaunch_info(spec, folder, rows, live):
+    """Failed tasks still to be finished, per batch, and the commands to run them again."""
+    logs = sorted(glob.glob(os.path.join(folder, ".nextflow.log*")),
+                  key=lambda p: int(p.rsplit(".", 1)[1]) if p.rsplit(".", 1)[1].isdigit() else 0)
+    latest = {}     # batch -> parsed log of its latest run
+    for path in logs:
+        try:
+            parsed = parse_log(path)
+        except OSError:
+            continue
+        command = parsed["run"]["command"]
+        if not command or "-preview" in command.split():
+            continue
+        args = command.split()
+        batch = args[args.index("--batch") + 1] if "--batch" in args[:-1] else None
+        if batch is None or batch == "1":
+            continue    # its rows cannot be told apart any more
+        if batch not in latest or (parsed["run"]["started"] or 0) > (latest[batch]["run"]["started"] or 0):
+            latest[batch] = parsed
+
+    per_fly = spec["identity"] is not None
+    batches = []
+    for batch, parsed in sorted(latest.items(), reverse=True):
+        failed = [t for t in parsed["tasks"] if t["status"] == "failed"]
+        if not failed:
+            continue
+        # a run still going on: its failures are shown by the run itself
+        if live and live.get("batch") == batch:
+            continue
+        members = [r for r in rows if r["mark"] == batch]
+        if not members:
+            continue    # every row of the batch was re-queued since
+        candidates = []
+        for r in members:
+            candidates += [(r["experiment"], r["experiment"]), (r["basedir"].rstrip("/"), r["experiment"])]
+        work_root = parsed["run"]["work_dir"]
+        if work_root and not os.path.isabs(work_root):
+            work_root = os.path.join(folder, work_root)
+        tasks, flies = [], {}
+        for t in failed[:MAX_FAILED]:
+            experiment = _attribute(t, work_root, candidates)
+            details = _task_details_of(t["work_dir"]) if t.get("work_dir") else \
+                {"identity": None, "error": [], "exception": None, "where": None}
+            identity = details["identity"] if per_fly else None
+            # the rows the task belongs to
+            targets = [r for r in members if r["experiment"] == experiment
+                       and (identity is None or r["identity"] == identity)] if experiment else []
+            for r in targets:
+                key = (r["experiment"], r["identity"])
+                flies.setdefault(key, {"experiment": r["experiment"], "identity": r["identity"], "line": r["line"],
+                                       "tasks": []})["tasks"].append(t["name"])
+            tasks.append({"name": t["name"], "process": t["process"], "exit": t["exit"], "work_dir": t.get("work_dir"),
+                          "experiment": experiment, "identity": identity, "error": details["error"],
+                          "exception": details["exception"], "where": details["where"]})
+        if not flies:
+            continue
+        errors = {t["exception"] or t["error"][-1] for t in tasks if t["error"]}
+        batches.append({
+            "batch": batch,
+            "run_name": parsed["run"]["run_name"],
+            "session": parsed["run"]["session"],
+            "started": parsed["run"]["started"],
+            "ended": parsed["run"]["ended"],
+            "n_failed": len(failed),
+            "tasks": tasks,
+            "flies": sorted(flies.values(), key=lambda f: (f["experiment"], f["identity"] or "")),
+            # every failure ends with the same line: probably one cause, a rerun alone will not help
+            "same_error": next(iter(errors)) if len(errors) == 1 and len(tasks) > 1 else None,
+            "command": (f"cd {shlex.quote(folder)} && nohup nextflow "
+                        f"{shlex.join(_resume_args(parsed['run']['command'], parsed['run']['session']))}"
+                        f" > nextflow_run_{batch}_retry.out 2>&1 &") if parsed["run"]["session"] else None,
+        })
+
+    flies = [f for b in batches for f in b["flies"]]
+    requeue = None
+    if flies and all(SAFE_RE.match(f["experiment"]) and (f["identity"] is None or SAFE_RE.match(f["identity"]))
+                     for f in flies):
+        e, m = spec["experiment"] + 1 if spec["experiment"] is not None else None, spec["mark"] + 1
+        conditions = []
+        for b in batches:
+            for f in b["flies"]:
+                c = [f'x=="{b["batch"]}"']
+                c.append(f'${e}=="{f["experiment"]}"' if e else f'NR=={f["line"]}')
+                if per_fly and f["identity"] is not None:
+                    c.append(f'${spec["identity"] + 1}=="{f["identity"]}"')
+                conditions.append("(" + " && ".join(c) + ")")
+        program = f'{{x=${m}; gsub(/ /, "", x)}} {" || ".join(conditions)} {{${m}=1}} 1'
+        csv_name = spec["csv"]
+        # as run_queue.sh: under flock, written in place
+        requeue = (f"cd {shlex.quote(folder)} && ( flock 9; awk -F, -v OFS=, {shlex.quote(program)} {csv_name}"
+                   f" > {csv_name}.tmp && cat {csv_name}.tmp > {csv_name} && rm {csv_name}.tmp ) 9>>{csv_name}")
+    return {"batches": batches, "requeue": requeue, "live": bool(live)} if batches else None
 
 
 def _summary(tasks):
@@ -410,6 +608,8 @@ def pipeline_status(spec):
         in_run_public, queued_public = _rows_public(in_run), _rows_public(queued)
     if run is not None and run.get("batch"):
         run["completed"] = completed(run["batch"])
+    relaunch = relaunch_info(spec, folder, rows, run if run and run["pid"] else None) if has_queue or os.path.exists(
+        os.path.join(folder, "run_queue.sh")) else None
 
     return {
         **_public(spec),
@@ -425,6 +625,7 @@ def pipeline_status(spec):
         "fly_outputs": [{"stage": stage, "path": pattern, "description": d} for stage, pattern, d in FLY_OUTPUTS]
         if spec["identity"] is not None else None,
         "recent_batches": recent,
+        "relaunch": relaunch,
     }
 
 
@@ -437,7 +638,88 @@ def _rows_public(rows):
              "unstamped": r.get("unstamped", False)} for r in rows]
 
 
+def requeue_rows(spec, wanted):
+    """Mark the rows (batch, experiment, identity) of the pipeline's CSV 1 again, as the
+    `requeue` command does: under flock on the CSV (run_queue.sh and pose_estimation's
+    run_queue.sh take the same lock), written in place. Returns the CSV line numbers changed."""
+    path = os.path.join(PIPELINES_DIR, spec["folder"], spec["csv"])
+    m, e = spec["mark"], spec["experiment"]
+    i = spec["identity"]
+    changed = []
+    with open(path, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(path, newline="", errors="replace") as fh:
+                lines = fh.read().split("\n")
+            for n, line in enumerate(lines):
+                fields = line.split(",")
+                if len(fields) <= m:
+                    continue
+                row = {"experiment": fields[e].strip() if e is not None and len(fields) > e else None,
+                       "basedir": fields[spec["basedir"]].strip() if len(fields) > spec["basedir"] else "",
+                       "identity": fields[i].strip() if i is not None and len(fields) > i else None}
+                if row["experiment"] is None:
+                    row["experiment"] = _experiment_name(spec, fields)
+                key = (fields[m].replace(" ", ""), row["experiment"], row["identity"])
+                if key in wanted:
+                    fields[m] = "1"
+                    lines[n] = ",".join(fields)
+                    changed.append(n + 1)
+            if changed:
+                with open(path, "w", newline="") as fh:    # in place, as run_queue.sh (cat tmp > csv)
+                    fh.write("\n".join(lines))
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    return changed
+
+
 def register_monitor(app):
+
+    @app.route("/api/monitor/<pipeline>/check_now", methods=["POST"])
+    def monitor_check_now(pipeline):
+        """End the `sleep` run_queue.sh polls with, so it looks at the CSV now: its loop just goes
+        on to the next check (nothing to do while it waits for a run to end)."""
+        spec = next((s for s in PIPELINES if s["id"] == pipeline), None)
+        if spec is None:
+            return jsonify({"error": f"unknown pipeline {pipeline}"}), 404
+        runner = queue_runner(os.path.join(PIPELINES_DIR, spec["folder"]))
+        if not runner or not runner["pids"]:
+            return jsonify({"error": "run_queue.sh is not running"}), 409
+        sleeping = _queue_sleep(runner["pids"])
+        if sleeping is None:
+            return jsonify({"error": "run_queue.sh is not polling (it waits for a nextflow run to end)"}), 409
+        try:
+            os.kill(sleeping["pid"], signal.SIGTERM)
+        except OSError as error:
+            return jsonify({"error": f"could not wake run_queue.sh: {error}"}), 500
+        logger.info("monitor: woke run_queue.sh of %s (sleep %s)", pipeline, sleeping["pid"])
+        return jsonify({"ok": True})
+
+    @app.route("/api/monitor/<pipeline>/requeue", methods=["POST"])
+    def monitor_requeue(pipeline):
+        """{"batches": [batch, ...]} (default: all): mark 1 again the rows of the failed flies
+        listed by relaunch_info for those batches, so run_queue.sh takes them in its next round."""
+        spec = next((s for s in PIPELINES if s["id"] == pipeline), None)
+        if spec is None:
+            return jsonify({"error": f"unknown pipeline {pipeline}"}), 404
+        status = pipeline_status(spec)
+        relaunch = status.get("relaunch")
+        if not relaunch:
+            return jsonify({"error": "no failed tasks to re-queue"}), 400
+        body = request.get_json(silent=True) or {}
+        batches = body.get("batches")
+        wanted = {(b["batch"], f["experiment"], f["identity"] if spec["identity"] is not None else None)
+                  for b in relaunch["batches"] if batches is None or b["batch"] in batches for f in b["flies"]}
+        if not wanted:
+            return jsonify({"error": "nothing to re-queue for those batches"}), 400
+        try:
+            changed = requeue_rows(spec, wanted)
+        except OSError as error:
+            return jsonify({"error": f"could not edit {spec['csv']}: {error}"}), 500
+        logger.info("monitor: re-queued lines %s of %s", changed, spec["csv"])
+        runner = status.get("queue_runner") or {}
+        return jsonify({"lines": changed, "rows": len(changed), "queue_running": bool(runner.get("pids")),
+                        "next_check": runner.get("next_check"), "csv": spec["csv"]})
 
     @app.route("/api/monitor", methods=["GET"])
     def monitor():
