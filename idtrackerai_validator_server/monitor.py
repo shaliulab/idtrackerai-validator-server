@@ -446,7 +446,7 @@ def relaunch_info(spec, folder, rows, live):
                 flies.setdefault(key, {"experiment": r["experiment"], "identity": r["identity"], "line": r["line"],
                                        "tasks": []})["tasks"].append(t["name"])
             tasks.append({"name": t["name"], "process": t["process"], "exit": t["exit"], "work_dir": t.get("work_dir"),
-                          "experiment": experiment, "identity": identity, "error": details["error"],
+                          "ended": t["ended"], "experiment": experiment, "identity": identity, "error": details["error"],
                           "exception": details["exception"], "where": details["where"]})
         if not flies:
             continue
@@ -562,11 +562,12 @@ def pipeline_status(spec):
                         "processes": [{"process": p, **_summary([t for t in ts if t["process"] == p])}
                                       for p in dict.fromkeys(t["process"] for t in ts)],
                         "failed": [{"name": t["name"], "process": t["process"], "exit": t["exit"],
-                                    "work_dir": t.get("work_dir")}
+                                    "work_dir": t.get("work_dir"), "ended": t["ended"]}
                                    for t in ts if t["status"] == "failed"][:20]}
             for k, ts in per_experiment.items()
         }
-        run["failed_tasks"] = [{"name": t["name"], "exit": t["exit"], "work_dir": t.get("work_dir")}
+        run["failed_tasks"] = [{"name": t["name"], "exit": t["exit"], "work_dir": t.get("work_dir"),
+                                "ended": t["ended"]}
                                for t in tasks if t["status"] == "failed"][:50]
 
         # no row holds the running batch's stamp (the CSV was saved over by an editor holding
