@@ -21,6 +21,14 @@ Clearing sets the rows back to -1. Missing folders and label files are made with
 deepethogram (deg_add_video.py, run with $DEG_PYTHON, ~30 s each): a write that needs
 one runs as a job (one item per new folder, progress in the console). Every write is
 logged to $DEG_LABELS_LOG.
+
+Undo: each write keeps, per file, the rows it replaced and those it wrote (int8, in
+memory, lost when the server restarts), under the `action` id the client sends (one per
+label applied; Label while moving adds its seconds to the action of the label it
+paints with). POST .../deg_labels/undo restores the fly's last action, the files'
+rows in reverse order of writing; it refuses when the rows are no longer what was
+written (changed elsewhere, e.g. in the deepethogram GUI). An undone action can be
+redone (.../deg_labels/redo) until the next write of that fly.
 """
 import glob
 import json
@@ -67,6 +75,14 @@ OTHER, MIXED = CLASSES.index("other"), CLASSES.index("mixed")
 
 _locks = {}
 _locks_lock = threading.Lock()
+
+# fly -> writes that can be undone, oldest first:
+# {"action", "time", "start", "end", "behaviors", "files": [(chunk, path, a, b, before, after)]}
+# Undone writes go to the fly's redo stack (in order of writing), which a new write empties.
+UNDO_DEPTH = 500
+_undo = {}
+_redo = {}
+_undo_lock = threading.Lock()
 
 
 def _lock(key):
@@ -269,10 +285,10 @@ def ensure_label_file(fly, chunk, on_progress=None):
     return out["labels"], out["created"]
 
 
-def write_labels(fly, start, end, behaviors):
+def write_labels(fly, start, end, behaviors, action=None):
     """Label the movie seconds [start, end) with `behaviors` (DEG columns set to 1, the
     others 0), or clear them (-1) when behaviors is None; clearing makes no new folder.
-    Returns one dict per file written."""
+    Kept for undo under `action`. Returns one dict per file written."""
     chunksize = _properties(fly)["chunksize"]
     first, last = _frame_range(fly, start, end)
 
@@ -284,6 +300,7 @@ def write_labels(fly, start, end, behaviors):
             raise ValueError(f"Unknown behaviors {unknown}: the project's are {columns}" if unknown else "No behavior given")
 
     written = []
+    changes = []
     for chunk in _chunks(fly, start, end):
         a = max(first, chunk * chunksize) - chunk * chunksize
         b = min(last, (chunk + 1) * chunksize) - chunk * chunksize
@@ -298,6 +315,7 @@ def write_labels(fly, start, end, behaviors):
             b = min(b, len(df))
             if b <= a:
                 continue
+            before = df.iloc[a:b, :].to_numpy(dtype=np.int8)
             if behaviors is None:
                 df.iloc[a:b, :] = -1
             else:
@@ -305,10 +323,118 @@ def write_labels(fly, start, end, behaviors):
                 df.iloc[a:b, [df.columns.get_loc(c) for c in behaviors]] = 1
             df.to_csv(path + ".tmp")
             os.replace(path + ".tmp", path)
+            changes.append((chunk, path, a, b, before, df.iloc[a:b, :].to_numpy(dtype=np.int8)))
         written.append({"chunk": chunk, "path": path, "created": created, "rows": [a, b]})
     _log({"time": time.time(), "fly": fly, "start": start, "end": end, "behaviors": behaviors,
           "files": [{"path": w["path"], "rows": w["rows"]} for w in written]})
+    if changes:
+        with _undo_lock:
+            stack = _undo.setdefault(fly, [])
+            stack.append({"action": action, "time": time.time(), "start": start, "end": end,
+                          "behaviors": behaviors, "files": changes})
+            del stack[:-UNDO_DEPTH]
+            _redo.pop(fly, None)
     return written
+
+
+def _last_action(stack):
+    """Index of the first write of the stack's last action (writes without action are one each)."""
+    i = len(stack) - 1
+    action = stack[i]["action"]
+    while action is not None and i > 0 and stack[i - 1]["action"] == action:
+        i -= 1
+    return i
+
+
+def _first_action(stack):
+    """End index of the writes of the stack's first action."""
+    i = 1
+    action = stack[0]["action"]
+    while action is not None and i < len(stack) and stack[i]["action"] == action:
+        i += 1
+    return i
+
+
+def _summary(writes):
+    return {"writes": len(writes), "start": min(w["start"] for w in writes),
+            "end": max(w["end"] for w in writes), "behaviors": writes[-1]["behaviors"],
+            "time": writes[-1]["time"]}
+
+
+def _n_actions(stack):
+    return sum(1 for j, w in enumerate(stack)
+               if w["action"] is None or j == 0 or stack[j - 1]["action"] != w["action"])
+
+
+def history_info(fly):
+    """What undo / redo would restore: {"writes", "start", "end", "behaviors", "time",
+    "actions"} of the last action written / first action undone, None when nothing."""
+    with _undo_lock:
+        undo, redo = _undo.get(fly), _redo.get(fly)
+        return {
+            "undo": {**_summary(undo[_last_action(undo):]), "actions": _n_actions(undo)} if undo else None,
+            "redo": {**_summary(redo[:_first_action(redo)]), "actions": _n_actions(redo)} if redo else None,
+        }
+
+
+def _apply(fly, writes, forward):
+    """Write back the rows of `writes`: their `after` (redo, in order) or their `before`
+    (undo, in reverse). All or nothing: refused when a file's rows are not what they
+    should be before that (changed elsewhere since)."""
+    files = [change for w in writes for change in w["files"]]
+    locks = [_lock((fly, chunk)) for chunk in sorted({change[0] for change in files})]
+    for lock in locks:
+        lock.acquire()
+    try:
+        frames = {path: pd.read_csv(path, index_col=0) for path in {change[1] for change in files}}
+        current = {path: df.to_numpy(dtype=np.int8) for path, df in frames.items()}
+        for _, path, a, b, before, after in (files if forward else reversed(files)):
+            expected, new = (before, after) if forward else (after, before)
+            if current[path].shape[1] != expected.shape[1] or not np.array_equal(current[path][a:b], expected):
+                raise RuntimeError(f"{os.path.basename(path)} changed after this label was "
+                                   f"{'undone' if forward else 'written'} (rows {a}-{b}): not "
+                                   f"{'redone' if forward else 'undone'}")
+            current[path][a:b] = new
+        for path, df in frames.items():
+            df.iloc[:, :] = current[path]
+            df.to_csv(path + ".tmp")
+            os.replace(path + ".tmp", path)
+    finally:
+        for lock in reversed(locks):
+            lock.release()
+    return sorted(frames)
+
+
+def undo_last(fly):
+    """Restore the rows the fly's last action replaced; it moves to the redo stack."""
+    with _undo_lock:
+        stack = _undo.get(fly)
+        if not stack:
+            raise ValueError(f"Nothing to undo for {fly}")
+        i = _last_action(stack)
+        writes = stack[i:]
+        paths = _apply(fly, writes, forward=False)
+        del stack[i:]
+        _redo[fly] = writes + _redo.get(fly, [])
+    info = _summary(writes)
+    _log({"time": time.time(), "fly": fly, "undo": info, "files": paths})
+    return info
+
+
+def redo_first(fly):
+    """Write again the fly's last undone action; it goes back to the undo stack."""
+    with _undo_lock:
+        stack = _redo.get(fly)
+        if not stack:
+            raise ValueError(f"Nothing to redo for {fly}")
+        i = _first_action(stack)
+        writes = stack[:i]
+        paths = _apply(fly, writes, forward=True)
+        del stack[:i]
+        _undo.setdefault(fly, []).extend(writes)
+    info = _summary(writes)
+    _log({"time": time.time(), "fly": fly, "redo": info, "files": paths})
+    return info
 
 
 def _log(entry):
@@ -415,9 +541,10 @@ def register_deg_labels(app):
             "framerate": _properties(fly)["framerate"],
             "files": n_files,
             "runs": runs,
+            **history_info(fly),   # undo, redo
         }
 
-    def _write_job(fly, start, end, behaviors, missing):
+    def _write_job(fly, start, end, behaviors, missing, action):
         """Make the missing folders (one job item each, ~30 s), then write: 202 + the job,
         whose result is the response of a write without new folders."""
         def work(job):
@@ -426,7 +553,7 @@ def register_deg_labels(app):
                 with _lock((fly, chunk)):
                     ensure_label_file(fly, chunk, on_progress=lambda p, i=i: job.update(i, progress=p))
                 job.update(i, status="done", progress=1.0)
-            written = write_labels(fly, start, end, behaviors)
+            written = write_labels(fly, start, end, behaviors, action)
             job.result = {**_payload(fly), "written": written}
 
         names = [f"DEG video {key}" for _, key in missing]
@@ -457,6 +584,8 @@ def register_deg_labels(app):
         except (KeyError, TypeError, ValueError):
             return jsonify({"error": "start and end (integer seconds of movie) are required"}), 400
         behaviors = body.get("behaviors")
+        action = body.get("action")
+        action = str(action) if action is not None else None
         if start < 0 or end <= start:
             return jsonify({"error": f"Invalid range [{start}, {end})"}), 400
         if end - start > MAX_RANGE:
@@ -467,11 +596,29 @@ def register_deg_labels(app):
         try:
             missing = missing_folders(fly, start, end) if behaviors is not None else []
             if missing:
-                return _write_job(fly, start, end, behaviors, missing)
-            written = write_labels(fly, start, end, behaviors)
+                return _write_job(fly, start, end, behaviors, missing, action)
+            written = write_labels(fly, start, end, behaviors, action)
         except (ValueError, FileNotFoundError) as error:
             return jsonify({"error": str(error)}), 400
         except Exception as error:
             logger.exception("Could not write the DEG labels of %s", fly)
             return jsonify({"error": str(error)}), 500
         return jsonify({**_payload(fly), "written": written})
+
+    @app.route("/api/ethogram/<fly>/deg_labels/<step>", methods=["POST"])
+    def deg_labels_history(fly, step):
+        """undo / redo the fly's last labelling action; returns the labels plus `undone` / `redone`."""
+        if not FLY_PATTERN.match(fly):
+            return jsonify({"error": f"invalid fly id {fly}"}), 400
+        if step not in ("undo", "redo"):
+            return jsonify({"error": f"unknown step {step}"}), 404
+        try:
+            done = undo_last(fly) if step == "undo" else redo_first(fly)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        except RuntimeError as error:
+            return jsonify({"error": str(error)}), 409
+        except Exception as error:
+            logger.exception("Could not %s the DEG labels of %s", step, fly)
+            return jsonify({"error": str(error)}), 500
+        return jsonify({**_payload(fly), {"undo": "undone", "redo": "redone"}[step]: done})
