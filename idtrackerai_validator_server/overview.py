@@ -16,6 +16,9 @@ case in the experiment's `light_cycle_flags`.
 Reading ~500 databases takes ~10 s, so each one is cached until its mtime changes;
 `?refresh=1` drops the cache.
 
+`deg_videos`: number of DEG video folders (chunk of a fly) of the experiment with
+labelled frames (deg_labels.labelled_videos), not cached with the record.
+
 Experiments not analyzed yet (folder in $FLYHOSTEL_VIDEOS but no database) are
 taken from the metadata sheets: the CSV exports in $FLYHOSTEL_METADATA of every
 sheet listed under SHEETS in the googleapi config. They come with `analyzed: False`
@@ -339,6 +342,16 @@ def scan(root, refresh=False):
     except Exception as error:     # the analyzed experiments are still worth showing
         logger.exception("Could not read the metadata sheets")
         warnings.append(f"could not read the metadata sheets: {error}")
+
+    # DEG video folders (chunk of a fly) with labelled frames, the ground truth ethograms
+    try:
+        from idtrackerai_validator_server.deg_labels import labelled_videos
+        deg = labelled_videos()
+    except Exception as error:
+        logger.exception("Could not read the DEG labels")
+        warnings.append(f"could not read the DEG labels: {error}")
+        deg = {}
+    records = [{**record, "deg_videos": deg.get(record["experiment"], 0)} for record in records]
 
     coverage = Counter(column for record in records for fly in record["flies"] for column in fly)
     return {

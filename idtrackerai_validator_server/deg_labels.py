@@ -22,6 +22,7 @@ deepethogram (deg_add_video.py, run with $DEG_PYTHON, ~30 s each): a write that 
 one runs as a job (one item per new folder, progress in the console). Every write is
 logged to $DEG_LABELS_LOG.
 """
+import glob
 import json
 import logging
 import os
@@ -317,6 +318,88 @@ def _log(entry):
             handle.write(json.dumps(entry) + "\n")
     except OSError as error:
         logger.warning("Could not log DEG labels to %s: %s", LOG_PATH, error)
+
+
+VIDEO_FOLDER_RE = re.compile(r"^(.+)_(\d{6})_(\d{3})$")
+# labels file -> [mtime, size, has labelled frames], also kept in LABELLED_CACHE
+LABELLED_CACHE = os.path.join(os.path.dirname(LOG_PATH), "deg_labelled.json")
+_labelled_cache = None
+_labelled_lock = threading.Lock()
+
+
+def _has_labels(path):
+    """Does the labels file have a frame with a value other than -1 (any 0 or 1 cell)?
+    Values are only -1 / 0 / 1 and the index starts each line, so ",0" / ",1" are cells."""
+    with open(path, "rb") as handle:
+        handle.readline()   # header
+        data = handle.read()
+    return b",1" in data or b",0" in data
+
+
+def labelled_videos():
+    """experiment (relative folder, as in the Overview) -> number of DEG video folders
+    (chunk of a fly) with labelled frames, over the projects of DEG_ROOT. Each labels
+    file is read once per (mtime, size) (~1000 files, ~1 GB: ~20 s cold, ~0.3 s after)."""
+    global _labelled_cache
+    from concurrent.futures import ThreadPoolExecutor
+    from idtrackerai_validator_server.experiments import to_relpath
+
+    files = []
+    for data in sorted(glob.glob(os.path.join(DEG_ROOT, "*", "DATA"))):
+        for entry in os.scandir(data):
+            match = VIDEO_FOLDER_RE.match(entry.name)
+            if not match or not entry.is_dir():
+                continue
+            path = _labels_path(os.path.dirname(data), entry.name, int(match[2]))
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            files.append((match[1], path, (stat.st_mtime, stat.st_size)))
+
+    changed = []
+
+    def check(item):
+        _, path, (mtime, size) = item
+        cached = _labelled_cache.get(path)
+        if cached and cached[:2] == [mtime, size]:
+            return cached[2]
+        try:
+            value = _has_labels(path)
+        except OSError:
+            return False
+        _labelled_cache[path] = [mtime, size, value]
+        changed.append(path)
+        return value
+
+    with _labelled_lock:
+        if _labelled_cache is None:
+            try:
+                with open(LABELLED_CACHE) as handle:
+                    _labelled_cache = json.load(handle)
+            except (OSError, ValueError):
+                _labelled_cache = {}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            flags = list(pool.map(check, files))
+        if changed:
+            try:
+                os.makedirs(os.path.dirname(LABELLED_CACHE), exist_ok=True)
+                tmp = LABELLED_CACHE + ".tmp"
+                with open(tmp, "w") as handle:
+                    json.dump(_labelled_cache, handle)
+                os.replace(tmp, LABELLED_CACHE)
+            except OSError as error:
+                logger.warning("Could not save %s: %s", LABELLED_CACHE, error)
+    counts = {}
+    for (experiment, _, _), labelled in zip(files, flags):
+        if not labelled:
+            continue
+        try:
+            relpath = to_relpath(experiment)
+        except Exception:   # not an experiment name
+            continue
+        counts[relpath] = counts.get(relpath, 0) + 1
+    return counts
 
 
 def register_deg_labels(app):
