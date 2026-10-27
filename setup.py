@@ -42,6 +42,7 @@ install_requires = [
     "h5py",
     "waitress",
     "pyyaml",
+    "psutil",
     # rois.py reads idtrackerai v5 .toml settings; tomllib is stdlib from 3.11 on.
     "tomli; python_version < '3.11'",
     # Imported at startup through flyhostel but declared by neither it
