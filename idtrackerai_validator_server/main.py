@@ -9,6 +9,42 @@ import webbrowser
 from .app import app
 
 
+def redirecting_ssl_adapter(certfile, keyfile):
+    """cheroot's TLS adapter, answering plain http requests with a redirect to https."""
+    import socket
+    from cheroot import errors
+    from cheroot.ssl.builtin import BuiltinSSLAdapter
+
+    class RedirectingSSLAdapter(BuiltinSSLAdapter):
+        def wrap(self, sock):
+            try:
+                first = sock.recv(1, socket.MSG_PEEK)
+            except OSError:
+                first = b""
+            # a TLS connection starts with a handshake record (0x16)
+            if first and first != b"\x16":
+                try:
+                    request = sock.recv(8192).decode("latin-1")
+                    path = (request.split(" ", 2) + ["", ""])[1] or "/"
+                    host = next(
+                        (line.split(":", 1)[1].strip() for line in request.split("\r\n")[1:]
+                         if line.lower().startswith("host:")),
+                        "{}:{}".format(*sock.getsockname()[:2]),
+                    )
+                    sock.sendall((
+                        "HTTP/1.1 301 Moved Permanently\r\n"
+                        "Location: https://{}{}\r\n"
+                        "Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    ).format(host, path if path.startswith("/") else "/").encode("latin-1"))
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                raise errors.NoSSLError
+            return super().wrap(sock)
+
+    return RedirectingSSLAdapter(certfile, keyfile)
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         prog="start-idtrackerai-validator-server",
@@ -86,9 +122,8 @@ def main():
         app.run(host=args.host, port=args.port, debug=True)
     elif tls:
         from cheroot import wsgi
-        from cheroot.ssl.builtin import BuiltinSSLAdapter
         server = wsgi.Server((args.host, args.port), app, numthreads=args.threads)
-        server.ssl_adapter = BuiltinSSLAdapter(args.certfile, args.keyfile)
+        server.ssl_adapter = redirecting_ssl_adapter(args.certfile, args.keyfile)
         try:
             server.start()
         finally:
