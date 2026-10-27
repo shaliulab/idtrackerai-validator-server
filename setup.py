@@ -41,6 +41,7 @@ install_requires = [
     "webcolors",
     "h5py",
     "waitress",
+    "cheroot",
     "pyyaml",
     "psutil",
     # rois.py reads idtrackerai v5 .toml settings; tomllib is stdlib from 3.11 on.

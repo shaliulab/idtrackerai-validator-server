@@ -33,6 +33,16 @@ def get_parser():
              "Never use this on a shared machine.",
     )
     parser.add_argument(
+        "--certfile",
+        default=os.environ.get("VALIDATOR_CERTFILE"),
+        help="TLS certificate (PEM). With --keyfile, serve over https (cheroot) instead of http.",
+    )
+    parser.add_argument(
+        "--keyfile",
+        default=os.environ.get("VALIDATOR_KEYFILE"),
+        help="TLS private key (PEM) of --certfile.",
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Do not open a browser window on startup.",
@@ -59,7 +69,8 @@ def main():
     # A browser can't usefully open 0.0.0.0, and on a remote machine there is
     # normally no browser to open at all.
     display_host = "localhost" if args.host in ("0.0.0.0", "127.0.0.1") else args.host
-    url = "http://{}:{}".format(display_host, args.port)
+    tls = bool(args.certfile and args.keyfile)
+    url = "{}://{}:{}".format("https" if tls else "http", display_host, args.port)
 
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
@@ -73,6 +84,15 @@ def main():
 
     if args.debug:
         app.run(host=args.host, port=args.port, debug=True)
+    elif tls:
+        from cheroot import wsgi
+        from cheroot.ssl.builtin import BuiltinSSLAdapter
+        server = wsgi.Server((args.host, args.port), app, numthreads=args.threads)
+        server.ssl_adapter = BuiltinSSLAdapter(args.certfile, args.keyfile)
+        try:
+            server.start()
+        finally:
+            server.stop()
     else:
         from waitress import serve
         serve(app, host=args.host, port=args.port, threads=args.threads)

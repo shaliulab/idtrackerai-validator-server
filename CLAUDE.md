@@ -38,6 +38,8 @@ npm run build   # -> build/ (static/js/main.<hash>.js, as the server and CI expe
 | `VALIDATOR_EXPERIMENT` | Yes | Experiment path, e.g. `FlyHostel4/6X/2023-08-31_13-00-00` or underscore form `FlyHostel4_6X_2023-08-31_13-00-00`; an arena of a multi-arena recording: `FlyHostel1/4X/2026-10-13_17-00-00/arenas/1` or `FlyHostel1_4X_2026-10-13_17-00-00_arena1` |
 | `FLYHOSTEL_VIDEOS` | Yes | Root directory containing all experiment folders and `index.txt` |
 | `BACKEND_PORT` | No | Flask port (default: 5000) |
+| `VALIDATOR_USERNAME`, `VALIDATOR_PASSWORD` | No | When both are set, every route requires HTTP Basic Auth with them (`require_login` in `app.py`). The systemd service binds `0.0.0.0` and sets them in `~/.config/systemd/user/idtrackerai-viewer.service.d/auth.conf` (not in git) |
+| `VALIDATOR_CERTFILE`, `VALIDATOR_KEYFILE` | No | `main.py` (`--certfile`/`--keyfile`): when both are set, serve over https with cheroot instead of http with waitress. The service uses a self-signed certificate for `10.43.207.98`/`localhost` in `~/.config/idtrackerai-validator/tls/` (drop-in `tls.conf`) |
 | `FLYHOSTEL_METADATA` | No | CSV exports of the metadata sheets, for not-analyzed experiments in the Overview (default: `/flyhostel_data/metadata`) |
 | `DOWNLOAD_FLYHOSTEL_METADATA` | No | `download_flyhostel_metadata` executable for the Overview's metadata update (default: `~vibflysleep/mambaforge/envs/rapids-23.04/bin/…`) |
 | `GOOGLEAPI_CONFIG` | No | Config listing the metadata sheets (`SHEETS`) (default: `~/.config/googleapi/config.yaml`) |

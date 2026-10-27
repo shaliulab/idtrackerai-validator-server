@@ -1,3 +1,4 @@
+import hmac
 import io
 import os
 from threading import Lock, Timer
@@ -7,7 +8,7 @@ from collections import OrderedDict
 import re
 import traceback
 import logging
-from flask import Flask, jsonify, request, send_from_directory, send_file
+from flask import Flask, Response, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
 from flask import g
 from flask_sqlalchemy import SQLAlchemy
@@ -111,6 +112,27 @@ app = Flask(__name__, static_folder=None)
 
 app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
 CORS(app)
+
+# HTTP Basic Auth on every route when VALIDATOR_USERNAME and VALIDATOR_PASSWORD are set
+AUTH_USERNAME = os.environ.get("VALIDATOR_USERNAME")
+AUTH_PASSWORD = os.environ.get("VALIDATOR_PASSWORD")
+
+
+@app.before_request
+def require_login():
+    if not (AUTH_USERNAME and AUTH_PASSWORD):
+        return None
+    auth = request.authorization
+    if (
+        auth is not None
+        and hmac.compare_digest((auth.username or "").encode(), AUTH_USERNAME.encode())
+        and hmac.compare_digest((auth.password or "").encode(), AUTH_PASSWORD.encode())
+    ):
+        return None
+    return Response(
+        "Login required", 401,
+        {"WWW-Authenticate": 'Basic realm="idtrackerai validator", charset="UTF-8"'},
+    )
 
 register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)

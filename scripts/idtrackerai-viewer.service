@@ -9,7 +9,7 @@ Type=simple
 # Full path to the entry point inside the conda environment. systemd does not
 # read your shell profile, so `conda activate` has no effect here — the
 # interpreter has to be named explicitly.
-ExecStart=/home/vibflysleep/mambaforge/envs/idtrackerai-viewer/bin/start-idtrackerai-validator-server --port 5000 --host 127.0.0.1 --no-browser
+ExecStart=/home/vibflysleep/mambaforge/envs/idtrackerai-viewer/bin/start-idtrackerai-validator-server --port 5000 --host 0.0.0.0 --no-browser
 
 Environment=FLYHOSTEL_VIDEOS=/flyhostel_data/videos
 Environment=PYTHONUNBUFFERED=1
