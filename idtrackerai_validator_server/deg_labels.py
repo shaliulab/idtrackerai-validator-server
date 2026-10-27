@@ -58,6 +58,8 @@ PROGRESS_MARKER = "@@PROGRESS "   # deg_add_video.MARKER (the script must not be
 LOG_PATH = os.environ.get("DEG_LABELS_LOG", os.path.expanduser("~/.cache/idtrackerai-validator/deg_labels.jsonl"))
 # Longest range labelled at once (s): every chunk it touches may need a new video folder (~5 s each)
 MAX_RANGE = 3600
+# Most chunks premade at once on each side of the cursor's chunk (~30 s each)
+MAX_PREMAKE = 50
 
 # RF class -> DEG columns set to 1, in the order of the client's keys 1, 2, ...
 PRESETS = {
@@ -604,6 +606,55 @@ def register_deg_labels(app):
             logger.exception("Could not write the DEG labels of %s", fly)
             return jsonify({"error": str(error)}), 500
         return jsonify({**_payload(fly), "written": written})
+
+    @app.route("/api/ethogram/<fly>/deg_videos", methods=["POST"])
+    def deg_videos_post(fly):
+        """{"t" (movie second), "n", "direction": "before" | "after"}: job making the DEG video
+        folders of the chunk of t and the n chunks before / after it (within the movie),
+        one item per chunk; chunks already there or without the fly are skipped."""
+        if not FLY_PATTERN.match(fly):
+            return jsonify({"error": f"invalid fly id {fly}"}), 400
+        body = request.get_json(silent=True) or {}
+        try:
+            t, n = int(body["t"]), int(body["n"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "t (movie second) and n (integer number of chunks) are required"}), 400
+        direction = body.get("direction")
+        if direction not in ("before", "after"):
+            return jsonify({"error": "direction must be before or after"}), 400
+        if not 0 <= n <= MAX_PREMAKE:
+            return jsonify({"error": f"n must be between 0 and {MAX_PREMAKE}"}), 400
+        try:
+            seconds = len(track(fly)["codes"])
+            t = max(0, min(seconds - 1, t))
+            movie = _chunks(fly, 0, seconds)
+            current = _chunks(fly, t, t + 1)[0]
+        except (ValueError, FileNotFoundError) as error:
+            return jsonify({"error": str(error)}), 400
+        if direction == "before":
+            chunks = list(range(max(movie[0], current - n), current + 1))
+        else:
+            chunks = list(range(current, min(movie[-1], current + n) + 1))
+
+        def work(job):
+            made = []
+            for i, chunk in enumerate(chunks):
+                job.update(i, status="running")
+                try:
+                    with _lock((fly, chunk)):
+                        path, created = ensure_label_file(fly, chunk, on_progress=lambda p, i=i: job.update(i, progress=p))
+                except (ValueError, FileNotFoundError, RuntimeError) as error:
+                    job.update(i, status="skipped", error=str(error), progress=1.0)
+                    continue
+                if created:
+                    made.append(chunk)
+                job.update(i, status="done" if created else "skipped",
+                           error=None if created else "already made", progress=1.0)
+            job.result = {**_payload(fly), "chunks": chunks, "made": made}
+
+        job = start_job(f"{fly}: DEG videos of chunks {chunks[0]}–{chunks[-1]}",
+                        [f"DEG video of chunk {chunk}" for chunk in chunks], work)
+        return jsonify(job.to_dict()), 202
 
     @app.route("/api/ethogram/<fly>/deg_labels/<step>", methods=["POST"])
     def deg_labels_history(fly, step):
