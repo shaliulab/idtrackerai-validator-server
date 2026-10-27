@@ -207,7 +207,23 @@ def label_runs(fly):
                 runs[-1][1] = run[1]   # continues across chunks
             else:
                 runs.append(run)
-    return runs, len(files)
+    return runs, files
+
+
+def video_spans(fly, files):
+    """[[start s, end s], ...] of the movie covered by the fly's DEG video folders (files of
+    _fly_label_files), consecutive chunks merged."""
+    props = _properties(fly)
+    start_frame = props["first_chunk"] * props["chunksize"]
+    spans = []
+    for chunk, _ in files:
+        a = max(0.0, (chunk * props["chunksize"] - start_frame) / props["framerate"])
+        b = ((chunk + 1) * props["chunksize"] - start_frame) / props["framerate"]
+        if spans and spans[-1][1] >= a:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    return spans
 
 
 def _chunk_label_file(fly, chunk):
@@ -533,7 +549,7 @@ def labelled_videos():
 def register_deg_labels(app):
 
     def _payload(fly):
-        runs, n_files = label_runs(fly)
+        runs, files = label_runs(fly)
         project = project_dir(fly)
         return {
             "project": project,
@@ -541,8 +557,9 @@ def register_deg_labels(app):
             "presets": list(PRESETS.items()),   # [name, columns], in key order (jsonify sorts dicts)
             "classes": CLASSES,
             "framerate": _properties(fly)["framerate"],
-            "files": n_files,
+            "files": len(files),
             "runs": runs,
+            "videos": video_spans(fly, files),   # movie seconds with a DEG video folder
             **history_info(fly),   # undo, redo
         }
 

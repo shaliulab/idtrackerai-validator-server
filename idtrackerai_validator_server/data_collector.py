@@ -398,6 +398,55 @@ def write_toml(folder, name, settings, was_ai):
     return path
 
 
+# arenas.toml (recordings split into N arenas, cropped by imgstore-crop-arenas): settings of
+# the hand-made ones; one ellipse per arena, found by roi-proposer's detector when it finds
+# exactly N, else laid out on a grid
+ARENAS_DEFAULTS = {"intensity_ths": [0, 130], "area_ths": [50, "inf"], "tracking_intervals": "",
+                   "number_of_animals": 0, "use_bkg": False, "check_segmentation": False,
+                   "track_wo_identities": True, "exclusive_rois": False}
+MAX_ARENAS = 16
+
+
+def grid_arenas(n, width, height):
+    """n circles on a rows x cols grid (rows ≤ cols), top-left to bottom-right."""
+    rows = max(1, int(math.floor(math.sqrt(n))))
+    cols = int(math.ceil(n / rows))
+    cw, ch = width / cols, height / rows
+    r = int(round(0.45 * min(cw, ch)))
+    return [f"+ Ellipse {{'center': [{int(round((i % cols + 0.5) * cw))}, {int(round((i // cols + 0.5) * ch))}], "
+            f"'axes': [{r}, {r}], 'angle': 0}}" for i in range(n)]
+
+
+# run in the roi-proposer env (its detector needs cv2 ≥ 4.5's HOUGH_GRADIENT_ALT)
+DETECT_ARENAS = """
+import json, sys, cv2
+from flyhostel.roi_proposer.rois import ARENAS_TOML_SCALE, detect_arenas, fit_ellipse
+img = cv2.imread(sys.argv[1], cv2.IMREAD_UNCHANGED)
+print(json.dumps([fit_ellipse(a, scale=ARENAS_TOML_SCALE) for a in detect_arenas(img)]))
+"""
+
+
+def propose_arenas(frame, n):
+    """(roi_list, source, detected) of n arenas in the frame."""
+    detected = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "frame.png")
+            cv2.imwrite(path, frame)
+            result = subprocess.run([os.path.join(os.path.dirname(ROI_PROPOSER), "python"), "-c", DETECT_ARENAS, path],
+                                    capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "failed")
+        found = json.loads(result.stdout.strip().splitlines()[-1])
+        detected = len(found)
+        if detected == n:
+            return found, "detected", detected
+    except Exception as error:   # roi-proposer missing or detection failed: grid
+        logger.warning("Arena detection failed: %s", error)
+    height, width = frame.shape[:2]
+    return grid_arenas(n, width, height), "grid", detected
+
+
 def conf_convert(toml_path):
     conf_path = os.path.splitext(toml_path)[0] + ".conf"
     result = subprocess.run([os.path.join(IDTRACKERAI_V4_BIN, "conf-convert"), "-i", toml_path, "-o", conf_path],
@@ -803,6 +852,29 @@ def register_data_collector(app):
             return bad_request("An ellipse needs 5 points or more")
         (cx, cy), (w, h), angle = cv2.fitEllipse(points)
         return jsonify({"center": [round(cx), round(cy)], "axes": [round(w / 2), round(h / 2)], "angle": round(angle)})
+
+    @app.route("/api/collector/arenas_proposal", methods=["POST"])
+    def collector_arenas_proposal():
+        """{"experiment", "frame_number", "n"}: settings of an arenas.toml splitting the recording
+        into n arenas (nothing written: the editor saves them); source detected / grid."""
+        body = request.get_json(silent=True) or {}
+        try:
+            experiment = body["experiment"].strip().strip("/")
+            if LOCAL_RE.match(experiment) and LOCAL_RE.match(experiment).group(5):
+                raise ValueError("arenas.toml belongs to the whole recording, not to an arena folder")
+            folder = experiment_folder(root, experiment)
+            n = int(body["n"])
+            if not 2 <= n <= MAX_ARENAS:
+                raise ValueError(f"n must be between 2 and {MAX_ARENAS}")
+            frame_number = int(body["frame_number"])
+            chunksize = store_info(folder)["chunksize"]
+            frame = FRAMES.get(folder, frame_number, chunksize)
+        except (ValueError, KeyError, TypeError, FileNotFoundError) as error:
+            return bad_request(f"missing {error}" if isinstance(error, KeyError) else error)
+        roi_list, source, detected = propose_arenas(frame, n)
+        video = os.path.realpath(os.path.join(folder, f"{frame_number // chunksize:06d}.mp4"))
+        settings = {"video_paths": [video], **ARENAS_DEFAULTS, "roi_list": roi_list}
+        return jsonify({"settings": settings, "source": source, "detected": detected})
 
     @app.route("/api/collector/preprocess_sample", methods=["GET"])
     def collector_preprocess_status():
