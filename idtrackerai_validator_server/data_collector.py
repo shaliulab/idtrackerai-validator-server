@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -60,6 +61,11 @@ HTTP_URL = os.environ.get("COLLECTOR_HTTP", "http://10.43.205.5:8000")
 ENVS = os.path.expanduser("~/mambaforge/envs")
 ROI_PROPOSER = os.environ.get("ROI_PROPOSER", os.path.join(ENVS, "roi-proposer", "bin", "roi-proposer"))
 IDTRACKERAI_V4_BIN = os.environ.get("IDTRACKERAI_V4_BIN", os.path.join(ENVS, "idtrackeraiv4", "bin"))
+# splits a recording into its arenas once arenas.toml is saved (flyhostel-pipeline env: ffmpeg with NVENC)
+CROP_ARENAS = os.environ.get("CROP_ARENAS", os.path.join(ENVS, "flyhostel-pipeline", "bin", "imgstore-crop-arenas"))
+CROP_ARGS = ["--jobs", "3", "--gpu", "--size", "1024"]
+CROP_LOG = "crop_arenas.log"
+CROP_PROGRESS_RE = re.compile(r"Cropping chunks:.*?\|\s*(\d+)/(\d+)")
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 ZT_LIMIT = 30
@@ -607,6 +613,67 @@ def start_preprocess(folder, start_chunk, end_chunk, samples_per_chunk):
     return process.pid
 
 
+# ---- imgstore-crop-arenas ----
+
+def crop_process(folder):
+    """The imgstore-crop-arenas process (or its sh wrapper) running in this folder, if any."""
+    real = os.path.realpath(folder)
+    for process in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        cmdline = process.info["cmdline"] or []
+        if not any("imgstore-crop-arenas" in part for part in cmdline[:3]):
+            continue
+        try:
+            if os.path.realpath(process.cwd()) == real:
+                return process
+        except psutil.Error:
+            continue
+    return None
+
+
+def crop_status(folder):
+    log_path = os.path.join(folder, CROP_LOG)
+    process = crop_process(folder)
+    status = {"running": process is not None, "log": None, "progress": None, "exit_code": None,
+              "has_arenas_toml": os.path.exists(os.path.join(folder, "arenas.toml")),
+              "arenas": sorted(int(d) for d in os.listdir(os.path.join(folder, "arenas"))
+                               if d.isdigit() and os.path.isdir(os.path.join(folder, "arenas", d)))
+              if os.path.isdir(os.path.join(folder, "arenas")) else []}
+    if process is not None:
+        status.update(pid=process.pid, started=process.info["create_time"])
+    if os.path.exists(log_path):
+        with open(log_path, errors="replace", newline="") as handle:
+            # tqdm rewrites its bar with \r: keep only its last state
+            lines = [([part for part in line.split("\r") if part.strip()] or [""])[-1]
+                     for line in handle.read().split("\n")]
+        lines = [line for line in lines if line.strip()]
+        for line in reversed(lines):
+            match = CROP_PROGRESS_RE.search(line)
+            if match:
+                status["progress"] = {"done": int(match.group(1)), "total": int(match.group(2))}
+                break
+        exit_line = next((line for line in reversed(lines) if line.startswith("[exit code ")), None)
+        if exit_line and not status["running"]:
+            status["exit_code"] = int(re.sub(r"\D", "", exit_line) or -1)
+        status["log"] = {"mtime": os.path.getmtime(log_path), "tail": lines[-40:]}
+    return status
+
+
+def start_crop(folder):
+    """imgstore-crop-arenas in its own session (keeps running when the server restarts), with
+    its env's bin/ first in PATH (ffmpeg, ffprobe); the exit code is appended to the log."""
+    cmd = [CROP_ARENAS, "--input", "metadata.yaml", "--arenas", "arenas.toml"] + CROP_ARGS
+    line = " ".join(shlex.quote(part) for part in cmd)
+    env = dict(os.environ, PYTHONUNBUFFERED="1",
+               PATH=os.path.dirname(CROP_ARENAS) + os.pathsep + os.environ.get("PATH", ""))
+    with open(os.path.join(folder, CROP_LOG), "w") as log:
+        log.write(f"$ cd {shlex.quote(folder)} && {line}\n")
+        log.flush()
+        process = subprocess.Popen(["sh", "-c", f'{line}; rc=$?; echo; echo "[exit code $rc]"'], cwd=folder,
+                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=True, env=env)
+    return process.pid
+
+
 # ---- routes ----
 
 def register_data_collector(app):
@@ -926,6 +993,59 @@ def register_data_collector(app):
         process = preprocess_process(folder)
         if process is None:
             return jsonify({"error": "preprocess-sample is not running on this experiment"}), 409
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            process.terminate()
+        return jsonify({"stopped": process.pid})
+
+    def _whole_recording(experiment):
+        experiment = (experiment or "").strip().strip("/")
+        folder = experiment_folder(root, experiment)
+        if LOCAL_RE.match(experiment).group(5):
+            raise ValueError("imgstore-crop-arenas splits the whole recording, not an arena folder")
+        return folder
+
+    @app.route("/api/collector/crop_arenas", methods=["GET"])
+    def collector_crop_status():
+        """?experiment=: imgstore-crop-arenas of the recording (running, progress, log, arenas made)."""
+        experiment = (request.args.get("experiment") or "").strip().strip("/")
+        try:
+            folder = experiment_folder(root, experiment)
+        except (ValueError, FileNotFoundError) as error:
+            return bad_request(error)
+        if LOCAL_RE.match(experiment).group(5):
+            return jsonify({"arena": True})
+        status = crop_status(folder)
+        status.update(arena=False, command=" ".join(
+            ["imgstore-crop-arenas", "--input", "metadata.yaml", "--arenas", "arenas.toml"] + CROP_ARGS))
+        return jsonify(status)
+
+    @app.route("/api/collector/crop_arenas", methods=["POST"])
+    def collector_crop_start():
+        """{"experiment"}: starts imgstore-crop-arenas on the recording's saved arenas.toml in the
+        background (409 if it runs there already)."""
+        try:
+            folder = _whole_recording((request.get_json(silent=True) or {}).get("experiment"))
+            if not os.path.exists(os.path.join(folder, "arenas.toml")):
+                raise ValueError("No arenas.toml: make and save it first")
+            if not os.path.exists(CROP_ARENAS):
+                raise ValueError(f"{CROP_ARENAS} not found (set CROP_ARENAS)")
+        except (ValueError, FileNotFoundError) as error:
+            return bad_request(error)
+        if crop_process(folder) is not None:
+            return jsonify({"error": "imgstore-crop-arenas is already running on this recording"}), 409
+        return jsonify({"pid": start_crop(folder)})
+
+    @app.route("/api/collector/crop_arenas/stop", methods=["POST"])
+    def collector_crop_stop():
+        try:
+            folder = _whole_recording((request.get_json(silent=True) or {}).get("experiment"))
+        except (ValueError, FileNotFoundError) as error:
+            return bad_request(error)
+        process = crop_process(folder)
+        if process is None:
+            return jsonify({"error": "imgstore-crop-arenas is not running on this recording"}), 409
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
