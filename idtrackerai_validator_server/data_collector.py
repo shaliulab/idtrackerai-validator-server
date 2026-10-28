@@ -663,10 +663,13 @@ def crop_status(folder):
     return status
 
 
-def start_crop(folder):
+def start_crop(folder, resume=False):
     """imgstore-crop-arenas in its own session (keeps running when the server restarts), with
-    its env's bin/ first in PATH (ffmpeg, ffprobe); the exit code is appended to the log."""
+    its env's bin/ first in PATH (ffmpeg, ffprobe); the exit code is appended to the log.
+    resume: --resume, skips the chunks done for every arena and crops the incomplete ones again."""
     cmd = [CROP_ARENAS, "--input", "metadata.yaml", "--arenas", "arenas.toml"] + CROP_ARGS
+    if resume:
+        cmd.append("--resume")
     line = " ".join(shlex.quote(part) for part in cmd)
     env = dict(os.environ, PYTHONUNBUFFERED="1",
                PATH=os.path.dirname(CROP_ARENAS) + os.pathsep + os.environ.get("PATH", ""))
@@ -1028,10 +1031,11 @@ def register_data_collector(app):
 
     @app.route("/api/collector/crop_arenas", methods=["POST"])
     def collector_crop_start():
-        """{"experiment"}: starts imgstore-crop-arenas on the recording's saved arenas.toml in the
-        background (409 if it runs there already)."""
+        """{"experiment", "resume"}: starts imgstore-crop-arenas (with --resume when resume) on the
+        recording's saved arenas.toml in the background (409 if it runs there already)."""
+        body = request.get_json(silent=True) or {}
         try:
-            folder = _whole_recording((request.get_json(silent=True) or {}).get("experiment"))
+            folder = _whole_recording(body.get("experiment"))
             if not os.path.exists(os.path.join(folder, "arenas.toml")):
                 raise ValueError("No arenas.toml: make and save it first")
             if not os.path.exists(CROP_ARENAS):
@@ -1040,7 +1044,7 @@ def register_data_collector(app):
             return bad_request(error)
         if crop_process(folder) is not None:
             return jsonify({"error": "imgstore-crop-arenas is already running on this recording"}), 409
-        return jsonify({"pid": start_crop(folder)})
+        return jsonify({"pid": start_crop(folder, resume=bool(body.get("resume")))})
 
     @app.route("/api/collector/crop_arenas/stop", methods=["POST"])
     def collector_crop_stop():
