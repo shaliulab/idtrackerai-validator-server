@@ -60,6 +60,7 @@ from idtrackerai_validator_server.pose import register_pose, get_h5_file, close_
 from idtrackerai_validator_server.monitor import register_monitor
 from idtrackerai_validator_server.resources import register_resources
 from idtrackerai_validator_server.data_collector import register_data_collector
+from idtrackerai_validator_server.sleap_labels import register_sleap_labels
 from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
@@ -180,6 +181,7 @@ def _pose_state():
 
 
 register_pose(app, get_state=_pose_state)
+register_sleap_labels(app, get_state=_pose_state)
 
 # Clean up previous frames
 if os.path.exists(FRAMES_DIR):
