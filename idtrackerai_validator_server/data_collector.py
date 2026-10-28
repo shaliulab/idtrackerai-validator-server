@@ -63,7 +63,7 @@ ROI_PROPOSER = os.environ.get("ROI_PROPOSER", os.path.join(ENVS, "roi-proposer",
 IDTRACKERAI_V4_BIN = os.environ.get("IDTRACKERAI_V4_BIN", os.path.join(ENVS, "idtrackeraiv4", "bin"))
 # splits a recording into its arenas once arenas.toml is saved (flyhostel-pipeline env: ffmpeg with NVENC)
 CROP_ARENAS = os.environ.get("CROP_ARENAS", os.path.join(ENVS, "flyhostel-pipeline", "bin", "imgstore-crop-arenas"))
-CROP_ARGS = ["--jobs", "3", "--gpu", "--size", "1024"]
+CROP_ARGS = ["--jobs", "4", "--gpu", "--size", "1024"]
 CROP_LOG = "crop_arenas.log"
 CROP_PROGRESS_RE = re.compile(r"Cropping chunks:.*?\|\s*(\d+)/(\d+)")
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
@@ -344,6 +344,11 @@ def _toml_value(value):
     if isinstance(value, list):
         if value and all(isinstance(v, str) for v in value):
             return "[\n" + "".join(f"    {_toml_value(v)},\n" for v in value) + "]"
+        numbers = all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value)
+        if numbers and any(isinstance(v, float) for v in value):
+            # [50.0, inf], not [50, inf]: imgstore-crop-arenas (python 3.10) reads tomls with the
+            # toml package (TOML 0.5), which rejects arrays mixing integers and floats
+            value = [float(v) for v in value]
         return "[" + ", ".join(_toml_value(v) for v in value) + "]"
     raise ValueError(f"Cannot write {value!r} to a toml")
 
