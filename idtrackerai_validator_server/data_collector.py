@@ -28,7 +28,6 @@ import logging
 import math
 import os
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -49,7 +48,7 @@ try:
 except ImportError:  # python < 3.11
     import tomli as tomllib
 
-from idtrackerai_validator_server import rois
+from idtrackerai_validator_server import gpu_queue, rois
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.overview import sheet_files
 
@@ -64,8 +63,12 @@ IDTRACKERAI_V4_BIN = os.environ.get("IDTRACKERAI_V4_BIN", os.path.join(ENVS, "id
 # splits a recording into its arenas once arenas.toml is saved (flyhostel-pipeline env: ffmpeg with NVENC)
 CROP_ARENAS = os.environ.get("CROP_ARENAS", os.path.join(ENVS, "flyhostel-pipeline", "bin", "imgstore-crop-arenas"))
 CROP_ARGS = ["--jobs", "4", "--gpu", "--size", "1024"]
+# GPU memory of one NVENC encoder (ffmpeg h264_nvenc of a 1024 px arena: 1271 MiB measured);
+# a crop holds up to --jobs of them (GPU queue estimate)
+CROP_ENCODER_MB = 1400
 CROP_LOG = "crop_arenas.log"
-CROP_PROGRESS_RE = re.compile(r"Cropping chunks:.*?\|\s*(\d+)/(\d+)")
+# tqdm: "Cropping chunks:   6%|▌    | 14/232 [1:53:51<24:41:05, 407.64s/it]"
+CROP_PROGRESS_RE = re.compile(r"Cropping chunks:.*?\|\s*(\d+)/(\d+)(?:\s*\[([\d:]+)<([\d:?]+))?")
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 
 ZT_LIMIT = 30
@@ -550,24 +553,29 @@ def _arg(cmdline, name):
     return int(cmdline[cmdline.index(name) + 1]) if name in cmdline else None
 
 
+def preprocess_run(process):
+    """Chunk range of a running preprocess-sample and the chunk it reads (its open .mp4)."""
+    try:
+        cmdline = process.info["cmdline"]
+        current = None
+        for f in process.open_files():
+            match = re.match(r"^(\d{6})\.mp4$", os.path.basename(f.path))
+            if match:
+                current = int(match.group(1))
+        return {"running": True, "pid": process.pid, "started": process.info["create_time"],
+                "start_chunk": _arg(cmdline, "--start-chunk"), "end_chunk": _arg(cmdline, "--end-chunk"),
+                "samples_per_chunk": _arg(cmdline, "--samples-per-chunk"), "current_chunk": current}
+    except psutil.Error:
+        return {}
+
+
 def preprocess_status(folder):
     csv_path = os.path.join(folder, "preprocess_sample.csv")
     log_path = os.path.join(folder, "preprocess_sample.log")
     status = {"running": False, "csv": None, "log": None}
     process = preprocess_process(folder)
     if process is not None:
-        try:
-            cmdline = process.info["cmdline"]
-            current = None
-            for f in process.open_files():
-                match = re.match(r"^(\d{6})\.mp4$", os.path.basename(f.path))
-                if match:
-                    current = int(match.group(1))
-            status.update(running=True, pid=process.pid, started=process.info["create_time"],
-                          start_chunk=_arg(cmdline, "--start-chunk"), end_chunk=_arg(cmdline, "--end-chunk"),
-                          samples_per_chunk=_arg(cmdline, "--samples-per-chunk"), current_chunk=current)
-        except psutil.Error:
-            pass
+        status.update(preprocess_run(process))
     if os.path.exists(log_path):
         with open(log_path, errors="replace") as handle:
             lines = handle.read().splitlines()
@@ -636,7 +644,6 @@ def crop_process(folder):
 
 
 def crop_status(folder):
-    log_path = os.path.join(folder, CROP_LOG)
     process = crop_process(folder)
     status = {"running": process is not None, "log": None, "progress": None, "exit_code": None,
               "has_arenas_toml": os.path.exists(os.path.join(folder, "arenas.toml")),
@@ -645,22 +652,101 @@ def crop_status(folder):
               if os.path.isdir(os.path.join(folder, "arenas")) else []}
     if process is not None:
         status.update(pid=process.pid, started=process.info["create_time"])
-    if os.path.exists(log_path):
-        with open(log_path, errors="replace", newline="") as handle:
-            # tqdm rewrites its bar with \r: keep only its last state
-            lines = [([part for part in line.split("\r") if part.strip()] or [""])[-1]
-                     for line in handle.read().split("\n")]
-        lines = [line for line in lines if line.strip()]
-        for line in reversed(lines):
-            match = CROP_PROGRESS_RE.search(line)
-            if match:
-                status["progress"] = {"done": int(match.group(1)), "total": int(match.group(2))}
-                break
-        exit_line = next((line for line in reversed(lines) if line.startswith("[exit code ")), None)
-        if exit_line and not status["running"]:
-            status["exit_code"] = int(re.sub(r"\D", "", exit_line) or -1)
-        status["log"] = {"mtime": os.path.getmtime(log_path), "tail": lines[-40:]}
+    status.update(crop_log(folder, status["running"]))
     return status
+
+
+def crop_log(folder, running):
+    """crop_arenas.log: progress (tqdm's last bar: chunks done / total, elapsed and remaining),
+    exit code of the last run (when not running) and the tail."""
+    log_path = os.path.join(folder, CROP_LOG)
+    if not os.path.exists(log_path):
+        return {}
+    status = {}
+    with open(log_path, errors="replace", newline="") as handle:
+        # tqdm rewrites its bar with \r: keep only its last state
+        lines = [([part for part in line.split("\r") if part.strip()] or [""])[-1]
+                 for line in handle.read().split("\n")]
+    lines = [line for line in lines if line.strip()]
+    for line in reversed(lines):
+        match = CROP_PROGRESS_RE.search(line)
+        if match:
+            status["progress"] = {"done": int(match.group(1)), "total": int(match.group(2)),
+                                  "elapsed": match.group(3), "remaining": match.group(4)}
+            break
+    exit_line = next((line for line in reversed(lines) if line.startswith("[exit code ")), None)
+    if exit_line and not running:
+        status["exit_code"] = int(re.sub(r"\D", "", exit_line) or -1)
+    status["log"] = {"mtime": os.path.getmtime(log_path), "tail": lines[-40:]}
+    return status
+
+
+# ---- what runs now ----
+
+def _relative(root, path):
+    """Experiment (relative to root) of a folder path, also when given through the drive a
+    FlyHostel<N> link points to (process cwds are resolved); None outside root."""
+    real = os.path.realpath(path)
+    prefixes = [(os.path.realpath(root), "")]
+    for name in os.listdir(root):
+        if re.match(r"^FlyHostel\d+$", name):
+            prefixes.append((os.path.realpath(os.path.join(root, name)), name))
+    for prefix, name in sorted(prefixes, key=lambda p: -len(p[0])):
+        if real == prefix or real.startswith(prefix + os.sep):
+            rel = os.path.join(name, os.path.relpath(real, prefix)).strip("/")
+            return rel if LOCAL_RE.match(rel) else None
+    return None
+
+
+def running_tools(root):
+    """Every imgstore-crop-arenas and preprocess-sample running on this computer (started here
+    or by hand), one entry per folder, with its progress."""
+    crops, preprocesses = {}, {}
+    for process in psutil.process_iter(["pid", "ppid", "cmdline", "create_time"]):
+        cmdline = process.info["cmdline"] or []
+        try:
+            if any("imgstore-crop-arenas" in part for part in cmdline[:3]):
+                crops.setdefault(os.path.realpath(process.cwd()), []).append(process)
+            elif any("preprocess-sample" in part for part in cmdline[:2]):
+                if "--store-path" in cmdline:
+                    store_path = cmdline[cmdline.index("--store-path") + 1]
+                else:
+                    store_path = next((part for part in cmdline if part.endswith("metadata.yaml")), None)
+                if store_path:
+                    if not os.path.isabs(store_path):
+                        store_path = os.path.join(process.cwd(), store_path)
+                    preprocesses.setdefault(os.path.realpath(os.path.dirname(store_path)), []).append(process)
+        except psutil.Error:
+            continue
+
+    def first(processes):
+        # the outermost process of the folder (the sh wrapper of runs started here)
+        return min(_outermost(processes), key=lambda p: p.info["create_time"], default=processes[0])
+
+    runs = []
+    for folder, processes in crops.items():
+        process = first(processes)
+        log = crop_log(folder, True)
+        runs.append({"tool": "crop_arenas", "experiment": _relative(root, folder), "folder": folder,
+                     "pid": process.pid, "started": process.info["create_time"],
+                     "resume": any("--resume" in (p.info["cmdline"] or []) for p in processes),
+                     "progress": log.get("progress"),
+                     "log_mtime": (log.get("log") or {}).get("mtime"),
+                     "last_line": ((log.get("log") or {}).get("tail") or [None])[-1]})
+    for folder, processes in preprocesses.items():
+        run = preprocess_run(first(processes))
+        if not run:
+            continue
+        start, end, current = run["start_chunk"], run["end_chunk"], run["current_chunk"]
+        progress = None
+        if start is not None and end is not None and end > start:
+            progress = {"done": max(0, current - start) if current is not None else 0, "total": end - start}
+        log_path = os.path.join(folder, "preprocess_sample.log")
+        runs.append({"tool": "preprocess_sample", "experiment": _relative(root, folder), "folder": folder,
+                     "progress": progress,
+                     "log_mtime": os.path.getmtime(log_path) if os.path.exists(log_path) else None, **run})
+    runs.sort(key=lambda r: (r["tool"], r["experiment"] or r["folder"]))
+    return runs
 
 
 def start_crop(folder, resume=False):
@@ -670,22 +756,48 @@ def start_crop(folder, resume=False):
     cmd = [CROP_ARENAS, "--input", "metadata.yaml", "--arenas", "arenas.toml"] + CROP_ARGS
     if resume:
         cmd.append("--resume")
-    line = " ".join(shlex.quote(part) for part in cmd)
     env = dict(os.environ, PYTHONUNBUFFERED="1",
                PATH=os.path.dirname(CROP_ARENAS) + os.pathsep + os.environ.get("PATH", ""))
-    with open(os.path.join(folder, CROP_LOG), "w") as log:
-        log.write(f"$ cd {shlex.quote(folder)} && {line}\n")
-        log.flush()
-        process = subprocess.Popen(["sh", "-c", f'{line}; rc=$?; echo; echo "[exit code $rc]"'], cwd=folder,
-                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, env=env)
-    return process.pid
+    return gpu_queue.spawn(cmd, folder, os.path.join(folder, CROP_LOG), env=env)
+
+
+def _outermost(processes):
+    pids = {p.pid for p in processes}
+    return [p for p in processes if p.info["ppid"] not in pids]
+
+
+def external_crops(root):
+    """imgstore-crop-arenas runs (their outermost process), for the GPU queue."""
+    processes = [p for p in psutil.process_iter(["pid", "ppid", "cmdline", "create_time"])
+                 if any("imgstore-crop-arenas" in part for part in (p.info["cmdline"] or [])[:3])]
+    jobs = []
+    for process in _outermost(processes):
+        try:
+            cwd = process.cwd()
+        except psutil.Error:
+            continue
+        jobs.append({"pid": process.pid, "what": _relative(root, cwd) or cwd, "started": process.info["create_time"]})
+    return jobs
+
+
+def register_crop_kind(root):
+    jobs = int(CROP_ARGS[CROP_ARGS.index("--jobs") + 1]) if "--jobs" in CROP_ARGS else 1
+
+    def progress(entry):
+        p = crop_log(entry["params"]["folder"], True).get("progress")
+        return dict(p, unit="chunks") if p else None
+
+    gpu_queue.register_kind(
+        "crop_arenas", "imgstore-crop-arenas", memory_mb=jobs * CROP_ENCODER_MB,
+        launch=lambda entry: start_crop(entry["params"]["folder"], resume=entry["params"].get("resume", False)),
+        progress=progress, external=lambda: external_crops(root))
 
 
 # ---- routes ----
 
 def register_data_collector(app):
     root = os.environ["FLYHOSTEL_VIDEOS"]
+    register_crop_kind(root)
 
     def bad_request(error):
         return jsonify({"error": str(error)}), 400
@@ -1025,17 +1137,20 @@ def register_data_collector(app):
         if LOCAL_RE.match(experiment).group(5):
             return jsonify({"arena": True})
         status = crop_status(folder)
+        status["queue"] = gpu_queue.find("crop_arenas", experiment)
         status.update(arena=False, command=" ".join(
             ["imgstore-crop-arenas", "--input", "metadata.yaml", "--arenas", "arenas.toml"] + CROP_ARGS))
         return jsonify(status)
 
     @app.route("/api/collector/crop_arenas", methods=["POST"])
     def collector_crop_start():
-        """{"experiment", "resume"}: starts imgstore-crop-arenas (with --resume when resume) on the
-        recording's saved arenas.toml in the background (409 if it runs there already)."""
+        """{"experiment", "resume"}: queues imgstore-crop-arenas (with --resume when resume) on the
+        recording's saved arenas.toml in the GPU queue, which starts it when the GPU has room
+        (409 if it runs or waits there already)."""
         body = request.get_json(silent=True) or {}
+        experiment = (body.get("experiment") or "").strip().strip("/")
         try:
-            folder = _whole_recording(body.get("experiment"))
+            folder = _whole_recording(experiment)
             if not os.path.exists(os.path.join(folder, "arenas.toml")):
                 raise ValueError("No arenas.toml: make and save it first")
             if not os.path.exists(CROP_ARENAS):
@@ -1044,14 +1159,31 @@ def register_data_collector(app):
             return bad_request(error)
         if crop_process(folder) is not None:
             return jsonify({"error": "imgstore-crop-arenas is already running on this recording"}), 409
-        return jsonify({"pid": start_crop(folder, resume=bool(body.get("resume")))})
+        resume = bool(body.get("resume"))
+        try:
+            entry = gpu_queue.enqueue("crop_arenas", f"{experiment}{' (resume)' if resume else ''}", experiment,
+                                      {"folder": folder, "resume": resume}, os.path.join(folder, CROP_LOG))
+        except FileExistsError as error:
+            return jsonify({"error": str(error)}), 409
+        return jsonify({"queued": entry})
+
+    @app.route("/api/collector/running", methods=["GET"])
+    def collector_running():
+        """imgstore-crop-arenas and preprocess-sample runs going on now, with their progress."""
+        return jsonify({"runs": running_tools(root), "now": time.time()})
 
     @app.route("/api/collector/crop_arenas/stop", methods=["POST"])
     def collector_crop_stop():
+        """Stops the recording's imgstore-crop-arenas, or takes it out of the GPU queue."""
+        experiment = ((request.get_json(silent=True) or {}).get("experiment") or "").strip().strip("/")
         try:
-            folder = _whole_recording((request.get_json(silent=True) or {}).get("experiment"))
+            folder = _whole_recording(experiment)
         except (ValueError, FileNotFoundError) as error:
             return bad_request(error)
+        entry = gpu_queue.find("crop_arenas", experiment)
+        if entry is not None:
+            gpu_queue.cancel(entry["id"])
+            return jsonify({"stopped": entry.get("pid"), "cancelled": entry["status"] == "queued"})
         process = crop_process(folder)
         if process is None:
             return jsonify({"error": "imgstore-crop-arenas is not running on this recording"}), 409
