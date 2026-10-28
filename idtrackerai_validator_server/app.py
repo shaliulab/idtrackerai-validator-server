@@ -48,7 +48,9 @@ from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.deg_labels import register_deg_labels
 from idtrackerai_validator_server.jobs import register_jobs
-from idtrackerai_validator_server.overview import register_overview, scan_not_analyzed, sheet_flies
+from idtrackerai_validator_server.overview import (
+    register_overview, scan_not_analyzed, sheet_flies, merge_light_cycle, LIGHT_CYCLE_COLUMNS, _clean,
+)
 from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
@@ -520,19 +522,30 @@ def get_version():
     return jsonify(GIT_VERSION)
 
 
+def _extra_metadata(rows):
+    """gbx (GBX column, "0" when missing or empty), light_cycle (also from the columns older
+    sheets wrote it in, as the Overview: merge_light_cycle) and age (age_min) of each row."""
+    flies = [{c: _clean(row.get(c)) for c in LIGHT_CYCLE_COLUMNS} for row in rows]
+    merge_light_cycle(flies)
+    return [{"gbx": _clean(row.get("GBX")) or "0", "light_cycle": fly.get("light_cycle") or "",
+             "age": _clean(row.get("age_min")) or ""} for row, fly in zip(rows, flies)]
+
+
 @app.route("/api/animal_metadata", methods=['GET'])
 def get_animal_metadata():
+    """Per identity: sex, genotype, gbx, light_cycle, age (see _extra_metadata)."""
     if STORE_INFO is not None:
         # Not analyzed: the metadata sheet rows
         result = {}
         flies = STORE_INFO["flies"]
+        extra = _extra_metadata(flies)
         for i, fly in enumerate(flies):
             identity = fly.get("identity") if len(flies) > 1 else None
             try:
                 key = str(int(float(identity))) if identity is not None else str(i if len(flies) == 1 else i + 1)
             except ValueError:
                 key = str(i + 1)
-            result[key] = {k: fly[k] for k in ("sex", "genotype") if k in fly}
+            result[key] = {**{k: fly[k] for k in ("sex", "genotype") if k in fly}, **extra[i]}
         return jsonify(result)
     if db_manager is None:
         return _experiment_required()
@@ -570,19 +583,24 @@ def get_animal_metadata():
                                "matching flies by row order", experiment)
                 by_identity = {}
 
-        result = {}
+        matched = []
         for i, identity in enumerate(identities):
             if by_identity:
                 r = by_identity.get(int(identity))
             else:
                 r = df.iloc[i] if i < len(df) else None
             if r is not None:
-                entry = {}
-                if 'sex' in df.columns:
-                    entry['sex'] = safe(r.get('sex'))
-                if 'genotype' in df.columns:
-                    entry['genotype'] = safe(r.get('genotype'))
-                result[str(identity)] = entry
+                matched.append((identity, r))
+        extra = _extra_metadata([r for _, r in matched])
+
+        result = {}
+        for (identity, r), more in zip(matched, extra):
+            entry = dict(more)
+            if 'sex' in df.columns:
+                entry['sex'] = safe(r.get('sex'))
+            if 'genotype' in df.columns:
+                entry['genotype'] = safe(r.get('genotype'))
+            result[str(identity)] = entry
         return jsonify(result)
     except Exception as e:
         logger.error("Error fetching animal metadata: %s", e)
