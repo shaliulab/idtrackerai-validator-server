@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1d3b6e">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/logo.svg" type="image/svg+xml">
+  <title>Sign in · FlyHostel Viewer</title>
+  <script>
+    // same theme as the app (App.js keeps it in fh-theme)
+    try { document.documentElement.dataset.theme = localStorage.getItem('fh-theme') || 'light'; } catch (e) { /* ignore */ }
+  </script>
+  <style>
+    :root {
+      --bg: #f4f6f9; --surface: #ffffff; --text: #1f2937; --subtext: #64748b;
+      --border: #dbe1e8; --border-strong: #c3ccd6; --accent: #2563eb; --accent-hover: #1d4ed8;
+      --accent-soft: #dbeafe; --danger: #dc2626; --danger-soft: #fef2f2; --info-soft: #f0f9ff;
+      --shadow: 0 1px 2px rgba(15, 23, 42, .06), 0 12px 32px rgba(15, 23, 42, .10);
+      --glow: radial-gradient(1200px 600px at 50% -10%, #dbe7fb 0%, transparent 60%);
+    }
+    :root[data-theme="dark"] {
+      --bg: #16181d; --surface: #1f232a; --text: #e2e8f0; --subtext: #94a3b8;
+      --border: #323843; --border-strong: #454d5a; --accent: #3b82f6; --accent-hover: #60a5fa;
+      --accent-soft: #1e3a5f; --danger: #f87171; --danger-soft: #3b1d1f; --info-soft: #1b2733;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 12px 32px rgba(0, 0, 0, .35);
+      --glow: radial-gradient(1200px 600px at 50% -10%, #1c2c45 0%, transparent 60%);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 24px 16px; background: var(--glow), var(--bg); color: var(--text);
+      font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    .card {
+      width: 100%; max-width: 380px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 14px; box-shadow: var(--shadow); padding: 32px 28px 24px;
+    }
+    .brand { text-align: center; margin-bottom: 24px; }
+    .brand img { width: 88px; height: 88px; display: block; margin: 0 auto 12px; }
+    .brand h1 { margin: 0; font-size: 20px; font-weight: 650; letter-spacing: .01em; }
+    .brand p { margin: 2px 0 0; font-size: 12px; color: var(--subtext); }
+    label.field { display: block; margin-bottom: 14px; }
+    label.field span { display: block; font-size: 12px; font-weight: 600; color: var(--subtext); margin-bottom: 5px; }
+    input[type=text], input[type=password] {
+      width: 100%; padding: 10px 12px; font: inherit; color: var(--text); background: var(--bg);
+      border: 1px solid var(--border-strong); border-radius: 8px; outline: none; transition: border-color .15s, box-shadow .15s;
+    }
+    input[type=text]:focus, input[type=password]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .pw { position: relative; }
+    .pw input { padding-right: 64px; }
+    .pw button {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: 0; background: none;
+      color: var(--subtext); font: inherit; font-size: 12px; padding: 4px 8px; cursor: pointer; border-radius: 6px;
+    }
+    .pw button:hover { color: var(--text); background: var(--accent-soft); }
+    .remember { display: flex; align-items: center; gap: 8px; margin: 4px 0 18px; font-size: 13px; cursor: pointer; }
+    .remember input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
+    button.submit {
+      width: 100%; padding: 11px; font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+      border: 0; border-radius: 8px; cursor: pointer; transition: background .15s;
+    }
+    button.submit:hover { background: var(--accent-hover); }
+    button.submit:disabled { opacity: .7; cursor: progress; }
+    .msg { border-radius: 8px; padding: 9px 12px; margin-bottom: 16px; font-size: 13px; }
+    .msg.error { background: var(--danger-soft); color: var(--danger); }
+    .msg.info { background: var(--info-soft); color: var(--subtext); }
+    .msg[hidden] { display: none; }
+    details { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 14px; font-size: 12px; color: var(--subtext); }
+    summary { cursor: pointer; }
+    details ol { padding-left: 18px; margin: 8px 0 0; }
+    details li { margin-bottom: 4px; }
+    a { color: var(--accent); }
+    code { font-size: 11px; }
+    footer { margin-top: 18px; font-size: 11px; color: var(--subtext); text-align: center; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="brand">
+      <img src="/logo.svg" alt="">
+      <h1>FlyHostel Viewer</h1>
+      <p>idtrackerai validator · Liu Lab @ VIB-KU Leuven</p>
+    </div>
+
+    {% if error %}<div class="msg error" id="msg" role="alert">{{ error }}</div>
+    {% elif signed_out %}<div class="msg info" id="msg" role="status">You signed out.</div>
+    {% else %}<div class="msg error" id="msg" role="alert" hidden></div>{% endif %}
+
+    <form id="login" method="post" action="/login">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label class="field">
+        <span>Username</span>
+        <input type="text" name="username" id="username" value="{{ username }}" autocomplete="username"
+               autocapitalize="none" spellcheck="false" required {% if not username %}autofocus{% endif %}>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <div class="pw">
+          <input type="password" name="password" id="password" autocomplete="current-password" required
+                 {% if username %}autofocus{% endif %}>
+          <button type="button" id="toggle" aria-label="Show password">Show</button>
+        </div>
+      </label>
+      <label class="remember">
+        <input type="checkbox" name="remember" checked> Keep me signed in on this browser
+      </label>
+      <button class="submit" type="submit" id="submit">Sign in</button>
+    </form>
+
+    {% if ca %}
+    <details>
+      <summary>The browser says the connection is not private?</summary>
+      <p>This server's certificate is signed by the FlyHostel Viewer certificate authority. Trust it once per computer:</p>
+      <ol>
+        <li>Download <a href="/ca.crt">flyhostel-viewer-ca.crt</a>.</li>
+        <li><b>Windows / Chrome / Edge:</b> open the file → Install Certificate → Current user → “Place all certificates in”
+          → <i>Trusted Root Certification Authorities</i>.</li>
+        <li><b>macOS / Safari / Chrome:</b> open it in Keychain Access (login keychain), double click the certificate →
+          Trust → <i>Always Trust</i>.</li>
+        <li><b>Linux Chrome:</b> <code>chrome://settings/certificates</code> → Authorities → Import, tick “Trust this certificate
+          for identifying websites”.</li>
+        <li><b>Firefox</b> (any OS): Settings → Privacy &amp; Security → View Certificates → Authorities → Import, tick “Trust this
+          CA to identify websites”.</li>
+        <li>Restart the browser.</li>
+      </ol>
+    </details>
+    {% endif %}
+  </main>
+  <footer>Your browser can remember the password: it is offered when you sign in.</footer>
+
+  <script>
+    (function () {
+      var form = document.getElementById('login');
+      var msg = document.getElementById('msg');
+      var password = document.getElementById('password');
+      var submit = document.getElementById('submit');
+      var signedOut = {{ 'true' if signed_out else 'false' }};
+      var hadError = {{ 'true' if error else 'false' }};
+
+      document.getElementById('toggle').addEventListener('click', function () {
+        var show = password.type === 'password';
+        password.type = show ? 'text' : 'password';
+        this.textContent = show ? 'Hide' : 'Show';
+        this.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+      });
+
+      // Chromium: Credential Management API. Sign in with fetch, store the credential
+      // once it worked, and next time sign in with it without a click. Elsewhere the
+      // form is submitted normally and the browser's password manager does the rest.
+      var cm = window.PasswordCredential && navigator.credentials && window.fetch;
+      if (!cm) return;
+
+      function showError(text) {
+        msg.textContent = text; msg.className = 'msg error'; msg.hidden = false;
+      }
+
+      function signIn(data, credential) {
+        submit.disabled = true;
+        submit.textContent = 'Signing in…';
+        return fetch('/login', {
+          method: 'POST', body: new URLSearchParams(data), credentials: 'same-origin',
+          headers: { Accept: 'application/json' },
+        }).then(function (r) {
+          return r.json().then(function (body) {
+            if (!body.ok) throw new Error(body.error || 'Sign in failed.');
+            var store = credential ? navigator.credentials.store(credential) : Promise.resolve();
+            return store.catch(function () {}).then(function () { window.location.replace(body.next || '/'); });
+          });
+        }).catch(function (e) {
+          submit.disabled = false;
+          submit.textContent = 'Sign in';
+          showError(e.message || 'Sign in failed.');
+          throw e;
+        });
+      }
+
+      form.addEventListener('submit', function (event) {
+        event.preventDefault();
+        var data = new FormData(form);
+        var credential = new PasswordCredential({
+          id: data.get('username'), password: data.get('password'), name: data.get('username'),
+        });
+        signIn(data, credential).catch(function () {});
+      });
+
+      if (signedOut) {
+        navigator.credentials.preventSilentAccess().catch(function () {});
+        return;
+      }
+      if (hadError) return;
+      navigator.credentials.get({ password: true, mediation: 'silent' }).then(function (credential) {
+        if (!credential || !credential.password) return;
+        var data = new FormData(form);
+        data.set('username', credential.id);
+        data.set('password', credential.password);
+        data.set('remember', 'on');
+        document.getElementById('username').value = credential.id;
+        signIn(data, null).catch(function () {});
+      }).catch(function () {});
+    })();
+  </script>
+</body>
+</html>

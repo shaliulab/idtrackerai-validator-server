@@ -108,6 +108,9 @@ def main():
     tls = bool(args.certfile and args.keyfile)
     url = "{}://{}:{}".format("https" if tls else "http", display_host, args.port)
 
+    app.config["SESSION_COOKIE_NAME"] = "validator_session_{}".format(args.port)
+    app.config["SESSION_COOKIE_SECURE"] = tls
+
     if not args.no_browser:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 

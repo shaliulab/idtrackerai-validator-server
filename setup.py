@@ -103,7 +103,7 @@ setup(
     packages=find_packages(include=["idtrackerai_validator_server*"]),
     include_package_data=True,
     package_data={
-        "idtrackerai_validator_server": ["frontend/*", "frontend/**/*"],
+        "idtrackerai_validator_server": ["frontend/*", "frontend/**/*", "templates/*"],
     },
     classifiers=[
         'Programming Language :: Python :: 3',

@@ -1,4 +1,3 @@
-import hmac
 import io
 import os
 from threading import Lock, Timer
@@ -8,7 +7,7 @@ from collections import OrderedDict
 import re
 import traceback
 import logging
-from flask import Flask, Response, jsonify, request, send_from_directory, send_file
+from flask import Flask, jsonify, request, send_from_directory, send_file
 from flask_cors import CORS
 from flask import g
 from flask_sqlalchemy import SQLAlchemy
@@ -44,6 +43,7 @@ from idtrackerai_validator_server.backend import (
     load_experiment_without_database,
     frame_time_from_index,
 )
+from idtrackerai_validator_server.auth import register_auth
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.deg_labels import register_deg_labels
@@ -116,29 +116,9 @@ FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fronten
 app = Flask(__name__, static_folder=None)
 
 
-app.config['SECRET_KEY'] = 'FLYHOSTEL_1234'
 CORS(app)
-
-# HTTP Basic Auth on every route when VALIDATOR_USERNAME and VALIDATOR_PASSWORD are set
-AUTH_USERNAME = os.environ.get("VALIDATOR_USERNAME")
-AUTH_PASSWORD = os.environ.get("VALIDATOR_PASSWORD")
-
-
-@app.before_request
-def require_login():
-    if not (AUTH_USERNAME and AUTH_PASSWORD):
-        return None
-    auth = request.authorization
-    if (
-        auth is not None
-        and hmac.compare_digest((auth.username or "").encode(), AUTH_USERNAME.encode())
-        and hmac.compare_digest((auth.password or "").encode(), AUTH_PASSWORD.encode())
-    ):
-        return None
-    return Response(
-        "Login required", 401,
-        {"WWW-Authenticate": 'Basic realm="idtrackerai validator", charset="UTF-8"'},
-    )
+# Login form and session cookie when VALIDATOR_USERNAME and VALIDATOR_PASSWORD are set
+register_auth(app)
 
 register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)

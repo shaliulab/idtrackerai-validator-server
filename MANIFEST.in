@@ -1,5 +1,6 @@
 include README.md
 recursive-include idtrackerai_validator_server/frontend *
+recursive-include idtrackerai_validator_server/templates *
 prune idtrackerai-validator-client
 prune flyhostel
 global-exclude *.py[cod] __pycache__
