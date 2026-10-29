@@ -388,7 +388,18 @@ def clean_settings(settings):
     else:
         settings.pop("roi_list", None)
         settings.pop("exclusive_rois", None)
-    ordered = {k: settings[k] for k in TOML_ORDER if k in settings and settings[k] is not None}
+    # landmarks.toml of 2 flies separated by a splitter: the line between them, [[x1, y1], [x2, y2]],
+    # read by split_identities.py of the pipeline (fly 1 on the left / top, fly 2 on the right / bottom)
+    splitter = settings.get("splitter")
+    if splitter is not None:
+        if (not isinstance(splitter, list) or len(splitter) != 2
+                or not all(isinstance(p, list) and len(p) == 2 for p in splitter)):
+            raise ValueError(f"splitter must be 2 points [[x1, y1], [x2, y2]]: {splitter}")
+        splitter = [[float(_number(v, "splitter")) for v in p] for p in splitter]
+        if splitter[0] == splitter[1] or any(math.isinf(v) for p in splitter for v in p):
+            raise ValueError(f"splitter must be 2 different points: {splitter}")
+        settings["splitter"] = splitter
+    ordered ={k: settings[k] for k in TOML_ORDER if k in settings and settings[k] is not None}
     ordered.update({k: v for k, v in settings.items() if k not in ordered and v is not None})
     return ordered
 
