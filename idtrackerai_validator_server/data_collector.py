@@ -189,6 +189,22 @@ done
     return experiments, now
 
 
+def databases(folder):
+    """Databases of a folder and of its arenas (paths relative to it): the *db files other than
+    index.db, the ones the index lists (an experiment with one is analyzed)."""
+    out = []
+    for pattern in ("*db", "arenas/*/*db"):
+        for path in sorted(glob.glob(os.path.join(folder, pattern))):
+            if os.path.basename(path) == "index.db":
+                continue
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            out.append({"path": os.path.relpath(path, folder), "size": stat.st_size, "mtime": stat.st_mtime})
+    return out
+
+
 def plan(experiment, remote, now, zt_limit, root):
     """What to copy of one experiment: chunks before ZT zt_limit and the other top-level files."""
     hostel, _, date_time, date, hour, minute, second = EXPERIMENT_RE.match(experiment).groups()
@@ -247,6 +263,7 @@ def plan(experiment, remote, now, zt_limit, root):
         "arenas": sorted(int(a) for a in os.listdir(os.path.join(folder, "arenas")) if a.isdigit())
         if os.path.isdir(os.path.join(folder, "arenas")) else [],
         "fetching": experiment in _fetching,
+        "databases": databases(folder) if os.path.isdir(folder) else [],
     }
 
 
@@ -960,6 +977,7 @@ def register_data_collector(app):
             "date_time": date_time, "arena": arena,
             "preview": os.path.getmtime(preview) if os.path.exists(preview) else None,
             "conf": os.path.exists(os.path.join(folder, date_time + ".conf")),
+            "databases": databases(folder),
             # the NX of an arena folder is the whole recording's: 1 animal per arena by default (as roi-proposer)
             "group_size": None if arena else int(experiment.split("/")[1][:-1]),
         })
