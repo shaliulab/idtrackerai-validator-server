@@ -18,9 +18,12 @@ app) rewrites them, the old file kept in toml_backups/, and converts <date>.toml
 preprocess-sample (idtrackeraiv4) samples frames of the chunks and writes the frames where
 the segmentation does not find number_of_animals blobs to preprocess_sample.csv. It takes
 hours, so it runs in its own session (it survives server restarts) and is found again by its
-command line; the chunk it reads (its open .mp4) gives its progress.
+command line; the chunk it reads (its open .mp4) gives its progress. It reads <folder name>.conf:
+in an arena folder (arenas/K) that is K.conf, a copy of <date>.conf (`sync_arena_conf`, made
+when <date>.toml is saved and before each run).
 """
 import datetime
+import filecmp
 import glob
 import io
 import json
@@ -549,6 +552,26 @@ def preprocess_chunks(folder):
     raise FileNotFoundError(f"No chunk with a readable .npz before chunk {PREPROCESS_MAX_CHUNK}")
 
 
+def _date_conf(folder):
+    """<date>.conf of an experiment folder or of one of its arenas (arenas/K)."""
+    if os.path.basename(os.path.dirname(folder)) == "arenas":
+        return os.path.join(folder, os.path.basename(os.path.dirname(os.path.dirname(folder))) + ".conf")
+    return os.path.join(folder, os.path.basename(folder) + ".conf")
+
+
+def sync_arena_conf(folder):
+    """Copies an arena's <date>.conf to K.conf, the name preprocess-sample reads (arenas/K);
+    returns the copy, None outside arena folders or without <date>.conf."""
+    if os.path.basename(os.path.dirname(folder)) != "arenas":
+        return None
+    source, target = _date_conf(folder), os.path.join(folder, os.path.basename(folder) + ".conf")
+    if not os.path.exists(source):
+        return None
+    if not (os.path.exists(target) and filecmp.cmp(source, target, shallow=False)):
+        shutil.copy2(source, target)
+    return target
+
+
 def preprocess_process(folder):
     """The preprocess-sample process checking this folder, if any (started here or by roi-proposer)."""
     store = os.path.join(os.path.realpath(folder), "metadata.yaml")
@@ -610,8 +633,10 @@ def preprocess_status(folder):
                 "points": [[float(x), float(y)] for x, y in zip(rows["x"], rows["y"]) if pd.notna(x) and pd.notna(y)],
             })
         status["csv"] = {"mtime": os.path.getmtime(csv_path), "rows": len(df), "frames": frames}
-    conf = os.path.join(folder, os.path.basename(folder) + ".conf")
+    # what preprocess-sample reads, <folder name>.conf, is <date>.conf or (arenas) its copy
+    conf = _date_conf(folder)
     status["has_conf"] = os.path.exists(conf)
+    status["conf"] = os.path.basename(conf)
     if status["has_conf"]:
         try:
             with open(conf) as handle:
@@ -961,6 +986,7 @@ def register_data_collector(app):
         if name == f"{date_time_of(experiment)}.toml":
             try:
                 response["conf"] = conf_convert(path)
+                sync_arena_conf(folder)
             except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
                 response["conf_error"] = str(error)
         response["files"] = toml_files(folder, date_time_of(experiment))
@@ -1097,10 +1123,10 @@ def register_data_collector(app):
         body = request.get_json(silent=True) or {}
         try:
             folder = experiment_folder(root, body.get("experiment"))
-            if LOCAL_RE.match(body["experiment"].strip().strip("/")).group(5):
-                raise ValueError("preprocess-sample does not run on arena folders: it reads <folder name>.conf")
-            if not os.path.exists(os.path.join(folder, os.path.basename(folder) + ".conf")):
-                raise ValueError(f"No {os.path.basename(folder)}.conf: save {os.path.basename(folder)}.toml first")
+            date_conf = _date_conf(folder)
+            if not os.path.exists(date_conf):
+                name = os.path.basename(date_conf)[:-len(".conf")]
+                raise ValueError(f"No {name}.conf: save {name}.toml first")
             if body.get("start_chunk") in (None, "") or body.get("end_chunk") in (None, ""):
                 start, end = preprocess_chunks(folder)
             else:
@@ -1112,6 +1138,7 @@ def register_data_collector(app):
             return bad_request(error)
         if preprocess_process(folder) is not None:
             return jsonify({"error": "preprocess-sample is already running on this experiment"}), 409
+        sync_arena_conf(folder)
         pid = start_preprocess(folder, start, end, samples)
         return jsonify({"pid": pid, "start_chunk": start, "end_chunk": end, "samples_per_chunk": samples})
 
