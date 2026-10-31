@@ -14,7 +14,9 @@ also be scheduled (`schedule_tick`: started at a given time, planned then).
 Settings: `roi-proposer propose` writes <date>.toml + landmarks.toml (arenas.toml for arena
 experiments) marked with AI_MARK; the editor (a web version of idtrackerai v6's segmentation
 app) rewrites them, the old file kept in toml_backups/, and converts <date>.toml to the
-<date>.conf (idtrackerai v4) preprocess-sample and the tracking read.
+<date>.conf (idtrackerai v4) preprocess-sample and the tracking read. In an arena folder, the
+roi_list of landmarks.toml is kept a copy of that of <date>.toml (`sync_arena_landmarks`): the
+food of an arena is the whole arena.
 
 preprocess-sample (idtrackeraiv4) samples frames of the chunks and writes the frames where
 the segmentation does not find number_of_animals blobs to preprocess_sample.csv. It takes
@@ -795,6 +797,35 @@ def sync_arena_conf(folder):
     return target
 
 
+def sync_arena_landmarks(folder, date_time):
+    """In an arena folder (arenas/K), makes the roi_list of landmarks.toml a copy of that of <date>.toml: the
+    food of an arena is the arena itself (fh export writes it to LANDMARKS from <date>.toml: its Ellipse is the
+    food and its negative ROIs are areas without food). The rest of landmarks.toml (e.g. the splitter) is kept;
+    without landmarks.toml, it is made from <date>.toml. Returns the path written, None if nothing changed."""
+    if os.path.basename(os.path.dirname(folder)) != "arenas":
+        return None
+    main = os.path.join(folder, f"{date_time}.toml")
+    if not os.path.exists(main):
+        return None
+    with open(main, "rb") as handle:
+        main_settings = tomllib.load(handle)
+    if not main_settings.get("roi_list"):
+        return None
+    path = os.path.join(folder, "landmarks.toml")
+    if os.path.exists(path):
+        with open(path, "rb") as handle:
+            settings = tomllib.load(handle)
+        with open(path) as handle:
+            was_ai = handle.read().startswith(AI_MARK)
+    else:
+        settings, was_ai = dict(main_settings), False
+    if settings.get("roi_list") == main_settings["roi_list"]:
+        return None
+    settings["roi_list"] = main_settings["roi_list"]
+    settings["exclusive_rois"] = main_settings.get("exclusive_rois", False)
+    return write_toml(folder, "landmarks.toml", clean_settings(settings), was_ai)
+
+
 def preprocess_process(folder):
     """The preprocess-sample process checking this folder, if any (started here or by roi-proposer)."""
     store = os.path.join(os.path.realpath(folder), "metadata.yaml")
@@ -1261,6 +1292,11 @@ def register_data_collector(app):
                 sync_arena_conf(folder)
             except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
                 response["conf_error"] = str(error)
+        # arenas: the roi_list of landmarks.toml is always a copy of that of <date>.toml (either one saved)
+        try:
+            response["landmarks_synced"] = sync_arena_landmarks(folder, date_time_of(experiment))
+        except (ValueError, OSError, tomllib.TOMLDecodeError) as error:
+            response["landmarks_error"] = str(error)
         response["files"] = toml_files(folder, date_time_of(experiment))
         return jsonify(response)
 
