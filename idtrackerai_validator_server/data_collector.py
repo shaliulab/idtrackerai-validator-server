@@ -8,7 +8,8 @@ copied: the files of the experiment folder (not its subfolders) and the chunks s
 before ZT `zt_limit` (30: the first 24 h and a buffer), skipping files modified in the last
 `RECENT_S` (still being written). ZT0 is the experiment date at its `reference_hour` in the
 metadata sheets (DEFAULT_REFERENCE_HOUR when the sheets have no row yet); a chunk starts at
-created_utc + chunk * chunksize / framerate (metadata.yaml). One fetch at a time.
+created_utc + chunk * chunksize / framerate (metadata.yaml). One fetch at a time. A fetch can
+also be scheduled (`schedule_tick`: started at a given time, planned then).
 
 Settings: `roi-proposer propose` writes <date>.toml + landmarks.toml (arenas.toml for arena
 experiments) marked with AI_MARK; the editor (a web version of idtrackerai v6's segmentation
@@ -23,6 +24,7 @@ in an arena folder (arenas/K) that is K.conf, a copy of <date>.conf (`sync_arena
 when <date>.toml is saved and before each run).
 """
 import datetime
+import fcntl
 import filecmp
 import glob
 import io
@@ -37,6 +39,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict
 
 import cv2
@@ -302,6 +305,209 @@ def fetch(job, index, experiment, files, root):
             raise RuntimeError(f"rsync exited with {process.returncode}: {stderr.strip()[-800:]}")
     finally:
         os.unlink(files_from)
+
+
+class FetchRefused(Exception):
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
+
+
+def start_fetch(experiments, zt_limit, root, on_end=None):
+    """Plan and start the fetch of `experiments` (a job, one item per experiment). Raises
+    FetchRefused (409 a fetch runs, 400 not on cv2 / no room, 502 cv2 unreachable).
+    on_end(job) is called when the job ends."""
+    if not experiments:
+        raise FetchRefused("No experiment selected", 400)
+    if not _fetch_lock.acquire(blocking=False):
+        raise FetchRefused("A fetch is already running", 409)
+    try:
+        dates = sorted({EXPERIMENT_RE.match(e).group(4) for e in experiments})
+        listed, now = {}, time.time()
+        for date in dates:
+            found, now = remote_files(date)
+            listed.update(found)
+        plans = []
+        for experiment in experiments:
+            if experiment not in listed:
+                raise ValueError(f"{experiment} is not on {REMOTE_HOST}")
+            plans.append(plan(experiment, listed[experiment], now, zt_limit, root))
+        needed = {}
+        for p in plans:
+            needed[p["flyhostel"]] = needed.get(p["flyhostel"], 0) + p["missing_bytes"]
+        for hostel, nbytes in needed.items():
+            free = _drive_free(root, f"{hostel}/")
+            if free is None:
+                raise ValueError(f"{os.path.join(root, hostel)} does not exist")
+            if free - nbytes < FETCH_MARGIN:
+                raise ValueError(f"{hostel}'s drive has {free / 1e9:.0f} GB free, {nbytes / 1e9:.0f} GB needed "
+                                 f"(at least {FETCH_MARGIN / 1e9:.0f} GB must stay free)")
+    except Exception as error:
+        _fetch_lock.release()
+        status = 502 if isinstance(error, (RuntimeError, subprocess.TimeoutExpired)) else 400
+        raise FetchRefused(str(error), status) from error
+    _fetching.update(experiments)
+
+    def work(job):
+        failed = None
+        try:
+            failed = []
+            for index, p in enumerate(plans):
+                if not p["missing"]:
+                    job.update(index, status="skipped", progress=1.0, error="already here")
+                    continue
+                job.update(index, status="running")
+                try:
+                    fetch(job, index, p["experiment"], p["missing"], root)
+                    job.update(index, status="done", progress=1.0)
+                except Exception as error:
+                    logger.exception("Fetching %s failed", p["experiment"])
+                    job.update(index, status="failed", error=str(error))
+                    failed.append(p["experiment"])
+                finally:
+                    _fetching.discard(p["experiment"])
+            job.result = {"experiments": experiments, "failed": failed}
+            if failed:
+                raise RuntimeError(f"{len(failed)} experiment(s) failed: {', '.join(failed)}")
+        finally:
+            _fetching.difference_update(experiments)
+            _fetch_lock.release()
+            if on_end is not None:
+                try:
+                    on_end(job, failed)
+                except Exception:
+                    logger.exception("Fetch end callback failed")
+
+    return start_job(f"Fetch {len(plans)} experiment(s) from {REMOTE_HOST} (up to ZT{zt_limit:g})",
+                     [p["experiment"] for p in plans], work)
+
+
+# ---- scheduled fetches ----
+# Entries in $COLLECTOR_SCHEDULE_FILE (JSON, read / written under an flock, so every server
+# instance shows and adds them); only the instance holding <file>.scheduler starts them. A due
+# entry starts when no fetch runs (else it waits for it, `waiting`); what it copies is planned
+# when it starts. Status: scheduled → running (job_id) → done / failed; or cancelled.
+
+SCHEDULE_FILE = os.environ.get("COLLECTOR_SCHEDULE_FILE",
+                               os.path.expanduser("~/.cache/idtrackerai-validator/fetch_schedule.json"))
+SCHEDULE_TICK_S = 30
+SCHEDULE_KEEP_FINISHED = 20
+_schedule_wake = threading.Event()
+_schedule_started = False
+_schedule_lock = None
+
+
+class _Schedule:
+    """with _Schedule() as state: state["entries"] ... (written back on exit)."""
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(SCHEDULE_FILE), exist_ok=True)
+        self._lock = open(SCHEDULE_FILE + ".lock", "a")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        try:
+            with open(SCHEDULE_FILE) as handle:
+                self.state = json.load(handle)
+        except (OSError, ValueError):
+            self.state = {"entries": []}
+        self._before = json.dumps(self.state, sort_keys=True)
+        return self.state
+
+    def __exit__(self, *exc):
+        try:
+            if exc[0] is None and json.dumps(self.state, sort_keys=True) != self._before:
+                finished = [e for e in self.state["entries"] if e["status"] not in ("scheduled", "running")]
+                for old in sorted(finished, key=lambda e: e.get("ended") or 0)[:-SCHEDULE_KEEP_FINISHED or None]:
+                    self.state["entries"].remove(old)
+                tmp = SCHEDULE_FILE + ".tmp"
+                with open(tmp, "w") as handle:
+                    json.dump(self.state, handle, indent=1)
+                os.replace(tmp, SCHEDULE_FILE)
+        finally:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()
+
+
+def _schedule_order(entries):
+    waiting = sorted((e for e in entries if e["status"] in ("scheduled", "running")),
+                     key=lambda e: (e["status"] != "running", e["at"]))
+    done = sorted((e for e in entries if e["status"] not in ("scheduled", "running")),
+                  key=lambda e: -(e.get("ended") or 0))
+    return waiting + done
+
+
+def _schedule_ended(entry_id):
+    def on_end(job, failed):
+        with _Schedule() as state:
+            for entry in state["entries"]:
+                if entry["id"] == entry_id:
+                    entry.update(status="failed" if job.error or failed or failed is None else "done",
+                                 error=job.error, ended=time.time(), waiting=None)
+    return on_end
+
+
+def schedule_tick(root):
+    """Start the earliest due entry when no fetch runs; mark running entries whose job this
+    process does not know (server restarted while it ran) as failed."""
+    from idtrackerai_validator_server.jobs import _jobs
+    now = time.time()
+    with _Schedule() as state:
+        for entry in state["entries"]:
+            if entry["status"] == "running" and entry["job_id"] not in _jobs:
+                entry.update(status="failed", ended=now,
+                             error="The server stopped while it ran (rsync resumes: schedule it again)")
+        due = sorted((e for e in state["entries"] if e["status"] == "scheduled" and e["at"] <= now),
+                     key=lambda e: e["at"])
+        if not due:
+            return
+        entry = dict(due[0])
+    # cv2 is listed outside the lock (seconds): the routes stay responsive
+    update = {"waiting": None}
+    try:
+        job = start_fetch(entry["experiments"], entry["zt_limit"], root, on_end=_schedule_ended(entry["id"]))
+        update.update(status="running", job_id=job.id, started=now)
+    except FetchRefused as error:
+        if error.status == 409:
+            update["waiting"] = "for the fetch running now"
+        elif error.status == 502 and now - entry["at"] < 6 * 3600:
+            update["waiting"] = f"{REMOTE_HOST} unreachable, retrying: {error}"
+        else:
+            update.update(status="failed", error=str(error), ended=now)
+    with _Schedule() as state:
+        for e in state["entries"]:
+            if e["id"] == entry["id"]:
+                if e["status"] == "cancelled" and update.get("status") == "running":
+                    e.update(status="running", job_id=update["job_id"], started=now)  # too late to cancel
+                elif e["status"] == "scheduled":
+                    e.update(update)
+                elif update.get("job_id") and not e.get("job_id"):   # it ended already
+                    e.update(job_id=update["job_id"], started=now)
+
+
+def _schedule_loop(root):
+    while True:
+        try:
+            schedule_tick(root)
+        except Exception:
+            logger.exception("Fetch schedule tick failed")
+        _schedule_wake.wait(SCHEDULE_TICK_S)
+        _schedule_wake.clear()
+
+
+def start_fetch_scheduler(root):
+    """Starts the fetch scheduler unless another server instance holds it."""
+    global _schedule_started, _schedule_lock
+    if _schedule_started:
+        return
+    os.makedirs(os.path.dirname(SCHEDULE_FILE), exist_ok=True)
+    handle = open(SCHEDULE_FILE + ".scheduler", "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        logger.info("data_collector: another server instance runs the fetch schedule")
+        return
+    _schedule_lock, _schedule_started = handle, True
+    threading.Thread(target=_schedule_loop, args=(root,), name="fetch-schedule", daemon=True).start()
 
 
 # ---- settings (tomls) ----
@@ -944,66 +1150,69 @@ def register_data_collector(app):
         try:
             experiments = [_check_experiment(e) for e in body.get("experiments") or []]
             zt_limit = float(body.get("zt_limit", ZT_LIMIT))
+            job = start_fetch(experiments, zt_limit, root)
+        except FetchRefused as error:
+            return jsonify({"error": str(error)}), error.status
         except ValueError as error:
             return bad_request(error)
+        return jsonify(job.to_dict()), 202
+
+    @app.route("/api/collector/schedule", methods=["GET"])
+    def collector_schedule():
+        """Scheduled fetches (waiting first, by time) and the last finished ones."""
+        with _Schedule() as state:
+            entries = list(state["entries"])
+        return jsonify({"entries": _schedule_order(entries), "now": time.time(),
+                        "scheduling": _schedule_started})
+
+    @app.route("/api/collector/schedule", methods=["POST"])
+    def collector_schedule_add():
+        """{"experiments", "zt_limit", "at" (unix s)}: fetch them at that time (what to copy is
+        planned then, so chunks recorded until then are included)."""
+        body = request.get_json(silent=True) or {}
+        try:
+            experiments = [_check_experiment(e) for e in body.get("experiments") or []]
+            zt_limit = float(body.get("zt_limit", ZT_LIMIT))
+            at = float(body["at"])
+        except (KeyError, TypeError, ValueError) as error:
+            return bad_request(f"Bad schedule: {error}")
         if not experiments:
             return bad_request("No experiment selected")
-        if not _fetch_lock.acquire(blocking=False):
-            return jsonify({"error": "A fetch is already running"}), 409
-        try:
-            dates = sorted({EXPERIMENT_RE.match(e).group(4) for e in experiments})
-            listed, now = {}, time.time()
-            for date in dates:
-                found, now = remote_files(date)
-                listed.update(found)
-            plans = []
-            for experiment in experiments:
-                if experiment not in listed:
-                    raise ValueError(f"{experiment} is not on {REMOTE_HOST}")
-                plans.append(plan(experiment, listed[experiment], now, zt_limit, root))
-            needed = {}
-            for p in plans:
-                needed[p["flyhostel"]] = needed.get(p["flyhostel"], 0) + p["missing_bytes"]
-            for hostel, nbytes in needed.items():
-                free = _drive_free(root, f"{hostel}/")
-                if free is None:
-                    raise ValueError(f"{os.path.join(root, hostel)} does not exist")
-                if free - nbytes < FETCH_MARGIN:
-                    raise ValueError(f"{hostel}'s drive has {free / 1e9:.0f} GB free, {nbytes / 1e9:.0f} GB needed "
-                                     f"(at least {FETCH_MARGIN / 1e9:.0f} GB must stay free)")
-        except Exception as error:
-            _fetch_lock.release()
-            status = 502 if isinstance(error, (RuntimeError, subprocess.TimeoutExpired)) else 400
-            return jsonify({"error": str(error)}), status
-        _fetching.update(experiments)
+        if at < time.time() - 60:
+            return bad_request("That time has passed")
+        entry = {"id": uuid.uuid4().hex[:8], "experiments": experiments, "zt_limit": zt_limit, "at": at,
+                 "created": time.time(), "status": "scheduled", "job_id": None, "error": None,
+                 "started": None, "ended": None, "waiting": None}
+        with _Schedule() as state:
+            state["entries"].append(entry)
+        _schedule_wake.set()
+        return jsonify({"entry": entry}), 201
 
-        def work(job):
-            try:
-                failed = []
-                for index, p in enumerate(plans):
-                    if not p["missing"]:
-                        job.update(index, status="skipped", progress=1.0, error="already here")
-                        continue
-                    job.update(index, status="running")
-                    try:
-                        fetch(job, index, p["experiment"], p["missing"], root)
-                        job.update(index, status="done", progress=1.0)
-                    except Exception as error:
-                        logger.exception("Fetching %s failed", p["experiment"])
-                        job.update(index, status="failed", error=str(error))
-                        failed.append(p["experiment"])
-                    finally:
-                        _fetching.discard(p["experiment"])
-                job.result = {"experiments": experiments, "failed": failed}
-                if failed:
-                    raise RuntimeError(f"{len(failed)} experiment(s) failed: {', '.join(failed)}")
-            finally:
-                _fetching.difference_update(experiments)
-                _fetch_lock.release()
+    @app.route("/api/collector/schedule/<entry_id>/cancel", methods=["POST"])
+    def collector_schedule_cancel(entry_id):
+        with _Schedule() as state:
+            entry = next((e for e in state["entries"] if e["id"] == entry_id), None)
+            if entry is None:
+                return jsonify({"error": f"No scheduled fetch {entry_id}"}), 404
+            if entry["status"] != "scheduled":
+                return jsonify({"error": f"It is {entry['status']} already"}), 409
+            entry.update(status="cancelled", ended=time.time())
+        return jsonify({"entry": entry})
 
-        job = start_job(f"Fetch {len(plans)} experiment(s) from {REMOTE_HOST} (up to ZT{zt_limit:g})",
-                        [p["experiment"] for p in plans], work)
-        return jsonify(job.to_dict()), 202
+    @app.route("/api/collector/schedule/<entry_id>/now", methods=["POST"])
+    def collector_schedule_now(entry_id):
+        """Start a scheduled fetch now (at the scheduler's next tick)."""
+        with _Schedule() as state:
+            entry = next((e for e in state["entries"] if e["id"] == entry_id), None)
+            if entry is None:
+                return jsonify({"error": f"No scheduled fetch {entry_id}"}), 404
+            if entry["status"] != "scheduled":
+                return jsonify({"error": f"It is {entry['status']} already"}), 409
+            entry["at"] = time.time()
+        _schedule_wake.set()
+        return jsonify({"entry": entry})
+
+    start_fetch_scheduler(root)
 
     @app.route("/api/collector/settings", methods=["GET"])
     def collector_settings():
