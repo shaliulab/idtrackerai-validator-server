@@ -15,6 +15,15 @@ starts at the first chunk present in the feather file.
 A fly with the feather but no JSON gets its figure drawn on first request (first 24 h,
 as behavior-viewer intended), written next to the feather.
 
+Arena flies show instead their activity ethogram (active / inactive per second), made by
+sleep_centroid.nf (flyhostel.data.sleep.activity_ethogram) when it exists, and their sleep
+bouts come from the same centroid sleep (utils.sleep_method):
+
+    <basedir>/sleep/<NN>/<experiment>__<NN>_ethogram_centroid.feather
+
+A fly without motionmapper feather (no movie) gets its time axis from that file: movie
+time 0 = the chunk of its first frame.
+
 Time conventions (same as flyhostel's sleep tables and the ethogram's ZT ticks):
     frame_number   frames since the beginning of the recording (chunk 0)
     zt             seconds since ZT0 of the first day of recording
@@ -48,6 +57,8 @@ from flyhostel.utils import (
     get_framerate,
     get_identities,
 )
+from flyhostel.utils.experiment import split_arena
+from flyhostel.data.sleep import ACTIVITY_STATES, ethogram_path
 
 # shared with FlyHostelLoader.record_all_sleep_bouts
 from flyhostel.data.pose.loaders.sleep_videos import (
@@ -89,6 +100,19 @@ def _figure_path(fly):
 
 def _feather_path(fly):
     return os.path.join(_fly_dir(fly), f"{fly}.feather")
+
+
+def _activity_path(fly):
+    """Activity ethogram of an arena fly (sleep_centroid.nf), None for other flies."""
+    experiment = fly.split("__")[0]
+    if split_arena(experiment)[1] is None:
+        return None
+    return ethogram_path(get_basedir(experiment), fly)
+
+
+def _has_activity(fly):
+    path = _activity_path(fly)
+    return path is not None and os.path.exists(path)
 
 
 def _ensure_figure(fly):
@@ -152,6 +176,28 @@ def _track_from_feather(fly, path):
     return winner - 1, scores
 
 
+def _track_from_activity(fly, path):
+    """Activity (index in ACTIVITY_STATES, -1 = none) of every second of movie, from the
+    activity ethogram: each row (one ZT second) fills the movie seconds up to the next row."""
+    props = _properties(fly)
+    df = pd.read_feather(path, columns=["frame_number", "t", "behavior"])
+    codes = pd.Categorical(df["behavior"], categories=ACTIVITY_STATES).codes.astype(np.int64)
+    t0 = props["first_chunk"] * props["chunksize"]
+    starts = np.floor((df["frame_number"].to_numpy() - t0) / props["framerate"]).astype(np.int64)
+    # a row reaches the next one when that is the next second, otherwise only its own second
+    contiguous = np.append(np.diff(df["t"].to_numpy()) == 1, False)
+    ends = np.where(contiguous, np.append(starts[1:], 0), starts + 1)
+    ends = np.maximum(ends, starts + 1)
+    keep = starts >= 0
+    starts, ends, codes = starts[keep], ends[keep], codes[keep]
+    n_bins = int(ends.max()) if len(ends) else 0
+    out = np.full(n_bins, -1, dtype=np.int64)
+    lengths = ends - starts
+    index = np.repeat(starts, lengths) + (np.arange(lengths.sum()) - np.repeat(np.cumsum(lengths) - lengths, lengths))
+    out[index] = np.repeat(codes, lengths)
+    return out, np.where(out >= 0, 1.0, 0.0)
+
+
 def _track_from_figure(path):
     """Same as _track_from_feather, read from a pre-rendered figure (1 s markers whose
     alpha is the score) when the feather is gone."""
@@ -186,7 +232,10 @@ def _track_from_figure(path):
 def _track(fly, source, mtime):
     """`mtime` keys the cache: a redrawn feather / figure is read again."""
     experiment = fly.split("__")[0]
-    if source.endswith(".feather"):
+    activity = source == _activity_path(fly)
+    if activity:
+        codes, scores = _track_from_activity(fly, source)
+    elif source.endswith(".feather"):
         codes, scores = _track_from_feather(fly, source)
     else:
         codes, scores = _track_from_figure(source)
@@ -198,7 +247,9 @@ def _track(fly, source, mtime):
         except Exception as error:   # no STORE_INDEX row / metadata: ticks fall back to movie time
             logger.warning("No ZT for the movie start of %s: %s", fly, error)
     return {
-        "behaviors": TRACK_BEHAVIORS,
+        "behaviors": ACTIVITY_STATES if activity else TRACK_BEHAVIORS,
+        # activity: from the centroid (no classifier score); behavior: from the pose
+        "kind": "activity" if activity else "behavior",
         "bin": 1,
         "codes": codes.tolist(),
         "scores": np.round(scores * 100).astype(int).tolist(),   # %
@@ -208,9 +259,10 @@ def _track(fly, source, mtime):
 
 
 def track(fly):
-    """Per-second behavior of the fly (see _track_from_feather), x = movie time."""
-    for source in (_feather_path(fly), _figure_path(fly)):
-        if os.path.exists(source):
+    """Per-second behavior of the fly (see _track_from_feather), x = movie time.
+    Arena flies: their activity ethogram when it exists (_track_from_activity)."""
+    for source in (_activity_path(fly), _feather_path(fly), _figure_path(fly)):
+        if source is not None and os.path.exists(source):
             return _track(fly, source, os.path.getmtime(source))
     raise FileNotFoundError(f"no {os.path.basename(_feather_path(fly))} or {os.path.basename(_figure_path(fly))} for {fly}")
 
@@ -232,6 +284,9 @@ def _properties(fly):
 
     experiment, identity = fly.split("__")
     first_chunk = movie_first_chunk(get_basedir(experiment), experiment, identity, chunksize)
+    if first_chunk is None and _has_activity(fly):
+        # no movie: the time axis starts at the chunk of the activity ethogram's first frame
+        first_chunk = int(pd.read_feather(_activity_path(fly), columns=["frame_number"])["frame_number"].min()) // chunksize
 
     return {
         "framerate": framerate,
@@ -296,7 +351,7 @@ def zt_to_frame(experiment, zt):
 def _movie_time(fly, frame_number):
     props = _properties(fly)
     if props["first_chunk"] is None:
-        raise ValueError(f"Cannot place frames in the movie of {fly}: no feather file")
+        raise ValueError(f"Cannot place frames in the ethogram of {fly}: no feather file")
     return (frame_number - props["first_chunk"] * props["chunksize"]) / props["framerate"]
 
 
@@ -383,8 +438,10 @@ def register_ethogram(app, get_selected_experiment):
         experiment = to_flat(exp)
         flies = [f"{experiment}__{str(identity).zfill(2)}" for identity in get_identities(experiment)]
         return jsonify([
-            {"fly": fly, "available": os.path.exists(_figure_path(fly)) or os.path.exists(_feather_path(fly)),
-             "drawn": os.path.exists(_figure_path(fly))}
+            {"fly": fly,
+             "available": os.path.exists(_figure_path(fly)) or os.path.exists(_feather_path(fly)) or _has_activity(fly),
+             "drawn": os.path.exists(_figure_path(fly)),
+             "activity": _has_activity(fly)}
             for fly in flies
         ])
 
