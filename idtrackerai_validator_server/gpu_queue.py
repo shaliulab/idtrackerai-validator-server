@@ -25,7 +25,11 @@ time. With no server running nothing starts.
 A kind is registered with register_kind(name, label, memory_mb, launch, ...):
     launch(entry) -> pid of the session leader (the sh wrapper)
     progress(entry) -> {"done", "total", "unit", ...} or None  (may set entry["info"])
-    external() -> [{"pid", "what", "started"}] running outside the queue
+    external() -> [{"pid", "what", "started", "params"}] running outside the queue
+    pause(job, on), pause_state(job) -> None (this run cannot be paused) / "running" / "pausing" /
+        "paused": optional, for kinds whose runs can stop between steps (imgstore-crop-arenas:
+        the chunks being encoded finish, no new one starts). job is a queue entry or an external
+        job. A paused job (nothing of it running any more) reserves no GPU memory.
 """
 import fcntl
 import json
@@ -56,9 +60,21 @@ _scheduler_lock = None      # file object holding the scheduler flock
 _started = False
 
 
-def register_kind(name, label, memory_mb, launch, progress=None, external=None, max_running=None):
+def register_kind(name, label, memory_mb, launch, progress=None, external=None, max_running=None,
+                  pause=None, pause_state=None):
     KINDS[name] = {"label": label, "memory_mb": memory_mb, "launch": launch, "progress": progress,
-                   "external": external, "max_running": max_running}
+                   "external": external, "max_running": max_running, "pause": pause, "pause_state": pause_state}
+
+
+def _pause_state(kind, job):
+    hook = KINDS.get(kind, {}).get("pause_state")
+    if hook is None:
+        return None
+    try:
+        return hook(job)
+    except Exception as error:
+        logger.debug("gpu_queue: pause state of %s: %s", job.get("what"), error)
+        return None
 
 
 # ---- state file ----
@@ -169,10 +185,12 @@ def estimate_mb(kind, entries, total=None):
 
 
 def _budget(state, gpu, running):
-    """running: [(kind, current MiB)] of every GPU job of a registered kind."""
+    """running: [(kind, current MiB, pause state)] of every GPU job of a registered kind; a paused
+    one (its last steps finished) reserves nothing."""
     entries = state["entries"]
     total, used = gpu["mem_total"], gpu["mem_used"]
-    reserved = sum(max(0.0, estimate_mb(kind, entries, total) - (mem or 0)) for kind, mem in running)
+    reserved = sum(max(0.0, estimate_mb(kind, entries, total) - (mem or 0))
+                   for kind, mem, paused in running if paused != "paused")
     return {"total_mb": total, "used_mb": used, "reserved_mb": reserved, "margin_mb": MARGIN_MB,
             "available_mb": total - used - reserved - MARGIN_MB, "util": gpu.get("util"), "t": time.time()}
 
@@ -212,7 +230,8 @@ def tick(launch=True):
                     entry["progress"] = progress(entry)
                 except Exception as error:
                     logger.debug("gpu_queue: progress of %s: %s", entry["id"], error)
-            running.append((entry["kind"], entry["mem_mb"]))
+            entry["pause_state"] = _pause_state(entry["kind"], entry)
+            running.append((entry["kind"], entry["mem_mb"], entry["pause_state"]))
 
         external = []
         for name, spec in KINDS.items():
@@ -230,8 +249,9 @@ def tick(launch=True):
                 if pids & queue_pids:
                     continue
                 mem = sum(mem_of.get(pid, 0) for pid in pids)
-                external.append({**job, "kind": name, "mem_mb": mem})
-                running.append((name, mem))
+                paused = _pause_state(name, job)
+                external.append({**job, "kind": name, "mem_mb": mem, "pause_state": paused})
+                running.append((name, mem, paused))
         state["external"] = external
 
         state["gpu"] = _budget(state, gpu, running) if gpu else None
@@ -246,7 +266,7 @@ def tick(launch=True):
                 state["blocked"] = "No GPU visible (nvidia-smi)"
             else:
                 need = estimate_mb(head["kind"], entries, gpu["mem_total"])
-                n_kind = sum(1 for kind, _ in running if kind == head["kind"])
+                n_kind = sum(1 for kind, _, _ in running if kind == head["kind"])
                 budget = state["gpu"]
                 if spec["max_running"] is not None and n_kind >= spec["max_running"]:
                     state["blocked"] = f"{spec['label']}: {n_kind} running, at most {spec['max_running']} at once"
@@ -320,6 +340,19 @@ def cancel(entry_id):
     raise KeyError(entry_id)
 
 
+def set_paused(job, on):
+    """Pauses / resumes a running queue entry or external job (ValueError if it cannot be)."""
+    hook = KINDS.get(job["kind"], {}).get("pause")
+    if hook is None:
+        raise ValueError(f"{KINDS.get(job['kind'], {}).get('label', job['kind'])} jobs cannot be paused")
+    if _pause_state(job["kind"], job) is None:
+        raise ValueError(f"{job['what']} cannot be paused (started by a version without pause: stop it and resume it)")
+    hook(job, on)
+    state = _pause_state(job["kind"], job)
+    _wake.set()
+    return state
+
+
 # ---- scheduler ----
 
 _wake = threading.Event()
@@ -376,6 +409,25 @@ def register_gpu_queue(app):
             return jsonify({"error": str(error)}), 409
         _wake.set()
         return jsonify(entry)
+
+    @app.route("/api/gpu_queue/<entry_id>/pause", methods=["POST"])
+    def gpu_queue_pause(entry_id):
+        """{"paused": bool}: pauses (its current steps finish, no new one starts) or resumes a
+        running entry; or, with entry_id external-<pid>, a job running outside the queue."""
+        on = bool((request.get_json(silent=True) or {}).get("paused", True))
+        state = read_state()
+        if entry_id.startswith("external-"):
+            pid = int(entry_id.split("-", 1)[1]) if entry_id.split("-", 1)[1].isdigit() else None
+            job = next((j for j in state.get("external") or [] if j["pid"] == pid), None)
+        else:
+            job = next((e for e in state["entries"] if e["id"] == entry_id and e["status"] == "running"), None)
+        if job is None:
+            return jsonify({"error": f"No running job {entry_id}"}), 404
+        try:
+            pause_state = set_paused(job, on)
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 409
+        return jsonify({"id": entry_id, "pause_state": pause_state})
 
     @app.route("/api/gpu_queue/<entry_id>/front", methods=["POST"])
     def gpu_queue_front(entry_id):

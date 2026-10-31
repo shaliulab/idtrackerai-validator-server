@@ -802,6 +802,48 @@ def running_tools(root):
     return runs
 
 
+# imgstore-crop-arenas starts no new chunk while this file (next to metadata.yaml) exists, and
+# prints CROP_PAUSE_MARK at the start of runs that know it (older runs ignore the file)
+CROP_PAUSE_FILE = "crop_arenas.pause"
+CROP_PAUSE_MARK = "Pause file:"
+
+
+def _crop_pausable(folder, started):
+    """Whether the run started at `started` logged CROP_PAUSE_MARK in the folder's crop_arenas.log."""
+    log_path = os.path.join(folder, CROP_LOG)
+    try:
+        if os.path.getmtime(log_path) < started - 5:
+            return False
+        with open(log_path, "rb") as handle:
+            return CROP_PAUSE_MARK.encode() in handle.read(65536)
+    except OSError:
+        return False
+
+
+def crop_pause_state(folder, pid, started):
+    """None (this run ignores the pause file), "running", "pausing" (paused, chunks still being
+    encoded) or "paused"."""
+    if not _crop_pausable(folder, started):
+        return None
+    if not os.path.exists(os.path.join(folder, CROP_PAUSE_FILE)):
+        return "running"
+    try:
+        children = psutil.Process(pid).children(recursive=True)
+    except psutil.Error:
+        return None
+    encoding = any("ffmpeg" in (child.name() or "") for child in children if child.is_running())
+    return "pausing" if encoding else "paused"
+
+
+def set_crop_paused(folder, on):
+    path = os.path.join(folder, CROP_PAUSE_FILE)
+    if on:
+        with open(path, "w") as handle:
+            handle.write(f"Paused from the validator at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    elif os.path.exists(path):
+        os.remove(path)
+
+
 def start_crop(folder, resume=False):
     """imgstore-crop-arenas in its own session (keeps running when the server restarts), with
     its env's bin/ first in PATH (ffmpeg, ffprobe); the exit code is appended to the log.
@@ -829,7 +871,8 @@ def external_crops(root):
             cwd = process.cwd()
         except psutil.Error:
             continue
-        jobs.append({"pid": process.pid, "what": _relative(root, cwd) or cwd, "started": process.info["create_time"]})
+        jobs.append({"pid": process.pid, "what": _relative(root, cwd) or cwd, "started": process.info["create_time"],
+                     "params": {"folder": cwd}})
     return jobs
 
 
@@ -843,7 +886,9 @@ def register_crop_kind(root):
     gpu_queue.register_kind(
         "crop_arenas", "imgstore-crop-arenas", memory_mb=jobs * CROP_ENCODER_MB,
         launch=lambda entry: start_crop(entry["params"]["folder"], resume=entry["params"].get("resume", False)),
-        progress=progress, external=lambda: external_crops(root))
+        progress=progress, external=lambda: external_crops(root),
+        pause=lambda job, on: set_crop_paused(job["params"]["folder"], on),
+        pause_state=lambda job: crop_pause_state(job["params"]["folder"], job["pid"], job["started"]))
 
 
 # ---- routes ----
