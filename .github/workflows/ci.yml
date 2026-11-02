@@ -18,9 +18,13 @@ jobs:
 
       - name: Check out submodules needed to build
         run: |
-          # Non-recursive: setup.py only needs flyhostel/setup.py to exist.
-          # Its own submodules are resolved at install time, not build time.
+          # Non-recursive: setup.py only needs flyhostel/setup.py and
+          # flyhostel/libraries/imgstore/setup.py to exist. flyhostel's other
+          # submodules are resolved at install time, not build time.
+          # .gitmodules uses ssh URLs, which need a key, so fetch over https.
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init idtrackerai-validator-client flyhostel
+          git -C flyhostel submodule update --init libraries/imgstore
 
       - uses: actions/setup-node@v4
         with:
@@ -89,13 +93,15 @@ jobs:
           # Only public repositories are needed: the validator client, flyhostel
           # and, of flyhostel's own submodules, the two its setup.py installs
           # from libraries/ (ethoscopy, and idtrackerai for the [idtrackerai]
-          # extra). The others (flyhostel-modelling, zeitgeber, googleapi,
-          # flyhostel-validation, yolov7tools) are private and not needed to
-          # serve; zeitgeber comes from PyPI. .gitmodules uses ssh URLs, which
-          # need a key, so fetch them over https instead.
+          # extra) and imgstore, which our setup.py installs from there because
+          # flyhostel needs a version newer than PyPI's. The others
+          # (flyhostel-modelling, zeitgeber, googleapi, flyhostel-validation,
+          # yolov7tools) are private and not needed to serve; zeitgeber comes
+          # from PyPI. .gitmodules uses ssh URLs, which need a key, so fetch
+          # them over https instead.
           git config --global url."https://github.com/".insteadOf "git@github.com:"
           git submodule update --init idtrackerai-validator-client flyhostel
-          git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai
+          git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
 
           python -m venv /tmp/testenv
           /tmp/testenv/bin/pip install --upgrade pip
@@ -140,8 +146,9 @@ jobs:
           server_pid=$!
 
           # Fail as soon as the process dies, rather than waiting out the full
-          # 30s and then reporting an opaque "connection refused".
-          for i in $(seq 1 30); do
+          # 120s and then reporting an opaque "connection refused". The first
+          # start is slow (bytecode, matplotlib's font cache): over 30s.
+          for i in $(seq 1 120); do
             curl -sf -o /dev/null http://localhost:5000/ && break
             if ! kill -0 "$server_pid" 2>/dev/null; then
               echo "server exited during startup:"

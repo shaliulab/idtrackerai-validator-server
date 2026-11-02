@@ -58,6 +58,8 @@ install_requires = [
     # sleap_labels.py; 0.9.5 checked: its .slp files load unchanged in SLEAP 1.3.3 (sleap-label)
     "sleap-io==0.9.5",
     vendored("flyhostel", HERE / "flyhostel", extras=["idtrackerai"]),
+    # flyhostel requires a version newer than the latest on PyPI (0.4.19).
+    vendored("imgstore-shaliulab", HERE / "flyhostel" / "libraries" / "imgstore"),
 ]
 
 
