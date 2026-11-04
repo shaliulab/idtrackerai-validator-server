@@ -444,24 +444,37 @@ def row2dict(row):
     return d
 
 
+def _recording_range():
+    """First and last frame in imgstore's index: the whole recording, tracked or not."""
+    try:
+        return int(cap._cap.frame_min), int(cap._cap.frame_max)
+    except (AttributeError, TypeError, ValueError) as error:
+        logger.warning("Cannot read the frame range of the recording: %s", error)
+        return None, None
+
+
 @app.route('/api/frame_range', methods=['GET'])
 def get_frame_range():
-    if STORE_INFO is not None:
-        return jsonify({"min_frame": STORE_INFO["frame_min"], "max_frame": STORE_INFO["frame_max"]})
-    if db_manager is None:
+    """min_frame, max_frame: tracked frames (the recording's without database, null when
+    nothing is tracked). recording_min, recording_max: frames that can be shown."""
+    if SELECTED_EXPERIMENT is None or cap is None:
         return _experiment_required()
-    tables = db_manager.tables
-    try:
-        # tables["IDENTITY"] is already IDENTITY_VAL or IDENTITY,
-        # depending on db_manager.use_val — so this respects app.py's choice.
-        min_frame, max_frame = db.session.query(
-            func.min(tables["IDENTITY"].frame_number),
-            func.max(tables["IDENTITY"].frame_number),
-        ).one()
-        return jsonify({"min_frame": min_frame, "max_frame": max_frame})
-    except Exception as error:
-        logger.error("Error computing frame range: %s", error)
-        return jsonify({"message": str(error)}), 500
+    recording_min, recording_max = _recording_range()
+    min_frame, max_frame = recording_min, recording_max
+    if db_manager is not None:
+        tables = db_manager.tables
+        try:
+            # tables["IDENTITY"] is already IDENTITY_VAL or IDENTITY,
+            # depending on db_manager.use_val — so this respects app.py's choice.
+            min_frame, max_frame = db.session.query(
+                func.min(tables["IDENTITY"].frame_number),
+                func.max(tables["IDENTITY"].frame_number),
+            ).one()
+        except Exception as error:
+            logger.error("Error computing frame range: %s", error)
+            min_frame, max_frame = None, None
+    return jsonify({"min_frame": min_frame, "max_frame": max_frame, "chunksize": int(CHUNKSIZE),
+                    "recording_min": recording_min, "recording_max": recording_max})
 
 @app.route("/api/framerate", methods=['GET'])
 def get_framerate():
