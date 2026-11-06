@@ -96,6 +96,7 @@ EXPERIMENT_RE = re.compile(r"^(FlyHostel\d+)/(\d+)X/((\d{4}-\d{2}-\d{2})_(\d{2})
 # local folders the editor works on: experiments and the arenas cropped out of them
 LOCAL_RE = re.compile(r"^(FlyHostel\d+)/(\d+)X/(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})(/arenas/(\d+))?$")
 CHUNK_RE = re.compile(r"^(\d{6})\.[A-Za-z0-9]+$")
+CHUNK_INDEX_RE = re.compile(r"^\d{6}\.npz$")
 
 _fetch_lock = threading.Lock()
 _fetching = set()
@@ -943,7 +944,72 @@ def crop_status(folder):
     if process is not None:
         status.update(pid=process.pid, started=process.info["create_time"])
     status.update(crop_log(folder, status["running"]))
+    status["completeness"] = crop_completeness(folder, status["arenas"])
+    try:
+        status["free_bytes"] = shutil.disk_usage(folder).free
+    except OSError:
+        status["free_bytes"] = None
     return status
+
+
+def _ranges(numbers):
+    """[1, 2, 3, 7] -> [[1, 3], [7, 7]]"""
+    ranges = []
+    for n in sorted(numbers):
+        if ranges and n == ranges[-1][1] + 1:
+            ranges[-1][1] = n
+        else:
+            ranges.append([n, n])
+    return ranges
+
+
+def crop_completeness(folder, arenas=None):
+    """Chunks of the recording cropped for every arena, by imgstore-crop-arenas' own rule (`_chunk_done`,
+    what --resume skips): each arena has the chunk's video and a copy of its .npz of the same size (the
+    .npz is copied after ffmpeg succeeded, so a run killed or out of disk space leaves the chunk without it).
+    None without arena folders; `missing` = ranges of chunks not done in some arena."""
+    if arenas is None:
+        arenas_dir = os.path.join(folder, "arenas")
+        arenas = sorted(int(d) for d in os.listdir(arenas_dir)
+                        if d.isdigit() and os.path.isdir(os.path.join(arenas_dir, d))) if os.path.isdir(arenas_dir) else []
+    if not arenas:
+        return None
+    sizes = {}
+    for name in os.listdir(folder):
+        if CHUNK_INDEX_RE.match(name):
+            sizes[int(name[:6])] = os.path.getsize(os.path.join(folder, name))
+    listings = {}
+    for arena in arenas:
+        arena_dir = os.path.join(folder, "arenas", str(arena))
+        listings[arena] = {entry.name: entry.stat().st_size for entry in os.scandir(arena_dir)}
+    missing = []
+    for chunk, size in sizes.items():
+        for arena in arenas:
+            files = listings[arena]
+            if files.get("%06d.npz" % chunk) != size or not any(
+                    files.get("%06d%s" % (chunk, ext)) for ext in (".mp4", ".avi")):
+                missing.append(chunk)
+                break
+    done = [chunk for chunk in sizes if chunk not in set(missing)]
+    # space the missing chunks will take, from the chunks done (all arenas together)
+    done_bytes = sum(files.get("%06d%s" % (chunk, ext)) or 0 for files in listings.values()
+                     for chunk in done for ext in (".mp4", ".avi", ".npz"))
+    return {"total": len(sizes), "done": len(done), "missing": _ranges(missing), "complete": not missing,
+            "needed_bytes": int(done_bytes / len(done) * len(missing)) if done else None}
+
+
+def _parent_recording(experiment):
+    """FlyHostel<N>/<X>X/<date> of an arena folder (…/arenas/K), else None."""
+    match = LOCAL_RE.match(experiment)
+    return experiment.rsplit("/arenas/", 1)[0] if match and match.group(5) else None
+
+
+def describe_missing(completeness):
+    ranges = ", ".join(str(a) if a == b else f"{a}–{b}" for a, b in completeness["missing"][:6])
+    if len(completeness["missing"]) > 6:
+        ranges += ", …"
+    return (f"the crop of the arenas is incomplete: {completeness['total'] - completeness['done']} of "
+            f"{completeness['total']} chunks are missing or broken (chunks {ranges})")
 
 
 def crop_log(folder, running):
@@ -968,6 +1034,8 @@ def crop_log(folder, running):
     if exit_line and not running:
         status["exit_code"] = int(re.sub(r"\D", "", exit_line) or -1)
     status["log"] = {"mtime": os.path.getmtime(log_path), "tail": lines[-40:]}
+    # ffmpeg's error when the drive filled up during the run (the log itself may end cut short)
+    status["no_space"] = any("No space left on device" in line for line in lines)
     return status
 
 
@@ -1308,6 +1376,18 @@ def register_data_collector(app):
             folder = experiment_folder(root, body.get("experiment"))
         except (ValueError, FileNotFoundError) as error:
             return bad_request(error)
+        # an arena whose crop stopped half way (killed, disk full) has empty or truncated videos, which
+        # roi-proposer fails on ("moov atom not found"): say so, unless the chunk asked for is complete
+        parent = _parent_recording((body.get("experiment") or "").strip().strip("/"))
+        if parent is not None:
+            completeness = crop_completeness(os.path.dirname(os.path.dirname(folder)))
+            chunk = body.get("chunk")
+            chunk = None if chunk in (None, "") else int(chunk)
+            if completeness and not completeness["complete"] and (
+                    chunk is None or any(a <= chunk <= b for a, b in completeness["missing"])):
+                return bad_request(ValueError(
+                    f"Cannot propose on this arena: {describe_missing(completeness)}. "
+                    f"Resume the crop of {parent} (\"Resume crop\" below the editor) and propose again once it is done"))
         if not _propose_lock.acquire(blocking=False):
             return jsonify({"error": "roi-proposer is already running"}), 409
         cmd = [ROI_PROPOSER, "propose", folder, "--no-preprocess-sample"]
@@ -1480,8 +1560,12 @@ def register_data_collector(app):
             folder = experiment_folder(root, experiment)
         except (ValueError, FileNotFoundError) as error:
             return bad_request(error)
-        if LOCAL_RE.match(experiment).group(5):
-            return jsonify({"arena": True})
+        parent = _parent_recording(experiment)
+        if parent is not None:
+            # an arena: the state of the crop that made it (the whole recording's), to resume it from here
+            status = crop_status(os.path.dirname(os.path.dirname(folder)))
+            status.update(arena=True, recording=parent, queue=gpu_queue.find("crop_arenas", parent))
+            return jsonify(status)
         status = crop_status(folder)
         status["queue"] = gpu_queue.find("crop_arenas", experiment)
         status.update(arena=False, command=" ".join(
