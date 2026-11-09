@@ -70,7 +70,9 @@ from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
 )
 from idtrackerai_validator_server import rois as roi_sources
-from idtrackerai_validator_server.utils import load_rejections, sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache
+from idtrackerai_validator_server.utils import (
+    sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache, load_interactions, find_interaction, interactions_path,
+)
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -900,18 +902,35 @@ def get_tracking(frame_number):
     return response
 
 
-@app.route('/api/prev_rejection/<int:frame_number>', methods=['GET'])
-def get_prev_rejection(frame_number):
+@app.route('/api/interactions/identities', methods=['GET'])
+def interaction_identities():
+    """Flies with interactions in the loaded experiment: {"available": the interactions index exists, "path": of it,
+    "identities": [identity, ...]}"""
     if db_manager is None:
         return _experiment_required()
-    return get_rejection(frame_number, "previous")
+    experiment = to_flat(SELECTED_EXPERIMENT)
+    try:
+        frames = load_interactions(experiment)
+        path = interactions_path(experiment)
+    except Exception as error:
+        logger.warning("Cannot read the interactions of %s: %s", experiment, error)
+        return jsonify({"available": False, "path": None, "identities": []})
+    return jsonify({"available": os.path.exists(path), "path": path, "identities": sorted(frames)})
 
 
-@app.route('/api/next_rejection/<int:frame_number>', methods=['GET'])
-def get_next_rejection(frame_number):
+@app.route('/api/interaction/<direction>/<int:identity>/<int:frame_number>', methods=['GET'])
+def navigate_interaction(direction, identity, frame_number):
+    """Return the first frame of the next / previous interaction of `identity` (with any fly), after / before frame_number.
+
+    direction: "prev" | "next". Returns {"frame_number": N} or {"frame_number": null} when none found.
+    """
     if db_manager is None:
         return _experiment_required()
-    return get_rejection(frame_number, "next")
+    if direction not in ('prev', 'next'):
+        return jsonify({"error": "direction must be prev or next"}), 400
+    experiment = to_flat(SELECTED_EXPERIMENT)
+    frames = load_interactions(experiment).get(identity)
+    return jsonify({"frame_number": find_interaction(frames, frame_number, direction)})
 
 
 @app.route('/api/prev_error/<int:frame_number>', methods=['GET'])
@@ -1073,39 +1092,6 @@ def get_ok(frame_number, direction):
     frame_number= get_first_non_zero_frame(db.session, frame_number, direction)
     logger.debug("get_ok %s", frame_number)
     return jsonify({"frame_number": frame_number})
-
-
-def get_rejection(frame_number, direction):
-
-    global SELECTED_EXPERIMENT
-    experiment=to_flat(SELECTED_EXPERIMENT)
-
-    fn=frame_number
-    
-    try:
-        rejections, features=load_rejections(experiment)
-
-        frames_with_rejection=rejections["first_frame"].values
-        diff=frames_with_rejection-frame_number
-
-        if direction=="next":
-            frames_with_rejection=frames_with_rejection[diff>0]
-            diff=diff[diff>0]
-            index=np.argmin(diff)
-            fn=frames_with_rejection[index]
-
-        elif direction=="previous":
-            frames_with_rejection=frames_with_rejection[diff<0]
-            diff=diff[diff<0]
-            index=np.argmin(-diff)
-            fn=frames_with_rejection[index]
-    except KeyError:
-        logger.warning("Cannot find %s rejection", direction)
-    except FileNotFoundError as error:
-        logger.warning(error)
-
-
-    return jsonify({"frame_number": int(fn)})
 
 
 def get_error(frame_number, direction):

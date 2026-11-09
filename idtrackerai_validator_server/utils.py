@@ -1,6 +1,7 @@
 import os.path
 import pickle
 import logging
+import numpy as np
 import pandas as pd
 from flyhostel.utils import (
     get_basedir,
@@ -18,27 +19,49 @@ from flyhostel.data.pose.loaders.sleep_videos import (  # noqa: F401  (find_slee
 logger = logging.getLogger(__name__)
 
 
-def load_rejections(experiment):
-    """
-    This function is also implemented in
-    from flyhostel.data.interactions.sociability.behavior_integration.load_rejections
-    """
-    csv_file=os.path.join(
-        get_basedir(experiment), "interactions", f"{experiment}_rejections.csv"
-    )
-    index_file=os.path.join(
-        get_basedir(experiment), "interactions", f"{experiment}_index.csv"
-    )
-    features_file=os.path.join(
-        get_basedir(experiment), "interactions", f"{experiment}_features.hdf5"
-    )
-    features=pd.read_hdf(features_file)
+# Interactions of every fly: interactions path -> (mtime, {identity: sorted first frames})
+INTERACTIONS_CACHE: dict = {}
 
-    rejections=pd.read_csv(csv_file)
-    index=pd.read_csv(index_file)
-    index=index.loc[index["keep"]]
-    rejections=rejections.merge(index[["first_frame", "id", "nn"]].reset_index(), how="left", on=["first_frame", "id", "nn"])
-    return rejections, features
+
+def interactions_path(experiment: str) -> str:
+    """Interactions found by the interactions pipeline (detect_neighbors / describe_interactions of vsc-scripts):
+    <basedir>/interactions/<experiment>_index.csv, one row per interaction and fly (id) with its partner (nn)"""
+    return os.path.join(get_basedir(experiment), "interactions", f"{experiment}_index.csv")
+
+
+def load_interactions(experiment: str) -> dict:
+    """{identity: sorted first frames of the interactions of the fly, as id or as nn}, of the interactions kept by the
+    pipeline (keep). {} when the experiment has no interactions index. Cached per file mtime."""
+    path = interactions_path(experiment)
+    if not os.path.exists(path):
+        return {}
+    mtime = os.path.getmtime(path)
+    cached = INTERACTIONS_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    index = pd.read_csv(path)
+    if "keep" in index.columns:
+        index = index.loc[index["keep"].astype(bool)]
+    frames = {}
+    for column in ("id", "nn"):
+        # fly ids end in |<identity>
+        identities = index[column].astype(str).str.rsplit("|", n=1).str[-1].astype(int)
+        for identity, first_frames in index["first_frame"].groupby(identities):
+            frames.setdefault(int(identity), []).append(first_frames.to_numpy())
+    frames = {identity: np.unique(np.concatenate(parts)).astype(int) for identity, parts in frames.items()}
+    INTERACTIONS_CACHE[path] = (mtime, frames)
+    return frames
+
+
+def find_interaction(first_frames, frame_number: int, direction: str):
+    """First frame of the next (after frame_number) or previous (before it) interaction, None when there is none"""
+    if first_frames is None or len(first_frames) == 0:
+        return None
+    if direction == "next":
+        i = np.searchsorted(first_frames, frame_number, side="right")
+        return int(first_frames[i]) if i < len(first_frames) else None
+    i = np.searchsorted(first_frames, frame_number, side="left") - 1
+    return int(first_frames[i]) if i >= 0 else None
 
 
 # Sleep frame cache: (experiment_flat, identity_int) -> sorted list[int] of asleep frame_numbers
