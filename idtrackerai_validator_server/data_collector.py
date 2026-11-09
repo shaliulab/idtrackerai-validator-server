@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -901,6 +902,54 @@ def preprocess_status(folder):
     return status
 
 
+def _store_chunks(folder):
+    """Chunks imgstore's index would list: a <chunk>.mp4 with its <chunk>.npz."""
+    return sorted(int(os.path.basename(f)[:6]) for f in glob.glob(os.path.join(folder, "[0-9]" * 6 + ".mp4"))
+                  if os.path.exists(f[:-4] + ".npz"))
+
+
+def _index_chunks(path):
+    """Chunks listed in an index.db (None if it cannot be read)."""
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
+            return sorted(row[0] for row in conn.execute("SELECT chunk FROM chunks"))
+    except sqlite3.Error as error:
+        logger.warning("Cannot read %s: %s", path, error)
+        return None
+
+
+def refresh_store_index(folder):
+    """Remakes the folder's index.db (imgstore's frame index, which preprocess-sample and the viewer read
+    instead of the chunks' .npz when it exists) unless it lists the same chunks the folder has: one made
+    before more chunks were fetched leaves the new ones out. Written to a temporary file and swapped in.
+    Returns {"remade", "chunks", "previous" (chunks listed before, None without index.db), "reason"}."""
+    from imgstore.index import ImgStoreIndex
+    from imgstore.stores.video import find_chunks_video
+
+    path = os.path.join(folder, "index.db")
+    chunks = _store_chunks(folder)
+    previous = _index_chunks(path) if os.path.exists(path) else None
+    info = {"remade": False, "chunks": len(chunks), "previous": None if previous is None else len(previous)}
+    if previous == chunks:
+        info["reason"] = "up to date"
+        return info
+    if not chunks:
+        info["reason"] = "no chunk with .mp4 and .npz"
+        return info
+    tmp = os.path.join(folder, ".index.db.tmp")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    t0 = time.time()
+    records = ImgStoreIndex.read_records(find_chunks_video(folder, ".mp4", chunks))
+    ImgStoreIndex.populate_database(tmp, records).close()
+    os.replace(tmp, path)
+    info.update(remade=True, reason="missing" if previous is None else "chunks differ",
+                indexed=len(records[1]), seconds=round(time.time() - t0, 1))
+    logger.info("Remade %s (%s): %s chunks indexed, %s before", path, info["reason"], info["indexed"],
+                info["previous"])
+    return info
+
+
 def start_preprocess(folder, start_chunk, end_chunk, samples_per_chunk):
     """end_chunk inclusive (preprocess-sample's --end-chunk is exclusive)."""
     cmd = [
@@ -1527,8 +1576,14 @@ def register_data_collector(app):
         if preprocess_process(folder) is not None:
             return jsonify({"error": "preprocess-sample is already running on this experiment"}), 409
         sync_arena_conf(folder)
+        try:
+            index = refresh_store_index(folder)
+        except Exception as error:
+            logger.exception("Cannot remake the index.db of %s", folder)
+            return jsonify({"error": f"Cannot remake index.db: {error}"}), 500
         pid = start_preprocess(folder, start, end, samples)
-        return jsonify({"pid": pid, "start_chunk": start, "end_chunk": end, "samples_per_chunk": samples})
+        return jsonify({"pid": pid, "start_chunk": start, "end_chunk": end, "samples_per_chunk": samples,
+                        "index": index})
 
     @app.route("/api/collector/preprocess_sample/stop", methods=["POST"])
     def collector_preprocess_stop():
