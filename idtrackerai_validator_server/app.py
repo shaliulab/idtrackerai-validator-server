@@ -66,6 +66,7 @@ from idtrackerai_validator_server.data_collector import register_data_collector
 from idtrackerai_validator_server.sleap_labels import register_sleap_labels
 from idtrackerai_validator_server.sleap_train import register_sleap_train
 from idtrackerai_validator_server.gpu_queue import register_gpu_queue
+from idtrackerai_validator_server.box_annotations import register_box_annotations
 from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
@@ -171,6 +172,24 @@ def _pose_state():
 register_pose(app, get_state=_pose_state)
 register_sleap_labels(app, get_state=_pose_state)
 register_sleap_train(app)
+
+
+def _frame_size():
+    import sqlite3
+    with sqlite3.connect(f"file:{db_manager.dbfile}?mode=ro", uri=True) as con:
+        values = dict(con.execute("SELECT field, value FROM METADATA WHERE field IN ('frame_width', 'frame_height')").fetchall())
+    return int(values.get("frame_width", 1000)), int(values.get("frame_height", 1000))
+
+
+def _annotate_state():
+    if db_manager is None:
+        return None
+    return {"experiment": SELECTED_EXPERIMENT, "basedir": os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT),
+            "dbfile": db_manager.dbfile, "chunksize": int(CHUNKSIZE), "n_animals": int(NUMBER_OF_ANIMALS),
+            "contours": lambda n: _default_contours(n)[0], "size": _frame_size}
+
+
+register_box_annotations(app, get_state=_annotate_state)
 # after every module registering a kind of GPU job (data_collector, sleap_train)
 register_gpu_queue(app)
 
@@ -688,6 +707,16 @@ def get_preprocess(frame_number):
         source = next((s for s in _roi_sources() if s["id"] == source_id), None)
         if source is None or "error" in source:
             return jsonify({"contours": [], "error": (source or {}).get("error", f"No source {source_id}")}), 404
+    try:
+        contours, areas = _default_contours(frame_number, source_id, source, session.get("idtrackerai_config", IDTRACKERAI_CONFIG))
+    except LookupError as error:
+        return jsonify({"contours": [], "error": str(error)}), 404
+    return jsonify({"contours": contours, "areas": areas, "source": source_id})
+
+
+def _default_contours(frame_number, source_id=None, source=None, config=None):
+    """(contours, areas) of a frame, segmented with the experiment's idtrackerai config (or `source`'s), cached.
+    LookupError when the frame cannot be read."""
     # an edited file invalidates its contours
     key = ((source_id, source.get("mtime")) if source else None, frame_number)
     with _contours_lock:
@@ -695,10 +724,10 @@ def get_preprocess(frame_number):
     if cached is None:
         image, _ = _read_frame(frame_number)
         if image is None:
-            return jsonify({"contours": [], "error": f"Frame {frame_number} cannot be read"}), 404
+            raise LookupError(f"Frame {frame_number} cannot be read")
         try:
             if source is None:
-                cached = process_frame(image, session.get("idtrackerai_config", IDTRACKERAI_CONFIG)), None
+                cached = process_frame(image, config or IDTRACKERAI_CONFIG), None
             else:
                 cached = roi_sources.segment(image, source)
         except Exception as error:
@@ -708,8 +737,7 @@ def get_preprocess(frame_number):
             _contours_cache[key] = cached
             while len(_contours_cache) > CONTOURS_CACHE_SIZE:
                 _contours_cache.popitem(last=False)
-    contours, areas = cached
-    return jsonify({"contours": contours, "areas": areas, "source": source_id})
+    return cached
 
 
 def get_pose(db_manager, frame_number):
