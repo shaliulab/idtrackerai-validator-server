@@ -13,10 +13,13 @@ Coordinates are those of the original frame (no CVAT resize). flyhostel reads th
 `integrate-human-annotations --source validator` (flyhostel/data/human_validation/cvat/validator_annotations.py),
 which turns each box into the rectangle contour CVAT exports, so the integration is the same.
 
-A frame not saved yet is proposed from the machine tables (ROI_0 + IDENTITY, never _VAL: the
-integration crosses the boxes with the machine data): one box per row, the bounding box of the
-segmented blob holding its centroid (at least MIN_BOX px) labelled with its local identity
-(0 → not assigned).
+A frame not saved yet is proposed, when `yolov7-cvat propose` ran on the experiment ("Propose" button: the
+detections and identity solver of the CVAT pipeline's `predict --assign` + `complete`, written to the tables
+proposal_frames / proposals / proposal_runs of the same database), from those proposals: boxes with the solver's
+identity, a note and its confidence, and the frame's flags (what a person has to check, the CVAT issues). Otherwise
+from the machine tables (ROI_0 + IDENTITY, never _VAL: the integration crosses the boxes with the machine data):
+one box per row, the bounding box of the segmented blob holding its centroid (at least MIN_BOX px) labelled with its
+local identity (0 → not assigned).
 
 Frames to check: the failed scenes of the validation pipeline's scene_qc.csv (make-identogram +
 auto-annotate-qc, scenes ≤ MAX_SCENE_LENGTH frames as export-images), else the runs of bad frames of
@@ -25,9 +28,11 @@ the QC tab's cached result.
 Routes
     GET    /api/annotate/scenes              scenes to check, annotated frames, labels, the database, the frames
                                              still with problems after the last integration (validator_problem_frames.csv)
-    GET    /api/annotate/frame/<n>           saved boxes or the proposal (?proposal=1: always), machine rows, local id → identity
+    GET    /api/annotate/frame/<n>           saved boxes or the proposal (?proposal=1: always; =tracking: idtrackerai's,
+                                             not the solver's), machine rows, local id → identity, flags
     POST   /api/annotate/frame/<n>           {"boxes": [{x0, y0, x1, y1, label}]} saves the frame
     DELETE /api/annotate/frame/<n>           the frame is no longer annotated
+    POST   /api/annotate/propose             job running `yolov7-cvat propose` (YOLO + identity solver) on the scenes
     POST   /api/annotate/integrate           {"mode": "integrate" | "save", "start_zt", "end_zt"}: job running
                                              flyhostel's integrate-human-annotations / save-human-annotations
 """
@@ -57,9 +62,11 @@ MIN_BOX = 50               # px: a proposal covers at least the square flyhostel
 PAD = 4                    # px around the segmented blob
 MAX_SCENE_LENGTH = 5000    # as flyhostel's export-images
 VALIDATION_ENV = os.path.expanduser(os.environ.get("FLYHOSTEL_VALIDATION_ENV", "~/mambaforge/envs/rapids-23.04"))
+YOLOV7_CVAT = os.path.expanduser(os.environ.get("YOLOV7_CVAT", "~/mambaforge/envs/yolov7/bin/yolov7-cvat"))
 
 _lock = threading.Lock()
 _integrating = {}          # experiment -> job id
+_proposing = {}            # experiment -> job id
 
 
 def _validation_folder(basedir):
@@ -77,6 +84,11 @@ def _connect(basedir, create=False):
         CREATE INDEX IF NOT EXISTS boxes_fn ON boxes (frame_number);
         CREATE TABLE IF NOT EXISTS frames (frame_number INTEGER PRIMARY KEY, author TEXT, updated REAL, n_boxes INTEGER);
         CREATE TABLE IF NOT EXISTS log (t REAL, author TEXT, frame_number INTEGER, boxes TEXT);
+        CREATE TABLE IF NOT EXISTS proposal_frames (frame_number INTEGER PRIMARY KEY, flags TEXT);
+        CREATE TABLE IF NOT EXISTS proposals (frame_number INTEGER, x0 REAL, y0 REAL, x1 REAL, y1 REAL, label TEXT,
+                                              note TEXT, confidence TEXT);
+        CREATE INDEX IF NOT EXISTS proposals_fn ON proposals (frame_number);
+        CREATE TABLE IF NOT EXISTS proposal_runs (t REAL, model TEXT, scenes INTEGER, frames INTEGER, summary TEXT);
     """)
     return con
 
@@ -233,12 +245,18 @@ def register_box_annotations(app, get_state):
         if error:
             return error
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
-        annotated = []
+        annotated, flagged, proposed, run = [], [], 0, None
         con = _connect(state["basedir"])
         if con is not None:
             with con:
                 annotated = [{"frame_number": fn, "author": a, "updated": u, "n_boxes": n}
                              for fn, a, u, n in con.execute("SELECT frame_number, author, updated, n_boxes FROM frames ORDER BY frame_number")]
+                flagged = [fn for (fn,) in con.execute(
+                    "SELECT frame_number FROM proposal_frames WHERE flags != '[]' ORDER BY frame_number")]
+                proposed = con.execute("SELECT COUNT(*) FROM proposal_frames").fetchone()[0]
+                last = con.execute("SELECT t, model, scenes, frames, summary FROM proposal_runs ORDER BY t DESC LIMIT 1").fetchone()
+                if last:
+                    run = {"t": last[0], "model": last[1], "scenes": last[2], "frames": last[3], "summary": json.loads(last[4] or "{}")}
             con.close()
         return jsonify({
             "experiment": state["experiment"], "n_animals": state["n_animals"], "chunksize": state["chunksize"],
@@ -247,6 +265,8 @@ def register_box_annotations(app, get_state):
             "database": os.path.join(_validation_folder(state["basedir"]), DB_NAME),
             "integrating": _integrating.get(state["experiment"]),
             "problems": read_problems(state["basedir"]),
+            "flagged": flagged, "proposed_frames": proposed, "proposal_run": run,
+            "proposing": _proposing.get(state["experiment"]),
         })
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["GET"])
@@ -256,7 +276,8 @@ def register_box_annotations(app, get_state):
             return error
         chunk = frame_number // state["chunksize"]
         rows = _machine_rows(state["dbfile"], frame_number)
-        saved, meta = None, None
+        saved, meta, solver, flags = None, None, None, []
+        want = request.args.get("proposal")
         con = _connect(state["basedir"])
         if con is not None:
             with con:
@@ -264,9 +285,19 @@ def register_box_annotations(app, get_state):
                 if meta:
                     saved = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab} for a, b, c, d, lab in con.execute(
                         "SELECT x0, y0, x1, y1, label FROM boxes WHERE frame_number = ? ORDER BY rowid", (frame_number,))]
+                pf = con.execute("SELECT flags FROM proposal_frames WHERE frame_number = ?", (frame_number,)).fetchone()
+                if pf:
+                    flags = json.loads(pf[0] or "[]")
+                    solver = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab or "", "note": note or "", "confidence": conf}
+                              for a, b, c, d, lab, note, conf in con.execute(
+                                  "SELECT x0, y0, x1, y1, label, note, confidence FROM proposals WHERE frame_number = ? ORDER BY rowid",
+                                  (frame_number,))]
             con.close()
-        proposal = None
-        if saved is None or request.args.get("proposal"):
+        proposal, source = None, None
+        if solver is not None and (saved is None or want) and want != "tracking":
+            proposal, source = solver, "solver"
+        elif saved is None or want:
+            source = "tracking"
             width, height = state["size"]()
             try:
                 contours = state["contours"](frame_number)
@@ -275,7 +306,8 @@ def register_box_annotations(app, get_state):
                 contours = []
             proposal = propose(rows, contours, width, height)
         return jsonify({
-            "frame_number": frame_number, "chunk": chunk,
+            "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",
+            "flags": flags, "has_solver": solver is not None,
             "saved": saved is not None, "boxes": proposal if proposal is not None else saved,
             "author": meta[0] if meta else None, "updated": meta[1] if meta else None,
             "machine": rows, "concatenation": _concatenation(state["dbfile"], chunk),
@@ -320,6 +352,45 @@ def register_box_annotations(app, get_state):
                     con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, "null"))
                 con.close()
         return jsonify({"frame_number": frame_number, "saved": False})
+
+    @app.route("/api/annotate/propose", methods=["POST"])
+    def annotate_propose():
+        state, error = state_or_error()
+        if error:
+            return error
+        experiment = state["experiment"]
+        running = _jobs.get(str(_proposing.get(experiment)))
+        if running is not None and running.status == "running":
+            return jsonify({"error": "proposals of this experiment are being made", "job": running.to_dict()}), 409
+        if not os.path.exists(YOLOV7_CVAT):
+            return jsonify({"error": f"{YOLOV7_CVAT} not found (YOLOV7_CVAT)"}), 500
+        if not os.path.exists(os.path.join(_validation_folder(state["basedir"]), "scene_qc.csv")):
+            return jsonify({"error": "no flyhostel/validation/scene_qc.csv: run make-identogram and auto-annotate-qc first"}), 400
+        command = [YOLOV7_CVAT, "propose", "--experiment", to_flat(experiment),
+                   "--videos", os.environ["FLYHOSTEL_VIDEOS"],
+                   "--db", os.path.join(_validation_folder(state["basedir"]), DB_NAME)]
+
+        def work(job):
+            job.update(0, status="running")
+            lines = []
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in process.stdout:
+                if line.startswith("@@PROGRESS"):
+                    job.update(0, progress=min(0.99, float(line.split()[1])))
+                    continue
+                lines.append(line.rstrip("\n"))
+                del lines[:-200]
+            code = process.wait()
+            summary = next((json.loads(l) for l in reversed(lines) if l.startswith("{")), None)
+            job.result = {"command": " ".join(command), "exit_code": code, "tail": lines[-40:], "summary": summary}
+            if code != 0:
+                job.update(0, status="failed", error=f"exit code {code}")
+                raise RuntimeError(f"yolov7-cvat propose ended with exit code {code}")
+            job.update(0, status="done", progress=1.0)
+
+        job = start_job(f"YOLO + identity proposals of {to_flat(experiment)}", [to_flat(experiment)], work)
+        _proposing[experiment] = job.id
+        return jsonify(job.to_dict()), 202
 
     @app.route("/api/annotate/integrate", methods=["POST"])
     def annotate_integrate():
