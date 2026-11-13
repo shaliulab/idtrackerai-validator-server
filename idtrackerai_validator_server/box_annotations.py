@@ -50,7 +50,7 @@ import cv2
 import numpy as np
 from flask import jsonify, request, session
 
-from idtrackerai_validator_server import qc
+from idtrackerai_validator_server import links, qc
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.jobs import _jobs, start_job
 
@@ -90,6 +90,9 @@ def _connect(basedir, create=False):
         CREATE INDEX IF NOT EXISTS proposals_fn ON proposals (frame_number);
         CREATE TABLE IF NOT EXISTS proposal_runs (t REAL, model TEXT, scenes INTEGER, frames INTEGER, summary TEXT);
     """)
+    # track: id of the track a box belongs to (drawn with "New track": carried to the next frame until hidden), or NULL
+    if "track" not in [r[1] for r in con.execute("PRAGMA table_info(boxes)")]:
+        con.execute("ALTER TABLE boxes ADD COLUMN track TEXT")
     return con
 
 
@@ -106,6 +109,207 @@ def _machine_rows(dbfile, frame_number):
         con.close()
 
 
+def box_fragments(boxes, rows):
+    """idtrackerai fragment of each box: the machine row whose centroid is inside the box, nearest its centre,
+    one row per box (as the client's fragmentsOf) -> [fragment or None]"""
+    pairs = []
+    for i, b in enumerate(boxes):
+        for j, r in enumerate(rows):
+            if r.get("fragment") is None or not (b["x0"] <= r["x"] <= b["x1"] and b["y0"] <= r["y"] <= b["y1"]):
+                continue
+            pairs.append((((r["x"] - (b["x0"] + b["x1"]) / 2) ** 2 + (r["y"] - (b["y0"] + b["y1"]) / 2) ** 2), i, j))
+    pairs.sort()
+    out, used = [None] * len(boxes), set()
+    for _, i, j in pairs:
+        if out[i] is None and j not in used:
+            out[i] = int(rows[j]["fragment"])
+            used.add(j)
+    return out
+
+
+_chunk_labels = {}   # (sidecar, dbfile, chunk) -> (key, {fragment: [(frame, label)] sorted})
+
+
+def chunk_fragment_labels(con, dbfile, chunk, chunksize, sidecar):
+    """The local identities a person gave in the saved frames of a chunk, per idtrackerai fragment (the
+    integration spreads each through its fragment): {fragment: [(frame_number, label)]}. Cached until a
+    frame of the chunk is saved or unsaved."""
+    lo, hi = chunk * chunksize, (chunk + 1) * chunksize
+    key = con.execute("SELECT COUNT(*), MAX(updated) FROM frames WHERE frame_number >= ? AND frame_number < ?", (lo, hi)).fetchone()
+    cache_key = (sidecar, dbfile, chunk)
+    hit = _chunk_labels.get(cache_key)
+    if hit and hit[0] == key:
+        return hit[1]
+    boxes = {}
+    for fn, x0, y0, x1, y1, label in con.execute(
+            "SELECT b.frame_number, b.x0, b.y0, b.x1, b.y1, b.label FROM boxes b JOIN frames f ON f.frame_number = b.frame_number "
+            "WHERE b.frame_number >= ? AND b.frame_number < ? ORDER BY b.frame_number, b.rowid", (lo, hi)):
+        boxes.setdefault(fn, []).append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "label": label or ""})
+    labels = {}
+    if boxes:
+        rows = {}
+        mcon = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
+        try:
+            frames = sorted(boxes)
+            for k in range(0, len(frames), 500):
+                part = frames[k:k + 500]
+                for fn, x, y, frag in mcon.execute(
+                        f"SELECT frame_number, x, y, fragment FROM ROI_0 WHERE frame_number IN ({','.join('?' * len(part))})", part):
+                    rows.setdefault(fn, []).append({"x": x, "y": y, "fragment": frag})
+        finally:
+            mcon.close()
+        for fn, bs in boxes.items():
+            for b, frag in zip(bs, box_fragments(bs, rows.get(fn, []))):
+                if frag is not None and b["label"].isdigit():
+                    labels.setdefault(frag, []).append((fn, b["label"]))
+    _chunk_labels[cache_key] = (key, labels)
+    return labels
+
+
+def inherit_labels(boxes, rows, labels, frame_number):
+    """Boxes of a proposal whose fragment a person labelled in another saved frame of the chunk take that
+    label (from the nearest saved frame before, else after), marked inherited = that frame; a local
+    identity already on another box swaps with it."""
+    if not labels:
+        return boxes
+    out = [dict(b) for b in boxes]
+    for i, frag in enumerate(box_fragments(out, rows)):
+        if frag is None or frag not in labels:
+            continue
+        before = [(fn, lab) for fn, lab in labels[frag] if fn < frame_number]
+        after = [(fn, lab) for fn, lab in labels[frag] if fn > frame_number]
+        if not before and not after:
+            continue
+        fn, label = before[-1] if before else after[0]
+        old = out[i]["label"]
+        if old != label:
+            for j, b in enumerate(out):
+                if j != i and b["label"] == label:
+                    b["label"] = old if old.isdigit() else ""
+                    b.pop("inherited", None)
+        out[i]["label"] = label
+        out[i]["inherited"] = fn
+    return out
+
+
+def relabel_by_fragment(boxes, fragments, mapping):
+    """Boxes with the labels of `mapping` (fragment -> local identity) on the boxes of those fragments; a local
+    identity already on another box swaps with it (as in the app). -> (boxes, changed)"""
+    out = [dict(b) for b in boxes]
+    changed = False
+    for frag, label in mapping.items():
+        if frag not in fragments:
+            continue
+        i = fragments.index(frag)
+        old = out[i]["label"]
+        if old == label:
+            continue
+        for j, b in enumerate(out):
+            if j != i and b["label"] == label:
+                b["label"] = old if old.isdigit() else ""
+        out[i]["label"] = label
+        changed = True
+    return out, changed
+
+
+def relabel_chunk(con, dbfile, chunk, chunksize, mapping, skip, author):
+    """`mapping` written into every saved frame of the chunk (but `skip`) holding a box of those fragments.
+    -> frames changed"""
+    lo, hi = chunk * chunksize, (chunk + 1) * chunksize
+    boxes = {}
+    for fn, x0, y0, x1, y1, label, track in con.execute(
+            "SELECT b.frame_number, b.x0, b.y0, b.x1, b.y1, b.label, b.track FROM boxes b JOIN frames f ON f.frame_number = b.frame_number "
+            "WHERE b.frame_number >= ? AND b.frame_number < ? AND b.frame_number != ? ORDER BY b.frame_number, b.rowid", (lo, hi, skip)):
+        boxes.setdefault(fn, []).append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "label": label or "",
+                                         **({"track": track} if track else {})})
+    if not boxes:
+        return []
+    rows = {}
+    mcon = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
+    try:
+        frames = sorted(boxes)
+        for k in range(0, len(frames), 500):
+            part = frames[k:k + 500]
+            for fn, x, y, frag in mcon.execute(
+                    f"SELECT frame_number, x, y, fragment FROM ROI_0 WHERE frame_number IN ({','.join('?' * len(part))})", part):
+                rows.setdefault(fn, []).append({"x": x, "y": y, "fragment": frag})
+    finally:
+        mcon.close()
+    now, changed = time.time(), []
+    for fn, bs in boxes.items():
+        new, did = relabel_by_fragment(bs, box_fragments(bs, rows.get(fn, [])), mapping)
+        if not did:
+            continue
+        con.execute("DELETE FROM boxes WHERE frame_number = ?", (fn,))
+        con.executemany("INSERT INTO boxes (frame_number, x0, y0, x1, y1, label, track) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [(fn, b["x0"], b["y0"], b["x1"], b["y1"], b["label"], b.get("track")) for b in new])
+        con.execute("UPDATE frames SET author = ?, updated = ? WHERE frame_number = ?", (author, now, fn))
+        con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, fn, json.dumps(new)))
+        changed.append(fn)
+    return sorted(changed)
+
+
+def fragment_events(dbfile, frame_number, chunksize):
+    """idtrackerai fragments starting / ending at this frame (not present in the previous / next frame of the
+    chunk): where a track was lost or picked up, so where identities switch"""
+    con = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
+    try:
+        frags = {}
+        for fn, frag in con.execute("SELECT frame_number, fragment FROM ROI_0 WHERE frame_number BETWEEN ? AND ?",
+                                    (frame_number - 1, frame_number + 1)):
+            if frag is not None:
+                frags.setdefault(fn, set()).add(int(frag))
+    finally:
+        con.close()
+    here = frags.get(frame_number, set())
+    chunk = frame_number // chunksize
+    starts = sorted(here - frags.get(frame_number - 1, set())) if (frame_number - 1) // chunksize == chunk else []
+    ends = sorted(here - frags.get(frame_number + 1, set())) if (frame_number + 1) // chunksize == chunk else []
+    return {"starts": starts, "ends": ends}
+
+
+_start_hours = {}
+
+
+def _clock(dbfile, frame_number):
+    """Seconds since 00:00 of the recording's first day on the clock of the folder names (UTC) at that frame,
+    or None: imgstore's frame_time (STORE_INDEX, ms) counts from the o'clock hour the recording started in
+    (METADATA date_time floored to the hour), as the Group viewer's ZT."""
+    try:
+        with sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True, timeout=5) as conn:
+            if dbfile not in _start_hours:
+                value = conn.execute("SELECT value FROM METADATA WHERE field = 'date_time'").fetchone()
+                start = int(float(value[0]))
+                _start_hours[dbfile] = (start - start % 3600) % 86400
+            row = conn.execute("SELECT frame_time FROM STORE_INDEX WHERE frame_number = ?", (frame_number,)).fetchone()
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        logger.warning("No time for frame %s: %s", frame_number, error)
+        return None
+    return None if row is None or row[0] is None else _start_hours[dbfile] + row[0] / 1000
+
+
+def _clocks(dbfile, frame_numbers):
+    """_clock of many frames in few queries: {frame_number: seconds} (frames without time left out)."""
+    frames = sorted(set(int(f) for f in frame_numbers))
+    if not frames:
+        return {}
+    first = _clock(dbfile, frames[0])     # also caches the start hour
+    if first is None:
+        return {}
+    out = {}
+    try:
+        with sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True, timeout=5) as conn:
+            for k in range(0, len(frames), 900):
+                part = frames[k:k + 900]
+                rows = conn.execute(
+                    f"SELECT frame_number, frame_time FROM STORE_INDEX WHERE frame_number IN ({','.join('?' * len(part))})",
+                    part)
+                out.update({fn: _start_hours[dbfile] + t / 1000 for fn, t in rows if t is not None})
+    except sqlite3.Error as error:
+        logger.warning("No times for the scenes: %s", error)
+    return out
+
+
 def _concatenation(dbfile, chunk):
     """local identity -> identity in that chunk"""
     con = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
@@ -120,19 +324,40 @@ def _concatenation(dbfile, chunk):
 
 def propose(rows, contours, width, height):
     """One box per machine row: the bounding box of the blob holding its centroid (else the
-    nearest within 20 px), at least MIN_BOX px wide and high, labelled with the local identity."""
+    nearest within 20 px), at least MIN_BOX px wide and high, labelled with the local identity.
+    Flies touching make one blob holding several centroids: each of them gets instead a box centred
+    on its centroid, of the median size of the frame's single-fly boxes."""
     polys = [np.asarray(c, dtype=np.float32).reshape((-1, 1, 2)) for c in contours if len(c) >= 3]
-    boxes = []
+    found = []
     for row in rows:
         x, y = float(row["x"]), float(row["y"])
         best, best_d = None, -20.0
-        for poly in polys:
+        for k, poly in enumerate(polys):
             d = cv2.pointPolygonTest(poly, (x, y), True)
             if d > best_d:
-                best, best_d = poly, d
-        if best is not None:
-            bx, by, bw, bh = cv2.boundingRect(best.astype(np.int32))
-            x0, y0, x1, y1 = bx - PAD, by - PAD, bx + bw + PAD, by + bh + PAD
+                best, best_d = k, d
+        found.append((row, x, y, best))
+    holders = {}
+    for _, _, _, k in found:
+        if k is not None:
+            holders[k] = holders.get(k, 0) + 1
+
+    def blob_box(k):
+        bx, by, bw, bh = cv2.boundingRect(polys[k].astype(np.int32))
+        return bx - PAD, by - PAD, bx + bw + PAD, by + bh + PAD
+
+    single = [blob_box(k) for k, n in holders.items() if n == 1]
+    if single:
+        fly_w = float(np.median([x1 - x0 for x0, _, x1, _ in single]))
+        fly_h = float(np.median([y1 - y0 for _, y0, _, y1 in single]))
+    else:
+        fly_w = fly_h = float(MIN_BOX)
+    boxes = []
+    for row, x, y, k in found:
+        if k is not None and holders[k] == 1:
+            x0, y0, x1, y1 = blob_box(k)
+        elif k is not None:
+            x0, y0, x1, y1 = x - fly_w / 2, y - fly_h / 2, x + fly_w / 2, y + fly_h / 2
         else:
             x0, y0, x1, y1 = x, y, x, y
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -147,7 +372,7 @@ def propose(rows, contours, width, height):
 
 
 def check_boxes(boxes, n_animals):
-    """Boxes as stored ({x0, y0, x1, y1, label}), or ValueError."""
+    """Boxes as stored ({x0, y0, x1, y1, label[, track]}), or ValueError."""
     labels = {str(i) for i in range(1, n_animals + 1)} | set(TAGS) | {""}
     out, seen = [], set()
     for box in boxes:
@@ -166,7 +391,13 @@ def check_boxes(boxes, n_animals):
         y0, y1 = sorted((y0, y1))
         if x1 - x0 < 2 or y1 - y0 < 2:
             raise ValueError("a box is too small")
-        out.append({"x0": round(x0, 1), "y0": round(y0, 1), "x1": round(x1, 1), "y1": round(y1, 1), "label": label})
+        box_out = {"x0": round(x0, 1), "y0": round(y0, 1), "x1": round(x1, 1), "y1": round(y1, 1), "label": label}
+        track = box.get("track")
+        if track:
+            if not isinstance(track, str) or len(track) > 64:
+                raise ValueError(f"bad track {track!r}")
+            box_out["track"] = track
+        out.append(box_out)
     return out
 
 
@@ -195,7 +426,15 @@ def read_scenes(basedir, experiment, n_animals):
                     reasons.append("between chunks")
                 if float(row.get("n_failed_fragments") or 0) > 0:
                     reasons.append(f"{int(float(row['n_failed_fragments']))} failed fragments")
-                scenes.append({"start": int(float(row["scene_start"])), "length": length, "reason": ", ".join(reasons)})
+                # the machine QC index starts a scene 2 frames before its first failure: a failure at frame 0
+                # gives a scene at -2, whose frames before 0 do not exist
+                start = int(float(row["scene_start"]))
+                if start < 0:
+                    length += start
+                    start = 0
+                if length <= 0:
+                    continue
+                scenes.append({"start": start, "length": length, "reason": ", ".join(reasons)})
         scenes.sort(key=lambda s: s["start"])
         return scenes, {"kind": "scene_qc", "path": path}
     # the QC tab's runs of bad frames, if it ran on the machine tables
@@ -239,12 +478,33 @@ def register_box_annotations(app, get_state):
             return None, (jsonify({"error": "load an experiment with a tracking database"}), 400)
         return state, None
 
+    @app.route("/api/annotate/link", methods=["GET"])
+    def annotate_link():
+        """?frame_number=N[&experiment=E][&tab=annotate|group_viewer]: link opening E (default the loaded one)
+        at frame N, with the address this browser used (links.frame_url)."""
+        experiment = request.args.get("experiment")
+        if not experiment:
+            state = get_state()
+            if state is None:
+                return jsonify({"error": "no experiment given or loaded"}), 400
+            experiment = state["experiment"]
+        try:
+            frame_number = int(request.args["frame_number"])
+            url = links.frame_url(experiment, frame_number, tab=request.args.get("tab", "annotate"),
+                                  base_url=request.host_url)
+        except (KeyError, ValueError) as error:
+            return jsonify({"error": f"frame_number (integer) and tab: {error}"}), 400
+        return jsonify({"url": url, "experiment": to_flat(experiment), "frame_number": frame_number})
+
     @app.route("/api/annotate/scenes", methods=["GET"])
     def annotate_scenes():
         state, error = state_or_error()
         if error:
             return error
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
+        clocks = _clocks(state["dbfile"], [sc["start"] for sc in scenes])
+        for sc in scenes:
+            sc["clock"] = clocks.get(sc["start"])
         annotated, flagged, proposed, run = [], [], 0, None
         con = _connect(state["basedir"])
         if con is not None:
@@ -283,8 +543,9 @@ def register_box_annotations(app, get_state):
             with con:
                 meta = con.execute("SELECT author, updated FROM frames WHERE frame_number = ?", (frame_number,)).fetchone()
                 if meta:
-                    saved = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab} for a, b, c, d, lab in con.execute(
-                        "SELECT x0, y0, x1, y1, label FROM boxes WHERE frame_number = ? ORDER BY rowid", (frame_number,))]
+                    saved = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab, **({"track": tr} if tr else {})}
+                             for a, b, c, d, lab, tr in con.execute(
+                                 "SELECT x0, y0, x1, y1, label, track FROM boxes WHERE frame_number = ? ORDER BY rowid", (frame_number,))]
                 pf = con.execute("SELECT flags FROM proposal_frames WHERE frame_number = ?", (frame_number,)).fetchone()
                 if pf:
                     flags = json.loads(pf[0] or "[]")
@@ -294,6 +555,12 @@ def register_box_annotations(app, get_state):
                                   (frame_number,))]
             con.close()
         proposal, source = None, None
+        labels = {}
+        con = _connect(state["basedir"])
+        if con is not None:
+            with con:
+                labels = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
+            con.close()
         if solver is not None and (saved is None or want) and want != "tracking":
             proposal, source = solver, "solver"
         elif saved is None or want:
@@ -305,12 +572,16 @@ def register_box_annotations(app, get_state):
                 logger.warning("No contours for frame %s: %s", frame_number, exc)
                 contours = []
             proposal = propose(rows, contours, width, height)
+        if proposal is not None:
+            proposal = inherit_labels(proposal, rows, labels, frame_number)
         return jsonify({
             "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",
             "flags": flags, "has_solver": solver is not None,
             "saved": saved is not None, "boxes": proposal if proposal is not None else saved,
             "author": meta[0] if meta else None, "updated": meta[1] if meta else None,
             "machine": rows, "concatenation": _concatenation(state["dbfile"], chunk),
+            "clock": _clock(state["dbfile"], frame_number),
+            "fragment_events": fragment_events(state["dbfile"], frame_number, state["chunksize"]),
         })
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["POST"])
@@ -330,12 +601,39 @@ def register_box_annotations(app, get_state):
             con = _connect(state["basedir"], create=True)
             with con:
                 con.execute("DELETE FROM boxes WHERE frame_number = ?", (frame_number,))
-                con.executemany("INSERT INTO boxes VALUES (?, ?, ?, ?, ?, ?)",
-                                [(frame_number, b["x0"], b["y0"], b["x1"], b["y1"], b["label"]) for b in boxes])
+                con.executemany("INSERT INTO boxes (frame_number, x0, y0, x1, y1, label, track) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                [(frame_number, b["x0"], b["y0"], b["x1"], b["y1"], b["label"], b.get("track")) for b in boxes])
                 con.execute("INSERT OR REPLACE INTO frames VALUES (?, ?, ?, ?)", (frame_number, author, now, len(boxes)))
                 con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, json.dumps(boxes)))
             con.close()
         return jsonify({"frame_number": frame_number, "saved": True, "boxes": boxes, "author": author, "updated": now})
+
+    @app.route("/api/annotate/relabel_fragments", methods=["POST"])
+    def annotate_relabel_fragments():
+        """{"experiment", "frame_number", "mapping": {fragment: local identity}}: the labels a person gave those
+        fragments in that frame, written into every saved frame of its chunk holding them (swapping as in the app)."""
+        state, error = state_or_error()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        if body.get("experiment") and to_flat(body["experiment"]) != to_flat(state["experiment"]):
+            return jsonify({"error": "another experiment is loaded"}), 409
+        try:
+            frame_number = int(body["frame_number"])
+            mapping = {int(f): str(label) for f, label in (body.get("mapping") or {}).items()}
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "frame_number and mapping {fragment: local identity} needed"}), 400
+        valid = {str(i) for i in range(1, state["n_animals"] + 1)}
+        if not mapping or any(label not in valid for label in mapping.values()):
+            return jsonify({"error": f"local identities are 1..{state['n_animals']}"}), 400
+        chunk = frame_number // state["chunksize"]
+        with _lock:
+            con = _connect(state["basedir"], create=True)
+            with con:
+                changed = relabel_chunk(con, state["dbfile"], chunk, state["chunksize"], mapping, frame_number,
+                                        f"{_author()} (fragments of frame {frame_number})")
+            con.close()
+        return jsonify({"chunk": chunk, "mapping": {str(k): v for k, v in mapping.items()}, "changed": changed})
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["DELETE"])
     def annotate_delete(frame_number):
@@ -420,9 +718,13 @@ def register_box_annotations(app, get_state):
         if mode == "save" and not os.path.exists(os.path.join(folder, "IDENTITY_VAL.feather")):
             return jsonify({"error": "integrate first: no IDENTITY_VAL.feather in the validation folder"}), 400
 
+        # the report prints links to the frames still with problems (links.annotate_url), with the address of this browser
+        public_url = request.host_url.rstrip("/")
+
         def work(job):
             job.update(0, status="running")
-            env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""))
+            env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""),
+                       VALIDATOR_PUBLIC_URL=public_url)
             lines = []
             process = subprocess.Popen(command, cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        text=True, bufsize=1)
