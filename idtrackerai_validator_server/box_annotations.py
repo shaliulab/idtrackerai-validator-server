@@ -111,20 +111,38 @@ def _machine_rows(dbfile, frame_number):
 
 def box_fragments(boxes, rows):
     """idtrackerai fragment of each box: the machine row whose centroid is inside the box, nearest its centre,
-    one row per box (as the client's fragmentsOf) -> [fragment or None]"""
+    one row per box (as the client's fragmentsOf) -> [fragment or None]. Tag boxes (FMB, NEW-FRAGMENT, CROSSING)
+    take no row. A row inside a box with a local identity that got no row of its own is one blob holding two
+    flies (a crossing): its fragment is given to neither box, or a label given to one fly would be carried
+    through the fragment to the other."""
+    def inside(b, r):
+        return b["x0"] <= r["x"] <= b["x1"] and b["y0"] <= r["y"] <= b["y1"]
+
+    def is_lid(b):
+        return str(b.get("label") or "").isdigit()
+
     pairs = []
     for i, b in enumerate(boxes):
+        if b.get("label") in TAGS:
+            continue
         for j, r in enumerate(rows):
-            if r.get("fragment") is None or not (b["x0"] <= r["x"] <= b["x1"] and b["y0"] <= r["y"] <= b["y1"]):
+            if r.get("fragment") is None or not inside(b, r):
                 continue
             pairs.append((((r["x"] - (b["x0"] + b["x1"]) / 2) ** 2 + (r["y"] - (b["y0"] + b["y1"]) / 2) ** 2), i, j))
     pairs.sort()
-    out, used = [None] * len(boxes), set()
+    row_of, used = [None] * len(boxes), set()
     for _, i, j in pairs:
-        if out[i] is None and j not in used:
-            out[i] = int(rows[j]["fragment"])
+        if row_of[i] is None and j not in used:
+            row_of[i] = j
             used.add(j)
-    return out
+    shared = set()
+    for i, b in enumerate(boxes):
+        if row_of[i] is None and is_lid(b):
+            for k, j in enumerate(row_of):
+                if j is not None and inside(b, rows[j]):
+                    shared.update((i, k))
+                    break
+    return [None if j is None or i in shared else int(rows[j]["fragment"]) for i, j in enumerate(row_of)]
 
 
 _chunk_labels = {}   # (sidecar, dbfile, chunk) -> (key, {fragment: [(frame, label)] sorted})

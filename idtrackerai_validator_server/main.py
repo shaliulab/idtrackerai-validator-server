@@ -126,6 +126,7 @@ def main():
     elif tls:
         from cheroot import wsgi
         _survive_disconnects()
+        _handshake_off_accept_thread()
         server = wsgi.Server((args.host, args.port), app, numthreads=args.threads)
         server.ssl_adapter = redirecting_ssl_adapter(args.certfile, args.keyfile)
         try:
@@ -165,6 +166,59 @@ def _survive_disconnects():
     cheroot_server.HTTPConnection.communicate = safe_communicate
     cheroot_server.HTTPConnection.close = safe_close
     cheroot_server.HTTPConnection._survives_disconnects = True
+
+
+class _Accepted:
+    """Stands in for the listening socket: accept() gives a connection accepted already."""
+
+    def __init__(self, sock, addr):
+        self.sock, self.addr = sock, addr
+
+    def accept(self):
+        return self.sock, self.addr
+
+
+def _handshake_off_accept_thread():
+    """cheroot 10 runs the TLS handshake (and the adapter's peek for plain http) on its single accept
+    thread, so one client that opens a connection without sending anything (browsers open such
+    speculative connections, e.g. when a link is opened) stopped the whole server from accepting for
+    up to 2 x the socket timeout (20 s): requests of that time failed with "Network Error" in the
+    page. The accept thread now only accepts; each connection is wrapped in a thread of its own and
+    handed to the workers when ready."""
+    import socket
+    from cheroot import connections
+
+    manager = connections.ConnectionManager
+    if getattr(manager, "_handshakes_off_accept_thread", False):
+        return
+    from_server_socket = manager._from_server_socket
+
+    def handshake(self, sock, addr):
+        try:
+            conn = from_server_socket(self, _Accepted(sock, addr))   # wrap, as cheroot does
+            if conn is not None:
+                self.server.process_conn(conn)
+        except Exception:   # noqa: BLE001 — a failed handshake only loses that connection
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def accept_then_hand_off(self, server_socket):
+        if self.server.ssl_adapter is None:
+            return from_server_socket(self, server_socket)
+        try:
+            sock, addr = server_socket.accept()
+        except (socket.timeout, BlockingIOError, InterruptedError):
+            return None
+        except OSError:
+            return None
+        threading.Thread(target=handshake, args=(self, sock, addr), daemon=True,
+                         name="tls-handshake").start()
+        return None
+
+    manager._from_server_socket = accept_then_hand_off
+    manager._handshakes_off_accept_thread = True
 
 if __name__ == "__main__":
     main()
