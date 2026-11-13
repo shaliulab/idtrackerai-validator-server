@@ -125,6 +125,7 @@ def main():
         app.run(host=args.host, port=args.port, debug=True)
     elif tls:
         from cheroot import wsgi
+        _survive_disconnects()
         server = wsgi.Server((args.host, args.port), app, numthreads=args.threads)
         server.ssl_adapter = redirecting_ssl_adapter(args.certfile, args.keyfile)
         try:
@@ -135,6 +136,35 @@ def main():
         from waitress import serve
         serve(app, host=args.host, port=args.port, threads=args.threads)
 
+
+
+def _survive_disconnects():
+    """cheroot 10 kills its worker thread when a client hangs up during a TLS request: the SSLError is
+    answered with a 500 written to the closed socket, whose SSLEOFError escapes the worker. Each browser
+    request cancelled mid-flight (frames loaded ahead, a closed tab) then costs one of the --threads
+    workers until none is left and the server stops answering. Such a connection is dropped instead."""
+    import ssl
+    from cheroot import server as cheroot_server
+
+    if getattr(cheroot_server.HTTPConnection, "_survives_disconnects", False):
+        return
+    communicate, close = cheroot_server.HTTPConnection.communicate, cheroot_server.HTTPConnection.close
+
+    def safe_communicate(self):
+        try:
+            return communicate(self)
+        except (ssl.SSLError, OSError):
+            return False   # the worker closes it and takes the next connection
+
+    def safe_close(self):
+        try:
+            close(self)
+        except (ssl.SSLError, OSError):
+            pass
+
+    cheroot_server.HTTPConnection.communicate = safe_communicate
+    cheroot_server.HTTPConnection.close = safe_close
+    cheroot_server.HTTPConnection._survives_disconnects = True
 
 if __name__ == "__main__":
     main()
