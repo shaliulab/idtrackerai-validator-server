@@ -17,7 +17,8 @@ INDEX_COMMAND = [
     "find", "-L", ".", "-mindepth", "4", "-maxdepth", "6", "-regextype", "posix-extended",
     "(", "-regex", r"\./[^/]+/[^/]+/[^/]+/[^/]+", "-type", "d", "-not", "-name", "arenas", "-prune", ")",
     "-o", "(", "-regex", r"\./[^/]+/[^/]+/[^/]+/(arenas/[0-9]+/)?[^/]+db", "-regex", ".*FlyHostel.*db",
-    "-not", "-name", "index.db", "-print", ")",
+    # -size +0c: an empty file is no database (sqlite makes one when a missing path is opened for writing)
+    "-not", "-name", "index.db", "-size", "+0c", "-print", ")",
 ]
 
 

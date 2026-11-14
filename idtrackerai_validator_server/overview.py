@@ -221,8 +221,8 @@ def sheet_files():
 
 
 def _has_database(folder):
-    """Same rule as the index command: a *db file in the folder (or one of its arenas) other than index.db."""
-    return any(os.path.basename(p) != "index.db"
+    """Same rule as the index command: a non-empty *db file in the folder (or one of its arenas) other than index.db."""
+    return any(os.path.basename(p) != "index.db" and os.path.getsize(p) > 0
                for pattern in ("*db", "arenas/*/*db") for p in glob.glob(os.path.join(folder, pattern)))
 
 

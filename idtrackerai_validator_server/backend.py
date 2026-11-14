@@ -212,7 +212,7 @@ def update_experiments(root=None, output="index.txt"):
         rel = path.relative_to(root).as_posix()
         if path.name == "index.db":            # -not -name index.db
             continue
-        if DB_RE.fullmatch(rel):               # -regex .*FlyHostel.*db
+        if DB_RE.fullmatch(rel) and path.stat().st_size > 0:   # -regex .*FlyHostel.*db -size +0c
             entries.append(f"./{rel}")
 
     entries.sort()

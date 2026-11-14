@@ -234,6 +234,8 @@ def databases(folder):
                 stat = os.stat(path)
             except OSError:
                 continue
+            if stat.st_size == 0:      # an empty file is no database (not listed by the index either)
+                continue
             out.append({"path": os.path.relpath(path, folder), "size": stat.st_size, "mtime": stat.st_mtime,
                         "validated": is_validated(path, stat)})
     return out
