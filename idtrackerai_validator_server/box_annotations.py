@@ -67,6 +67,10 @@ YOLOV7_CVAT = os.path.expanduser(os.environ.get("YOLOV7_CVAT", "~/mambaforge/env
 _lock = threading.Lock()
 _integrating = {}          # experiment -> job id
 _proposing = {}            # experiment -> job id
+_preparing = {}            # experiment -> job id
+PREPARE_VERSION = "v4.0"  # validation_version.txt, as vsc-scripts/manual/validation/main.sh
+TIME_WINDOW_LENGTH = 0.002   # make-identogram, as main.sh
+PREPARE_JOBS = int(os.environ.get("PREPARE_N_JOBS", "10"))   # auto-annotate-qc cores
 
 
 def _validation_folder(basedir):
@@ -545,6 +549,7 @@ def register_box_annotations(app, get_state):
             "problems": read_problems(state["basedir"]),
             "flagged": flagged, "proposed_frames": proposed, "proposal_run": run,
             "proposing": _proposing.get(state["experiment"]),
+            "preparing": _preparing.get(state["experiment"]),
         })
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["GET"])
@@ -706,6 +711,66 @@ def register_box_annotations(app, get_state):
 
         job = start_job(f"YOLO + identity proposals of {to_flat(experiment)}", [to_flat(experiment)], work)
         _proposing[experiment] = job.id
+        return jsonify(job.to_dict()), 202
+
+    @app.route("/api/annotate/prepare", methods=["POST"])
+    def annotate_prepare():
+        """Job making flyhostel/validation/scene_qc.csv: make-identogram then auto-annotate-qc, the first steps of
+        vsc-scripts/manual/validation/main.sh (one job item each). An existing scene_qc.csv needs {"force": true}."""
+        state, error = state_or_error()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        experiment = state["experiment"]
+        running = _jobs.get(str(_preparing.get(experiment)))
+        if running is not None and running.status == "running":
+            return jsonify({"error": "the scenes of this experiment are being prepared", "job": running.to_dict()}), 409
+        executables = [os.path.join(VALIDATION_ENV, "bin", name) for name in ("make-identogram", "auto-annotate-qc")]
+        missing = [e for e in executables if not os.path.exists(e)]
+        if missing:
+            return jsonify({"error": f"{missing[0]} not found (FLYHOSTEL_VALIDATION_ENV)"}), 500
+        folder = _validation_folder(state["basedir"])
+        if os.path.exists(os.path.join(folder, "scene_qc.csv")) and not body.get("force"):
+            return jsonify({"error": "scene_qc.csv exists already (force to make it again)"}), 409
+        flat = to_flat(experiment)
+        commands = [
+            [executables[0], "--experiment", flat, "--folder", folder, "--time-window-length", str(TIME_WINDOW_LENGTH), "--cache"],
+            [executables[1], "--experiment", flat, "--folder", folder, "--n-jobs", str(PREPARE_JOBS)],
+        ]
+
+        def work(job):
+            # make-identogram writes logs/<scene>_<frame>_status.txt relative to its working directory (main.sh runs
+            # in vsc-scripts/manual/validation, which has one): here the validation folder
+            os.makedirs(os.path.join(folder, "logs"), exist_ok=True)
+            with open(os.path.join(folder, "validation_version.txt"), "w") as handle:
+                handle.write(PREPARE_VERSION + "\n")
+            env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""))
+            tails = []
+            for i, command in enumerate(commands):
+                job.update(i, status="running")
+                lines = []
+                process = subprocess.Popen(command, cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           text=True, bufsize=1)
+                for line in process.stdout:
+                    lines.append(line.rstrip("\n"))
+                    del lines[:-200]
+                    match = re.search(r"(\d+)%\|", line)
+                    if match:
+                        job.update(i, progress=min(0.99, int(match.group(1)) / 100))
+                code = process.wait()
+                tails.append({"command": " ".join(command), "exit_code": code, "tail": lines[-40:]})
+                job.result = {"steps": tails}
+                if code != 0:
+                    job.update(i, status="failed", error=f"exit code {code}")
+                    for j in range(i + 1, len(commands)):
+                        job.update(j, status="skipped", error="previous step failed")
+                    raise RuntimeError(f"{os.path.basename(command[0])} ended with exit code {code}")
+                job.update(i, status="done", progress=1.0)
+            scenes, _ = read_scenes(state["basedir"], experiment, state["n_animals"])
+            job.result["scenes"] = len(scenes)
+
+        job = start_job(f"Prepare the scenes of {flat}", ["make-identogram", "auto-annotate-qc"], work)
+        _preparing[experiment] = job.id
         return jsonify(job.to_dict()), 202
 
     @app.route("/api/annotate/integrate", methods=["POST"])
