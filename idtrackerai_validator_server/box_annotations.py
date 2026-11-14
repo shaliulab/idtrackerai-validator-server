@@ -149,27 +149,45 @@ def box_fragments(boxes, rows):
     return [None if j is None or i in shared else int(rows[j]["fragment"]) for i, j in enumerate(row_of)]
 
 
-_chunk_labels = {}   # (sidecar, dbfile, chunk) -> (key, {fragment: [(frame, label)] sorted})
+def tag_fragments(boxes, rows):
+    """Fragments a NEW-FRAGMENT tag splits in this frame: per tag box, the machine row whose centroid is inside it,
+    nearest its centre (flyhostel's integration gives that fly a new fragment from the tagged frame to the end of the
+    chunk)."""
+    out = set()
+    for b in boxes:
+        if b.get("label") != "NEW-FRAGMENT":
+            continue
+        cx, cy = (b["x0"] + b["x1"]) / 2, (b["y0"] + b["y1"]) / 2
+        inside = [r for r in rows if r.get("fragment") is not None
+                  and b["x0"] <= r["x"] <= b["x1"] and b["y0"] <= r["y"] <= b["y1"]]
+        if inside:
+            r = min(inside, key=lambda r: (r["x"] - cx) ** 2 + (r["y"] - cy) ** 2)
+            out.add(int(r["fragment"]))
+    return out
 
 
-def chunk_fragment_labels(con, dbfile, chunk, chunksize, sidecar):
-    """The local identities a person gave in the saved frames of a chunk, per idtrackerai fragment (the
-    integration spreads each through its fragment): {fragment: [(frame_number, label)]}. Cached until a
-    frame of the chunk is saved or unsaved."""
+def segment_key(fragment, frame_number, splits):
+    """Key of the stretch of a fragment holding that frame: "<fragment>" up to its first NEW-FRAGMENT tag, then
+    "<fragment>@<frame of the last tag at or before it>". Labels are carried within a stretch only.
+    splits: {fragment: [frames]}"""
+    if fragment is None:
+        return None
+    start = max((f for f in splits.get(fragment, ()) if f <= frame_number), default=None)
+    return str(fragment) if start is None else f"{fragment}@{start}"
+
+
+def _saved_chunk(con, dbfile, chunk, chunksize, skip=None):
+    """Saved boxes of a chunk ({frame: [box]}, but `skip`) and the machine rows of those frames"""
     lo, hi = chunk * chunksize, (chunk + 1) * chunksize
-    key = con.execute("SELECT COUNT(*), MAX(updated) FROM frames WHERE frame_number >= ? AND frame_number < ?", (lo, hi)).fetchone()
-    cache_key = (sidecar, dbfile, chunk)
-    hit = _chunk_labels.get(cache_key)
-    if hit and hit[0] == key:
-        return hit[1]
     boxes = {}
-    for fn, x0, y0, x1, y1, label in con.execute(
-            "SELECT b.frame_number, b.x0, b.y0, b.x1, b.y1, b.label FROM boxes b JOIN frames f ON f.frame_number = b.frame_number "
+    for fn, x0, y0, x1, y1, label, track in con.execute(
+            "SELECT b.frame_number, b.x0, b.y0, b.x1, b.y1, b.label, b.track FROM boxes b JOIN frames f ON f.frame_number = b.frame_number "
             "WHERE b.frame_number >= ? AND b.frame_number < ? ORDER BY b.frame_number, b.rowid", (lo, hi)):
-        boxes.setdefault(fn, []).append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "label": label or ""})
-    labels = {}
+        if fn != skip:
+            boxes.setdefault(fn, []).append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "label": label or "",
+                                             **({"track": track} if track else {})})
+    rows = {}
     if boxes:
-        rows = {}
         mcon = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
         try:
             frames = sorted(boxes)
@@ -180,22 +198,56 @@ def chunk_fragment_labels(con, dbfile, chunk, chunksize, sidecar):
                     rows.setdefault(fn, []).append({"x": x, "y": y, "fragment": frag})
         finally:
             mcon.close()
-        for fn, bs in boxes.items():
-            for b, frag in zip(bs, box_fragments(bs, rows.get(fn, []))):
-                if frag is not None and b["label"].isdigit():
-                    labels.setdefault(frag, []).append((fn, b["label"]))
-    _chunk_labels[cache_key] = (key, labels)
-    return labels
+    return boxes, rows
 
 
-def inherit_labels(boxes, rows, labels, frame_number):
+def _splits(boxes, rows):
+    """{fragment: [frames]} of the NEW-FRAGMENT tags of these saved frames"""
+    splits = {}
+    for fn in sorted(boxes):
+        for frag in tag_fragments(boxes[fn], rows.get(fn, [])):
+            splits.setdefault(frag, []).append(fn)
+    return splits
+
+
+_chunk_labels = {}   # (sidecar, dbfile, chunk) -> (key, ({segment key: [(frame, label)] sorted}, splits))
+
+
+def chunk_fragment_labels(con, dbfile, chunk, chunksize, sidecar):
+    """The local identities a person gave in the saved frames of a chunk, per stretch of idtrackerai fragment
+    (`segment_key`: the integration spreads each through its fragment, split by NEW-FRAGMENT tags):
+    ({key: [(frame_number, label)]}, splits {fragment: [frames]}). Cached until a frame of the chunk is saved or
+    unsaved."""
+    lo, hi = chunk * chunksize, (chunk + 1) * chunksize
+    key = con.execute("SELECT COUNT(*), MAX(updated) FROM frames WHERE frame_number >= ? AND frame_number < ?", (lo, hi)).fetchone()
+    cache_key = (sidecar, dbfile, chunk)
+    hit = _chunk_labels.get(cache_key)
+    if hit and hit[0] == key:
+        return hit[1]
+    boxes, rows = _saved_chunk(con, dbfile, chunk, chunksize)
+    splits = _splits(boxes, rows)
+    labels = {}
+    for fn, bs in boxes.items():
+        for b, frag in zip(bs, box_fragments(bs, rows.get(fn, []))):
+            if frag is not None and b["label"].isdigit():
+                labels.setdefault(segment_key(frag, fn, splits), []).append((fn, b["label"]))
+    _chunk_labels[cache_key] = (key, (labels, splits))
+    return labels, splits
+
+
+def inherit_labels(boxes, rows, labels, frame_number, splits=None):
     """Boxes of a proposal whose fragment a person labelled in another saved frame of the chunk take that
     label (from the nearest saved frame before, else after), marked inherited = that frame; a local
     identity already on another box swaps with it."""
     if not labels:
         return boxes
     out = [dict(b) for b in boxes]
+    splits = dict(splits or {})
+    here = tag_fragments(out, rows)     # this frame's own tags (a proposal has none)
+    for frag in here:
+        splits[frag] = sorted(set(splits.get(frag, [])) | {frame_number})
     for i, frag in enumerate(box_fragments(out, rows)):
+        frag = segment_key(frag, frame_number, splits)
         if frag is None or frag not in labels:
             continue
         before = [(fn, lab) for fn, lab in labels[frag] if fn < frame_number]
@@ -215,8 +267,9 @@ def inherit_labels(boxes, rows, labels, frame_number):
 
 
 def relabel_by_fragment(boxes, fragments, mapping):
-    """Boxes with the labels of `mapping` (fragment -> local identity) on the boxes of those fragments; a local
-    identity already on another box swaps with it (as in the app). -> (boxes, changed)"""
+    """Boxes with the labels of `mapping` (segment key -> local identity) on the boxes of those fragment stretches
+    (`fragments`: their keys); a local identity already on another box swaps with it (as in the app).
+    -> (boxes, changed)"""
     out = [dict(b) for b in boxes]
     changed = False
     for frag, label in mapping.items():
@@ -234,32 +287,20 @@ def relabel_by_fragment(boxes, fragments, mapping):
     return out, changed
 
 
-def relabel_chunk(con, dbfile, chunk, chunksize, mapping, skip, author):
-    """`mapping` written into every saved frame of the chunk (but `skip`) holding a box of those fragments.
-    -> frames changed"""
-    lo, hi = chunk * chunksize, (chunk + 1) * chunksize
-    boxes = {}
-    for fn, x0, y0, x1, y1, label, track in con.execute(
-            "SELECT b.frame_number, b.x0, b.y0, b.x1, b.y1, b.label, b.track FROM boxes b JOIN frames f ON f.frame_number = b.frame_number "
-            "WHERE b.frame_number >= ? AND b.frame_number < ? AND b.frame_number != ? ORDER BY b.frame_number, b.rowid", (lo, hi, skip)):
-        boxes.setdefault(fn, []).append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "label": label or "",
-                                         **({"track": track} if track else {})})
+def relabel_chunk(con, dbfile, chunk, chunksize, mapping, skip, author, skip_tags=()):
+    """`mapping` (segment key -> local identity) written into every saved frame of the chunk (but `skip`) holding a
+    box of those fragment stretches. skip_tags: the fragments the NEW-FRAGMENT tags of frame `skip` split, as the
+    person has it now (maybe not saved yet). -> frames changed"""
+    boxes, rows = _saved_chunk(con, dbfile, chunk, chunksize, skip=skip)
     if not boxes:
         return []
-    rows = {}
-    mcon = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True)
-    try:
-        frames = sorted(boxes)
-        for k in range(0, len(frames), 500):
-            part = frames[k:k + 500]
-            for fn, x, y, frag in mcon.execute(
-                    f"SELECT frame_number, x, y, fragment FROM ROI_0 WHERE frame_number IN ({','.join('?' * len(part))})", part):
-                rows.setdefault(fn, []).append({"x": x, "y": y, "fragment": frag})
-    finally:
-        mcon.close()
+    splits = _splits(boxes, rows)
+    for frag in skip_tags:
+        splits[frag] = sorted(set(splits.get(frag, [])) | {skip})
     now, changed = time.time(), []
     for fn, bs in boxes.items():
-        new, did = relabel_by_fragment(bs, box_fragments(bs, rows.get(fn, [])), mapping)
+        keys = [segment_key(f, fn, splits) for f in box_fragments(bs, rows.get(fn, []))]
+        new, did = relabel_by_fragment(bs, keys, mapping)
         if not did:
             continue
         con.execute("DELETE FROM boxes WHERE frame_number = ?", (fn,))
@@ -578,11 +619,11 @@ def register_box_annotations(app, get_state):
                                   (frame_number,))]
             con.close()
         proposal, source = None, None
-        labels = {}
+        labels, splits = {}, {}
         con = _connect(state["basedir"])
         if con is not None:
             with con:
-                labels = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
+                labels, splits = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
             con.close()
         if solver is not None and (saved is None or want) and want != "tracking":
             proposal, source = solver, "solver"
@@ -596,7 +637,7 @@ def register_box_annotations(app, get_state):
                 contours = []
             proposal = propose(rows, contours, width, height)
         if proposal is not None:
-            proposal = inherit_labels(proposal, rows, labels, frame_number)
+            proposal = inherit_labels(proposal, rows, labels, frame_number, splits)
         return jsonify({
             "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",
             "flags": flags, "has_solver": solver is not None,
@@ -605,6 +646,7 @@ def register_box_annotations(app, get_state):
             "machine": rows, "concatenation": _concatenation(state["dbfile"], chunk),
             "clock": _clock(state["dbfile"], frame_number),
             "fragment_events": fragment_events(state["dbfile"], frame_number, state["chunksize"]),
+            "fragment_splits": {str(f): fs for f, fs in splits.items()},
         })
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["POST"])
@@ -633,8 +675,10 @@ def register_box_annotations(app, get_state):
 
     @app.route("/api/annotate/relabel_fragments", methods=["POST"])
     def annotate_relabel_fragments():
-        """{"experiment", "frame_number", "mapping": {fragment: local identity}}: the labels a person gave those
-        fragments in that frame, written into every saved frame of its chunk holding them (swapping as in the app)."""
+        """{"experiment", "frame_number", "mapping": {segment key: local identity}, "tags": [fragments]}: the labels a
+        person gave those fragment stretches ("<fragment>" or "<fragment>@<frame>", split by NEW-FRAGMENT tags; `tags`:
+        the fragments this frame's tags split) in that frame, written into every saved frame of its chunk holding them
+        (swapping as in the app)."""
         state, error = state_or_error()
         if error:
             return error
@@ -643,7 +687,11 @@ def register_box_annotations(app, get_state):
             return jsonify({"error": "another experiment is loaded"}), 409
         try:
             frame_number = int(body["frame_number"])
-            mapping = {int(f): str(label) for f, label in (body.get("mapping") or {}).items()}
+            mapping = {}
+            for f, label in (body.get("mapping") or {}).items():
+                frag, _, start = str(f).partition("@")
+                mapping[f"{int(frag)}@{int(start)}" if start else str(int(frag))] = str(label)
+            tags = [int(f) for f in body.get("tags") or []]
         except (KeyError, TypeError, ValueError):
             return jsonify({"error": "frame_number and mapping {fragment: local identity} needed"}), 400
         valid = {str(i) for i in range(1, state["n_animals"] + 1)}
@@ -654,9 +702,9 @@ def register_box_annotations(app, get_state):
             con = _connect(state["basedir"], create=True)
             with con:
                 changed = relabel_chunk(con, state["dbfile"], chunk, state["chunksize"], mapping, frame_number,
-                                        f"{_author()} (fragments of frame {frame_number})")
+                                        f"{_author()} (fragments of frame {frame_number})", skip_tags=tags)
             con.close()
-        return jsonify({"chunk": chunk, "mapping": {str(k): v for k, v in mapping.items()}, "changed": changed})
+        return jsonify({"chunk": chunk, "mapping": mapping, "changed": changed})
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["DELETE"])
     def annotate_delete(frame_number):
