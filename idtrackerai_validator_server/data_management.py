@@ -119,6 +119,7 @@ def is_critical(relpath, experiment, tracked=None):
         chunk = int(match.group(1))
         return tracked is not None and tracked[0] <= chunk <= tracked[1] and chunk < BACKUP_CHUNKS
     if relpath in ("flyhostel/validation/validation.csv", "flyhostel/validation/validation_lags.csv",
+                   "flyhostel/validation/validator_annotations.db",
                    f"interactions/{flat}_database.feather"):
         return True
     if re.fullmatch(r"flyhostel/validation/[^/]+_annotations\.zip", relpath):

@@ -48,6 +48,7 @@ from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
 from idtrackerai_validator_server.deg_labels import register_deg_labels
 from idtrackerai_validator_server.jobs import register_jobs
+from idtrackerai_validator_server.ethoscope import register_ethoscope
 from idtrackerai_validator_server.overview import (
     register_overview, scan_not_analyzed, sheet_flies, merge_light_cycle, LIGHT_CYCLE_COLUMNS, _clean,
 )
@@ -172,6 +173,27 @@ def _pose_state():
 register_pose(app, get_state=_pose_state)
 register_sleap_labels(app, get_state=_pose_state)
 register_sleap_train(app)
+
+
+def _ethoscope_rows():
+    """(experiment, metadata rows) for the Ethoscope tab: ethoscope_metadata of the database,
+    else the metadata sheet rows (not analyzed); light_cycle merged as in the Overview."""
+    if STORE_INFO is not None:
+        rows = [dict(r) for r in STORE_INFO["flies"]]
+    elif db_manager is not None:
+        row = db_manager.tables["METADATA"].query.filter_by(field="ethoscope_metadata").first()
+        if row is None or not row.value:
+            return SELECTED_EXPERIMENT, []
+        df = pd.read_csv(io.StringIO(row.value), index_col=0, dtype=str, keep_default_na=False)
+        rows = df.to_dict("records")
+    else:
+        return None
+    for r, extra in zip(rows, _extra_metadata(rows)):
+        r["light_cycle"] = extra["light_cycle"]
+    return SELECTED_EXPERIMENT, rows
+
+
+register_ethoscope(app, get_rows=_ethoscope_rows)
 
 
 def _frame_size():
