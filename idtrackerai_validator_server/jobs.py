@@ -4,13 +4,15 @@ jobs.py  —  long-running background jobs with progress, polled by the frontend
 A job is a list of items (e.g. one per video being made), each with a progress in
 [0, 1] and a status. The work runs in a daemon thread; the frontend polls
 GET /api/jobs/<id> and, when the job produced a file, fetches it once from
-GET /api/jobs/<id>/download.
+GET /api/jobs/<id>/download. GET /api/jobs lists the jobs the server knows (running ones first),
+so a reloaded page follows the running ones again.
 """
 import os
 import shutil
 import logging
 import itertools
 import threading
+import time
 from collections import OrderedDict
 
 from flask import jsonify, send_file
@@ -38,6 +40,8 @@ class Job:
         self.download_name = None
         self.workdir = None              # deleted when the job is forgotten / downloaded
         self.result = None               # JSON-able result shown by the client, if any
+        self.started = time.time()
+        self.ended = None
         self._lock = threading.Lock()
 
     def update(self, index, **fields):
@@ -55,6 +59,8 @@ class Job:
                 "directory": self.directory,
                 "download": self.result_path is not None,
                 "result": self.result,
+                "started": self.started,
+                "ended": self.ended,
             }
 
     def cleanup(self):
@@ -81,12 +87,28 @@ def start_job(title, items, work):
             logger.exception("Job %s (%s) failed", job.id, title)
             job.error = str(error)
             job.status = "failed"
+        finally:
+            job.ended = time.time()
 
     threading.Thread(target=run, name=f"job-{job.id}", daemon=True).start()
     return job
 
 
 def register_jobs(app):
+
+    @app.route("/api/jobs", methods=["GET"])
+    def list_jobs():
+        """Every job kept (running and the last MAX_JOBS finished): running first, then newest first.
+        Results are left out (they can be large): GET /api/jobs/<id> has them."""
+        with _jobs_lock:
+            jobs = list(_jobs.values())
+        out = []
+        for job in jobs:
+            entry = job.to_dict()
+            entry.pop("result", None)
+            out.append(entry)
+        out.sort(key=lambda j: (j["status"] != "running", -j["started"]))
+        return jsonify({"jobs": out, "now": time.time()})
 
     @app.route("/api/jobs/<job_id>", methods=["GET"])
     def get_job(job_id):
