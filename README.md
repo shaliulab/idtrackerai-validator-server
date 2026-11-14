@@ -9,21 +9,36 @@ so no separate frontend server is needed.
 
 # How to install in Linux
 
-## Download
+Tested on Python 3.10. Building the web interface needs Node.js and npm: install
+them from your package manager or from https://nodejs.org if `npm --version` fails.
 
-The client is a git submodule, so clone recursively:
+## Download
 
 ```
 mkdir -p $HOME/opt
 cd $HOME/opt
-git clone --recurse-submodules https://github.com/shaliulab/idtrackerai-validator-server
+git clone https://github.com/shaliulab/idtrackerai-validator-server
+cd idtrackerai-validator-server
 ```
 
-If you already cloned without `--recurse-submodules`:
+## Get the submodules
+
+The web interface (`idtrackerai-validator-client`) and `flyhostel` are git
+submodules, and `flyhostel` has submodules of its own. Some of these use ssh URLs
+(`git@github.com:…`), and some are private lab repositories.
+
+**With access to the shaliulab repositories and an ssh key on GitHub** (lab members):
 
 ```
-cd $HOME/opt/idtrackerai-validator-server
 git submodule update --init --recursive
+```
+
+**Without them**, fetch only the public submodules the validator needs, over https:
+
+```
+git config --global url."https://github.com/".insteadOf "git@github.com:"
+git submodule update --init idtrackerai-validator-client flyhostel
+git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
 ```
 
 ## Make a conda/mamba environment (optional)
@@ -33,37 +48,62 @@ conda create --name validator python=3.10
 conda activate validator
 ```
 
-## Build the web interface
-
-The interface is written in React and has to be compiled once before the server
-can serve it. This requires Node.js and npm — install them from your package
-manager or from https://nodejs.org if `npm --version` fails.
+## Build the web interface and install
 
 ```
 cd $HOME/opt/idtrackerai-validator-server
 ./build_frontend.sh
-```
-
-This runs `npm ci && npm run build` in `idtrackerai-validator-client/` and copies
-the result into `idtrackerai_validator_server/frontend/`, where the Flask app
-looks for it. Re-run it whenever you change the client.
-
-## Install the Python package
-
-Tested on Python 3.10.
-
-```
-cd $HOME/opt/idtrackerai-validator-server
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install .
 ```
 
-The `[gpu]` extra pulls in torch and torchvision, which idtrackerai needs at
-runtime. Quote it — the brackets are shell glob characters.
+`build_frontend.sh` compiles the React client in `idtrackerai-validator-client/`
+and copies it into `idtrackerai_validator_server/frontend/`, where the server
+looks for it. It runs `git submodule update --init --recursive` first, so without
+access to the private submodules it stops there. In that case build the interface
+during the install instead:
 
-Use `pip install -e .` instead of `pip install .` if you intend to edit the
-Python code. Note that an editable install does **not** build the client, so
-`./build_frontend.sh` is still required.
+```
+rm -rf idtrackerai_validator_server/frontend
+pip install .
+```
+
+`pip install .` builds the interface only when `idtrackerai_validator_server/frontend/`
+has none; with one already there it installs that one as it is.
+
+idtrackerai needs torch and torchvision at runtime. The first `pip install` gets
+the CPU builds, which are enough to serve the app. Skip it if your environment
+already has torch, for example a CUDA build.
+
+Use `pip install -e .` instead of `pip install .` if you intend to edit the Python
+code. An editable install does **not** build the client, so `./build_frontend.sh`
+is still required.
+
+## Install a specific version
+
+Releases are tagged (see https://github.com/shaliulab/idtrackerai-validator-server/releases).
+To install one, check out its tag before getting the submodules:
+
+```
+git checkout v1.2.1
+```
+
+and then follow the steps above from "Get the submodules".
+
+## Update
+
+Get the new code **before** building the interface again: otherwise the old
+interface is rebuilt and installed.
+
+```
+cd $HOME/opt/idtrackerai-validator-server
+git pull                       # or: git fetch --tags && git checkout <version>
+git submodule update --init --recursive    # or the public-only commands above
+./build_frontend.sh            # or: rm -rf idtrackerai_validator_server/frontend
+pip install .
+```
+
+Then restart the server.
 
 # Setup
 
@@ -115,15 +155,43 @@ Options:
 
 | flag | default | meaning |
 | --- | --- | --- |
-| `--port` | 5000 | port to listen on |
-| `--host` | 127.0.0.1 | interface to bind; `0.0.0.0` accepts connections from the network |
+| `--port` | 5000 (`$BACKEND_PORT`) | port to listen on |
+| `--host` | 127.0.0.1 (`$BACKEND_HOST`) | interface to bind; `0.0.0.0` accepts connections from the network |
 | `--no-browser` | off | do not open a browser window on startup |
-| `--threads` | 8 | waitress worker threads |
+| `--threads` | 8 | worker threads |
+| `--certfile`, `--keyfile` | `$VALIDATOR_CERTFILE`, `$VALIDATOR_KEYFILE` | TLS certificate and key: serve over https instead of http |
 | `--debug` | off | Flask development server with reloader; loopback only |
 
-`--host 0.0.0.0` makes the application reachable by anyone who can reach the
-port. There is no authentication, so prefer an SSH tunnel (below) on a shared
-machine.
+## Login and https
+
+By default there is no login: anyone who can reach the port can use the app. On
+the loopback interface (the default `--host`) that is only this machine. Before
+using `--host 0.0.0.0`, turn on the login, and preferably https:
+
+```
+export VALIDATOR_USERNAME=<user>
+export VALIDATOR_PASSWORD=<password>
+```
+
+When both are set, every page and API call needs a sign in. The form at `/login`
+keeps you signed in with a cookie, and scripts can send the same credentials as
+HTTP Basic auth.
+
+To serve over https, make a certificate and start the server with it:
+
+```
+scripts/make_tls_certificates.sh
+start-idtrackerai-validator-server --host 0.0.0.0 --no-browser \
+    --certfile ~/.config/idtrackerai-validator/tls/cert.pem \
+    --keyfile ~/.config/idtrackerai-validator/tls/key.pem
+```
+
+The script makes a small certificate authority (`ca.pem`) and a server certificate
+signed by it. Each client computer trusts `ca.pem` once, and then browsers show no
+warning. The login page links it as `/ca.crt` with instructions.
+`scripts/install_ca_linux_chrome.sh` does it for Chrome on Linux.
+
+An SSH tunnel (below) is the alternative on a shared machine.
 
 ## Running on a remote machine
 
