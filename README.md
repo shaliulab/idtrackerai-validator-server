@@ -41,16 +41,25 @@ git submodule update --init idtrackerai-validator-client flyhostel
 git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
 ```
 
-## Make a conda/mamba environment (optional)
+## Make a conda/mamba environment
+
+Recommended, so the validator's packages do not mix with others. Make it once:
 
 ```
 conda create --name validator python=3.10
+```
+
+Then activate it in every new terminal before installing, updating or starting
+the server (the prompt then starts with `(validator)`):
+
+```
 conda activate validator
 ```
 
 ## Build the web interface and install
 
 ```
+conda activate validator
 cd $HOME/opt/idtrackerai-validator-server
 ./build_frontend.sh
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
@@ -95,15 +104,34 @@ and then follow the steps above from "Get the submodules".
 Get the new code **before** building the interface again: otherwise the old
 interface is rebuilt and installed.
 
+With access to the lab repositories:
+
 ```
+conda activate validator
 cd $HOME/opt/idtrackerai-validator-server
-git pull                       # or: git fetch --tags && git checkout <version>
-git submodule update --init --recursive    # or the public-only commands above
-./build_frontend.sh            # or: rm -rf idtrackerai_validator_server/frontend
+git pull
+git submodule update --init --recursive
+./build_frontend.sh
 pip install .
 ```
 
-Then restart the server.
+Without them:
+
+```
+conda activate validator
+cd $HOME/opt/idtrackerai-validator-server
+git pull
+git submodule update --init idtrackerai-validator-client flyhostel
+git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
+rm -rf idtrackerai_validator_server/frontend
+pip install .
+```
+
+To go to a specific version instead of the latest, replace `git pull` with
+`git fetch --tags` followed by `git checkout v1.2.1` (the version you want).
+
+Then restart the server so it runs the new version (see "Stop and restart" under
+"Run" below), and reload the page in the browser.
 
 # Setup
 
@@ -145,11 +173,80 @@ find -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db > index.
 
 # Run
 
+There are two ways to run the server: in a terminal, or as a background service
+that keeps running after you close the terminal or log out, and starts again
+when the computer restarts. Use the service on a computer other people connect to.
+
+## In a terminal
+
 ```
-start-idtrackerai-validator-server --port 5000 --no-browser > server.log 2>&1
+conda activate validator
+start-idtrackerai-validator-server --port 5000
 ```
 
-The application is then available at http://localhost:5000
+The application is then available at http://localhost:5000 (a browser window
+opens; add `--no-browser` to skip it). The server runs as long as this terminal
+stays open, and prints its messages there.
+
+- **Stop**: press `Ctrl+C` in that terminal.
+- **Restart** (e.g. after an update): press `Ctrl+C`, then run the same
+  `start-idtrackerai-validator-server ...` command again.
+
+## As a background service
+
+Set it up once (the `FLYHOSTEL_VIDEOS` of "Setup" above must be set in this
+terminal):
+
+```
+conda activate validator
+cd $HOME/opt/idtrackerai-validator-server
+mkdir -p ~/.config/systemd/user/idtrackerai-viewer.service.d
+sed -e "s|^ExecStart=[^ ]*|ExecStart=$(which start-idtrackerai-validator-server)|" \
+    -e "s|^Environment=FLYHOSTEL_VIDEOS=.*|Environment=FLYHOSTEL_VIDEOS=$FLYHOSTEL_VIDEOS|" \
+    -e "s|^Environment=PE_ANNOTATIONS_DB=.*|Environment=PE_ANNOTATIONS_DB=$FLYHOSTEL_VIDEOS/pe_annotations.db|" \
+    scripts/idtrackerai-viewer.service > ~/.config/systemd/user/idtrackerai-viewer.service
+```
+
+The service accepts connections from the network (`--host 0.0.0.0`), so give it
+a login. Replace `choose-a-user` and `choose-a-password` before running this:
+
+```
+cat > ~/.config/systemd/user/idtrackerai-viewer.service.d/auth.conf <<'EOF'
+[Service]
+Environment=VALIDATOR_USERNAME=choose-a-user
+Environment=VALIDATOR_PASSWORD=choose-a-password
+EOF
+chmod 600 ~/.config/systemd/user/idtrackerai-viewer.service.d/auth.conf
+```
+
+Then start it, and have it start again whenever the computer restarts:
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now idtrackerai-viewer
+loginctl enable-linger $USER
+```
+
+`loginctl enable-linger` keeps the service running after you log out. If it asks
+for a password you do not have, ask an administrator to run
+`sudo loginctl enable-linger <your user name>`.
+
+The application is then available at http://localhost:5000 on this computer, and
+at `http://<this computer's name or IP>:5000` from others.
+
+## Stop and restart
+
+| what | in a terminal | as a service |
+| --- | --- | --- |
+| restart (after an update) | `Ctrl+C`, then start it again | `systemctl --user restart idtrackerai-viewer` |
+| stop | `Ctrl+C` | `systemctl --user stop idtrackerai-viewer` |
+| start | `start-idtrackerai-validator-server --port 5000` | `systemctl --user start idtrackerai-viewer` |
+| is it running? | look at the terminal | `systemctl --user status idtrackerai-viewer` (`q` to quit) |
+| messages / errors | printed in the terminal | `journalctl --user -u idtrackerai-viewer -f` (`Ctrl+C` to quit) |
+
+Restarting cuts off what the server is doing: let saves and running jobs (e.g.
+an integration in the Annotate tab) finish first. After a restart, reload the
+page in the browser.
 
 Options:
 
@@ -177,6 +274,8 @@ When both are set, every page and API call needs a sign in. The form at `/login`
 keeps you signed in with a cookie, and scripts can send the same credentials as
 HTTP Basic auth.
 
+For the background service, that is the `auth.conf` above.
+
 To serve over https, make a certificate and start the server with it:
 
 ```
@@ -185,6 +284,20 @@ start-idtrackerai-validator-server --host 0.0.0.0 --no-browser \
     --certfile ~/.config/idtrackerai-validator/tls/cert.pem \
     --keyfile ~/.config/idtrackerai-validator/tls/key.pem
 ```
+
+For the background service, add the certificate instead, then restart it:
+
+```
+cat > ~/.config/systemd/user/idtrackerai-viewer.service.d/tls.conf <<EOF
+[Service]
+Environment=VALIDATOR_CERTFILE=$HOME/.config/idtrackerai-validator/tls/cert.pem
+Environment=VALIDATOR_KEYFILE=$HOME/.config/idtrackerai-validator/tls/key.pem
+EOF
+systemctl --user daemon-reload
+systemctl --user restart idtrackerai-viewer
+```
+
+The address is then `https://…:5000` instead of `http://`.
 
 The script makes a small certificate authority (`ca.pem`) and a server certificate
 signed by it. Each client computer trusts `ca.pem` once, and then browsers show no
@@ -195,8 +308,8 @@ An SSH tunnel (below) is the alternative on a shared machine.
 
 ## Running on a remote machine
 
-Start the server on the remote host, then forward the single port from your
-laptop:
+Start the server on the remote host (in a terminal there, or as a service),
+then forward the single port from your laptop:
 
 ```
 ssh -L 5000:localhost:5000 remote-host

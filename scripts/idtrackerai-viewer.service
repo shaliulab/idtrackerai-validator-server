@@ -2,6 +2,10 @@
 Description=idtrackerai validator (FlyHostel viewer)
 Documentation=https://github.com/shaliulab/idtrackerai-validator-server
 After=network-online.target
+# Give up if it crashes 5 times in 5 minutes, rather than looping forever on a
+# permanent fault such as a missing data directory.
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
@@ -21,11 +25,6 @@ WorkingDirectory=%h
 
 Restart=on-failure
 RestartSec=5
-
-# Give up if it crashes 5 times in 5 minutes, rather than looping forever on a
-# permanent fault such as a missing data directory.
-StartLimitBurst=5
-StartLimitIntervalSec=300
 
 StandardOutput=journal
 StandardError=journal
