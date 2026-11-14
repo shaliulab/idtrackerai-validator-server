@@ -281,6 +281,13 @@ def load_experiment(basedir_suffix, chunk, db_manager):
 
             metadata=load_flyhostel_metadata(basedir_suffix, db_manager)
             chunksize=metadata[1]
+            if chunksize is None:
+                # load_experiment_metadata failed (logged above), most often an ethoscope_metadata without rows:
+                # the experiment was analyzed before its flies were entered in the metadata sheets
+                raise ValueError(
+                    "cannot read the METADATA of the database (an ethoscope_metadata without rows? fill the "
+                    "metadata sheet, then update the experiment's metadata from the Overview tab); see the server log"
+                )
             frame_number = chunksize * chunk
             frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
         except Exception as error:
