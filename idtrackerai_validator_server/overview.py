@@ -24,6 +24,12 @@ taken from the metadata sheets: the CSV exports in $FLYHOSTEL_METADATA of every
 sheet listed under SHEETS in the googleapi config. They come with `analyzed: False`
 and their flies from the sheet rows.
 
+`flyhostel_night` (per fly) and `first_night` (per experiment): flies may go through
+the FlyHostel more than once, on consecutive days. A fly is identified by its
+ethoscope run (`machine_name`, `date`, `region_id`); when the same fly is in an
+experiment of the same FlyHostel the day before, this is not its first night
+(`annotate_nights`, the automatic version of the sheets' `experiment_order`).
+
 POST /api/overview/reindex rewrites index.txt in a background job (jobs.py) with
 experiments.INDEX_COMMAND: the databases of the experiment folders, as by hand with
 find -L -maxdepth 4 -mindepth 4 -regex .*FlyHostel.*db -not -name index.db, and those
@@ -37,8 +43,9 @@ import subprocess
 import math
 import sqlite3
 import logging
+import datetime
 import threading
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 import yaml
@@ -70,6 +77,9 @@ GOOGLEAPI_CONFIG = os.path.expanduser(os.environ.get("GOOGLEAPI_CONFIG", "~/.con
 METADATA_DIR = os.environ.get("FLYHOSTEL_METADATA", "/flyhostel_data/metadata")
 # CSV export of a sheet: "ethoscope&flyhostel_metadata<version> - <sheet>.csv", latest version wins
 SHEET_FILE_RE = re.compile(r"metadata(\d+) - (.+)\.csv$")
+
+# A fly is on its night N+1 when it was in an experiment of the same FlyHostel up to this many days before.
+MAX_NIGHT_GAP_DAYS = 1
 
 _cache = {}                 # db path -> (mtime, record)
 _scan_lock = threading.Lock()
@@ -352,6 +362,7 @@ def scan(root, refresh=False):
         warnings.append(f"could not read the DEG labels: {error}")
         deg = {}
     records = [{**record, "deg_videos": deg.get(record["experiment"], 0)} for record in records]
+    records = annotate_nights(records)
 
     coverage = Counter(column for record in records for fly in record["flies"] for column in fly)
     return {
@@ -361,6 +372,71 @@ def scan(root, refresh=False):
         "fly_columns": [{"name": name, "count": count} for name, count in coverage.most_common()],
         "n_flies": sum(len(record["flies"]) for record in records),
     }
+
+
+def _fly_key(flyhostel, fly):
+    """(FlyHostel, ethoscope, date, ROI) identifying a fly across experiments, None if incomplete."""
+    machine, date, region = fly.get("machine_name"), fly.get("date"), fly.get("region_id")
+    if not (flyhostel and machine and date and region):
+        return None
+    region = region[:-2] if region.endswith(".0") else region
+    return (flyhostel, machine.strip().upper(), date.strip(), region.strip())
+
+
+def _day(value):
+    try:
+        return datetime.date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def annotate_nights(records):
+    """New records whose flies carry `flyhostel_night` ("1" = first time in the FlyHostel)
+    and `previous_experiment`, and the experiment `first_night`: "yes" (every fly whose
+    run is known is on its first night), "no" (none is), "mixed", None (no fly known),
+    `repeat_flies` and `previous_experiments`."""
+    runs = defaultdict(list)        # fly key -> [(day, experiment)]
+    for record in records:
+        day = _day(record.get("date"))
+        for fly in record.get("flies", []):
+            key = _fly_key(record.get("flyhostel"), fly)
+            if key and day:
+                runs[key].append((day, record["experiment"]))
+
+    nights = {}                     # (key, experiment) -> (night, previous experiment)
+
+    def night_of(key, day, experiment, depth=0):
+        if (key, experiment) in nights:
+            return nights[(key, experiment)]
+        before = [(d, e) for d, e in runs[key]
+                  if e != experiment and 0 < (day - d).days <= MAX_NIGHT_GAP_DAYS]
+        result = (1, None)
+        if before and depth < 50:
+            d, e = max(before)
+            result = (night_of(key, d, e, depth + 1)[0] + 1, e)
+        nights[(key, experiment)] = result
+        return result
+
+    out = []
+    for record in records:
+        day = _day(record.get("date"))
+        flies, known, repeat, previous = [], 0, 0, []
+        for fly in record.get("flies", []):
+            key = _fly_key(record.get("flyhostel"), fly)
+            if key and day:
+                night, prev = night_of(key, day, record["experiment"])
+                fly = {**fly, "flyhostel_night": str(night)}
+                known += 1
+                if prev:
+                    fly["previous_experiment"] = prev
+                    repeat += 1
+                    if prev not in previous:
+                        previous.append(prev)
+            flies.append(fly)
+        first = None if not known else "yes" if not repeat else "no" if repeat == known else "mixed"
+        out.append({**record, "flies": flies, "first_night": first, "repeat_flies": repeat,
+                    "known_flies": known, "previous_experiments": previous})
+    return out
 
 
 def register_overview(app):
