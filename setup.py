@@ -95,7 +95,7 @@ class BuildWithFrontend(build_py):
 
 setup(
     name='idtrackerai_validator_server',
-    version='1.2.2',
+    version='1.2.3',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',
