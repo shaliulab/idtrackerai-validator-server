@@ -46,6 +46,7 @@ from idtrackerai_validator_server.backend import (
 from idtrackerai_validator_server.auth import register_auth
 from idtrackerai_validator_server.pe_validation import register_pe_validation
 from idtrackerai_validator_server.ethogram import register_ethogram
+from idtrackerai_validator_server.leg_validation import register_leg_validation
 from idtrackerai_validator_server.deg_labels import register_deg_labels
 from idtrackerai_validator_server.jobs import register_jobs
 from idtrackerai_validator_server.ethoscope import register_ethoscope
@@ -127,6 +128,7 @@ register_auth(app)
 
 register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+register_leg_validation(app)
 register_deg_labels(app)
 register_jobs(app)
 register_overview(app)
@@ -178,19 +180,26 @@ register_sleap_train(app)
 def _ethoscope_rows():
     """(experiment, metadata rows) for the Ethoscope tab: ethoscope_metadata of the database,
     else the metadata sheet rows (not analyzed); light_cycle merged as in the Overview."""
-    if STORE_INFO is not None:
-        rows = [dict(r) for r in STORE_INFO["flies"]]
-    elif db_manager is not None:
-        row = db_manager.tables["METADATA"].query.filter_by(field="ethoscope_metadata").first()
-        if row is None or not row.value:
-            return SELECTED_EXPERIMENT, []
-        df = pd.read_csv(io.StringIO(row.value), index_col=0, dtype=str, keep_default_na=False)
+    # under the lock /api/load holds while it swaps the database: the client asks for the
+    # flies right when the experiment changes, and a query during the swap fails
+    with lock:
+        experiment = SELECTED_EXPERIMENT
+        if STORE_INFO is not None:
+            rows = [dict(r) for r in STORE_INFO["flies"]]
+        elif db_manager is not None:
+            row = db_manager.tables["METADATA"].query.filter_by(field="ethoscope_metadata").first()
+            if row is None or not row.value:
+                return experiment, []
+            value = row.value
+            rows = None
+        else:
+            return None
+    if rows is None:
+        df = pd.read_csv(io.StringIO(value), index_col=0, dtype=str, keep_default_na=False)
         rows = df.to_dict("records")
-    else:
-        return None
     for r, extra in zip(rows, _extra_metadata(rows)):
         r["light_cycle"] = extra["light_cycle"]
-    return SELECTED_EXPERIMENT, rows
+    return experiment, rows
 
 
 register_ethoscope(app, get_rows=_ethoscope_rows)
