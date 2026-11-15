@@ -12,6 +12,13 @@ middle leg while the thorax stays in place, from the raw pose only, and writes p
                                               speed (thorax), and per leg (mL, mR, fL, fR, rL, rR) the distance of the tip from
                                               its resting position (body lengths) and stroke_<leg>
 
+The counting step (leg_movements_per_fly.py) writes $LEG_MOVEMENTS_DIR/model/movements.csv: every event of its population (middle
+legs alone, while immobile) with the classifier's p_middle, movement (counted as a real movement), near (during a contact with
+another fly or just after it) and partner (that fly). Every event shown gets those columns when it is in the file, and the
+selections movements, movements_near and movements_away sample the counted movements (all, near another fly, away from others).
+Besides the verdict, a review says whether the moving leg touches the other fly (touches: yes, no, no_partner = no other fly in the
+clip).
+
 Events are not tied to the loaded experiment: the tab plays each fly's HLS movie (motionmapper/<NN>/movie, as the Ethograms tab)
 at the time of the event, so a random sample can mix flies of every experiment. Verdicts go to their own sqlite file,
 $LEG_ANNOTATIONS_DB (default: leg_annotations.db next to pe_annotations.db), keyed on the fly and the start and end of the event.
@@ -35,6 +42,9 @@ LEG_DB = os.environ.get("LEG_ANNOTATIONS_DB") or os.path.join(os.path.dirname(os
 # what the reviewer sees in the clip (keys 1-7 in the tab)
 VERDICTS = ("middle", "groom", "walk", "posture", "pose_error", "other", "unsure")
 WHICH_LEG = ("left", "right", "both")
+TOUCHES = ("yes", "no", "no_partner")
+MOVEMENT_COLUMNS = ["p_middle", "movement", "near", "partner"]
+MOVEMENT_SELECTIONS = {"movements": None, "movements_near": True, "movements_away": False}
 IMMOBILE_S = 10   # "while immobile": immobile in the sleep trace for at least this long when the event starts
 EVENT_COLUMNS = ["event", "start", "end", "leg", "strokes", "strokes_per_s", "amplitude", "front_strokes", "hind_strokes",
                  "thorax_displacement", "alone", "immobile_s", "tip_score", "jump_fraction", "clean"]
@@ -108,6 +118,10 @@ def _init_db():
                 reviewed_at TEXT    NOT NULL,
                 PRIMARY KEY (fly, start, end)
             )""")
+        columns = [r[1] for r in c.execute("PRAGMA table_info(leg_annotations)")]
+        if "touches" not in columns:
+            touches = ",".join(f"'{v}'" for v in TOUCHES)
+            c.execute(f"ALTER TABLE leg_annotations ADD COLUMN touches TEXT CHECK (touches IS NULL OR touches IN ({touches}))")
 
 
 def _annotations(flies=None):
@@ -154,6 +168,37 @@ def _model_queue():
     if not parts:
         return pd.DataFrame(columns=["fly"] + EVENT_COLUMNS)
     return pd.concat(parts, ignore_index=True).sort_values("_order").drop(columns="_order")
+
+
+def _movements():
+    """model/movements.csv of leg_movements_per_fly.py (fly, event, p_middle, movement, near, partner), or None"""
+    path = os.path.join(LEG_MOVEMENTS_DIR, "model", "movements.csv")
+    if not os.path.exists(path):
+        return None
+    return _read_cached(path, lambda p: pd.read_csv(p, usecols=["fly", "event"] + MOVEMENT_COLUMNS))
+
+
+def _movement_events(near):
+    """The events counted as movements (near: True near another fly, False away, None all), with the detector's columns"""
+    m = _movements()
+    if m is None:
+        return None
+    m = m.loc[m["movement"].astype(str).str.lower() == "true"]
+    if near is not None:
+        m = m.loc[(m["near"].astype(str).str.lower() == "true") == near]
+    parts = [fly_events(f).assign(fly=f).merge(rows[["event"]], on="event") for f, rows in m.groupby("fly")
+             if os.path.exists(_events_path(f))]
+    if not parts:
+        return pd.DataFrame(columns=["fly"] + EVENT_COLUMNS)
+    return pd.concat(parts, ignore_index=True).sort_values(["fly", "event"]).reset_index(drop=True)
+
+
+def _with_movements(df):
+    """The columns of movements.csv for the events in it (None for the others)"""
+    m = _movements()
+    if m is None or df.empty:
+        return df.assign(**{c: None for c in MOVEMENT_COLUMNS})
+    return df.drop(columns=MOVEMENT_COLUMNS, errors="ignore").merge(m, on=["fly", "event"], how="left")
 
 
 def _records(df):
@@ -218,24 +263,34 @@ def register_leg_validation(app):
             if df is None:
                 return jsonify({"error": "no model/queue.csv in LEG_MOVEMENTS_DIR: run leg_movements_model.py"}), 404
         elif not fly:
-            # every fly with events, movie or not: the queue must not change when movies are deleted or remade
-            flies = all_flies()
-            parts = [_select(fly_events(f), which).assign(fly=f) for f in flies]
-            parts = [p for p in parts if len(p)]
-            if not parts:
-                return jsonify([])
-            df = pd.concat(parts, ignore_index=True).sample(frac=1, random_state=seed)
+            if which in MOVEMENT_SELECTIONS:
+                # the movements counted by leg_movements_per_fly.py
+                df = _movement_events(MOVEMENT_SELECTIONS[which])
+                if df is None:
+                    return jsonify({"error": "no model/movements.csv in LEG_MOVEMENTS_DIR: run leg_movements_per_fly.py"}), 404
+                if df.empty:
+                    return jsonify([])
+            else:
+                # every fly with events, movie or not: the queue must not change when movies are deleted or remade
+                flies = all_flies()
+                parts = [_select(fly_events(f), which).assign(fly=f) for f in flies]
+                parts = [p for p in parts if len(p)]
+                if not parts:
+                    return jsonify([])
+                df = pd.concat(parts, ignore_index=True)
+            df = df.sample(frac=1, random_state=seed)
             done = _annotations(df["fly"].unique())
             reviewed_at = pd.Series([done.get((f, *_key(s, e)), {}).get("reviewed_at") for f, s, e in
                                      zip(df["fly"], df["start"], df["end"])], index=df.index)
             df = pd.concat([df.loc[reviewed_at.notna()].assign(_at=reviewed_at).sort_values("_at").drop(columns="_at"),
                             df.loc[reviewed_at.isna()].head(n)])
         notes = _annotations(df["fly"].unique())
-        rows = _records(df[["fly"] + [c for c in EVENT_COLUMNS if c in df.columns]])
+        df = _with_movements(df[["fly"] + [c for c in EVENT_COLUMNS if c in df.columns]])
+        rows = _records(df)
         movies = {f: has_movie(f) for f in df["fly"].unique()}
         for r in rows:
             a = notes.get((r["fly"], *_key(r["start"], r["end"])), {})
-            r.update(verdict=a.get("verdict"), which_leg=a.get("which_leg"), notes=a.get("notes") or "",
+            r.update(verdict=a.get("verdict"), which_leg=a.get("which_leg"), touches=a.get("touches"), notes=a.get("notes") or "",
                      reviewer=a.get("reviewer"), has_movie=movies[r["fly"]])
         return jsonify(rows)
 
@@ -262,8 +317,8 @@ def register_leg_validation(app):
 
     @app.route("/api/legs/annotate", methods=["POST"])
     def legs_annotate():
-        """{fly, event, start, end, leg, verdict, which_leg, notes}: saves the review of an event; verdict, which_leg and notes all
-        empty deletes it."""
+        """{fly, event, start, end, leg, verdict, which_leg, touches, notes}: saves the review of an event; all of verdict,
+        which_leg, touches and notes empty deletes it."""
         d = request.get_json(force=True)
         need = ("fly", "start", "end")
         if not all(k in d for k in need):
@@ -272,21 +327,25 @@ def register_leg_validation(app):
         if err:
             return err
         verdict, which_leg, notes = d.get("verdict") or None, d.get("which_leg") or None, (d.get("notes") or "").strip() or None
+        touches = d.get("touches") or None
+        if touches is not None and touches not in TOUCHES:
+            return jsonify({"error": f"touches must be one of {TOUCHES}"}), 400
         if verdict is not None and verdict not in VERDICTS:
             return jsonify({"error": f"verdict must be one of {VERDICTS}"}), 400
         if which_leg is not None and which_leg not in WHICH_LEG:
             return jsonify({"error": f"which_leg must be one of {WHICH_LEG}"}), 400
         start, end = _key(d["start"], d["end"])
         with sqlite3.connect(LEG_DB) as c:
-            if verdict is None and which_leg is None and notes is None:
+            if verdict is None and which_leg is None and touches is None and notes is None:
                 c.execute("DELETE FROM leg_annotations WHERE fly=? AND start=? AND end=?", (d["fly"], start, end))
                 return jsonify({"ok": True, "deleted": True})
             c.execute("""
-                INSERT INTO leg_annotations (fly, start, end, event, leg, verdict, which_leg, notes, reviewer, reviewed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO leg_annotations (fly, start, end, event, leg, verdict, which_leg, touches, notes, reviewer, reviewed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(fly, start, end) DO UPDATE SET event=excluded.event, leg=excluded.leg, verdict=excluded.verdict,
-                    which_leg=excluded.which_leg, notes=excluded.notes, reviewer=excluded.reviewer, reviewed_at=excluded.reviewed_at
-            """, (d["fly"], start, end, d.get("event"), d.get("leg"), verdict, which_leg, notes, _reviewer(),
+                    which_leg=excluded.which_leg, touches=excluded.touches, notes=excluded.notes, reviewer=excluded.reviewer,
+                    reviewed_at=excluded.reviewed_at
+            """, (d["fly"], start, end, d.get("event"), d.get("leg"), verdict, which_leg, touches, notes, _reviewer(),
                   datetime.datetime.utcnow().isoformat()))
         return jsonify({"ok": True, "reviewer": _reviewer()})
 
@@ -296,7 +355,7 @@ def register_leg_validation(app):
         notes = pd.DataFrame(list(_annotations().values()))
         if notes.empty:
             notes = pd.DataFrame(columns=["fly", "start", "end", "event", "leg", "verdict", "which_leg", "notes", "reviewer",
-                                          "reviewed_at"])
+                                          "reviewed_at", "touches"])
         detector = []
         for fly in notes["fly"].unique():
             if os.path.exists(_events_path(fly)):
