@@ -23,7 +23,10 @@ local identity (0 → not assigned).
 
 Frames to check: the failed scenes of the validation pipeline's scene_qc.csv (make-identogram +
 auto-annotate-qc, scenes ≤ MAX_SCENE_LENGTH frames as export-images), else the runs of bad frames of
-the QC tab's cached result.
+the QC tab's cached result. Plus the unsure chunk boundaries (`unsure_boundaries`): the integration links each
+fly of a chunk to the next by its nearest centroid (flyhostel's make_identity_table), which can go wrong when a fly
+is missing on either side, jumps, or another fly is almost as close; those boundaries are added as scenes of
+2 × BOUNDARY_CONTEXT frames (or their reason appended to a scene that already covers them).
 
 Routes
     GET    /api/annotate/scenes              scenes to check, annotated frames, labels, the database, the frames
@@ -33,8 +36,11 @@ Routes
     POST   /api/annotate/frame/<n>           {"boxes": [{x0, y0, x1, y1, label}]} saves the frame
     DELETE /api/annotate/frame/<n>           the frame is no longer annotated
     POST   /api/annotate/propose             job running `yolov7-cvat propose` (YOLO + identity solver) on the scenes
-    POST   /api/annotate/integrate           {"mode": "integrate" | "save", "start_zt", "end_zt"}: job running
-                                             flyhostel's integrate-human-annotations / save-human-annotations
+    POST   /api/annotate/integrate           {"mode": "integrate" | "save", "start_zt", "end_zt", "range"}: job running
+                                             flyhostel's integrate-human-annotations / save-human-annotations. Without
+                                             ZT, integrate covers every tracked chunk (--fn-interval), or the annotated
+                                             frames with "range": "annotated"; save writes what was integrated
+    POST   /api/annotate/integrate/stop      kills the running integration / write of the loaded experiment
 """
 import csv
 import json
@@ -43,6 +49,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import signal
 import threading
 import time
 
@@ -68,6 +75,17 @@ _lock = threading.Lock()
 _integrating = {}          # experiment -> job id
 _proposing = {}            # experiment -> job id
 _preparing = {}            # experiment -> job id
+_integration_procs = {}    # experiment -> Popen of the running integrate / save
+_stopped = set()           # job ids stopped by a person
+
+# Chunk boundaries the integration may link wrongly (flyhostel's make_identity_table: each fly of the last frame of
+# chunk c goes, in local identity order, to the nearest free fly of the first frame of c + 1). Measured on
+# FlyHostel1_3X_2026-08-28: the chosen fly is ≤ 13 px away, the next candidate ≥ 76 px further.
+BOUNDARY_JUMP_PX = 30      # chosen fly further than this: the fly moved a lot or the link is wrong
+BOUNDARY_MARGIN_PX = 50    # second candidate less than this further than the chosen one: ambiguous
+BOUNDARY_CONTEXT = 3       # frames shown on each side of the boundary
+_boundary_cache = {}       # dbfile -> (mtime, n_animals, [(frame, reason)])
+_boundary_running = set()  # dbfiles being checked in the background
 PREPARE_VERSION = "v4.0"  # validation_version.txt, as vsc-scripts/manual/validation/main.sh
 TIME_WINDOW_LENGTH = 0.002   # make-identogram, as main.sh
 PREPARE_JOBS = int(os.environ.get("PREPARE_N_JOBS", "10"))   # auto-annotate-qc cores
@@ -513,6 +531,116 @@ def read_scenes(basedir, experiment, n_animals):
     return [], {"kind": None, "path": None}
 
 
+def tracked_frame_range(dbfile):
+    """(first, last) frame number with rows in ROI_0, or (None, None). Separate queries, so both use the index."""
+    with sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True) as conn:
+        first = conn.execute("SELECT MIN(frame_number) FROM ROI_0").fetchone()[0]
+        last = conn.execute("SELECT MAX(frame_number) FROM ROI_0").fetchone()[0]
+    return first, last
+
+
+def link_boundary(before, after, n_animals):
+    """Reasons ([] if none) why the integration's link of one chunk boundary may be wrong.
+
+    before / after: [(local_identity, x, y)] of the last frame of a chunk / the first of the next (machine tables).
+    Same greedy matching as flyhostel's make_identity_table: in local identity order, the nearest free fly.
+    """
+    reasons = []
+    lids_before = sorted(row for row in before if row[0])
+    lids_after = [row for row in after if row[0]]
+    for name, rows, all_rows in (("last frame", lids_before, before), ("first frame", lids_after, after)):
+        lids = [row[0] for row in rows]
+        if len(lids) != n_animals or len(set(lids)) != len(lids) or len(all_rows) != len(rows):
+            reasons.append(f"{len(set(lids))} of {n_animals} flies identified in the {name}")
+    used = set()
+    for lid, x, y in lids_before:
+        candidates = sorted((float(np.hypot(x - ax, y - ay)), alid) for alid, ax, ay in lids_after if alid not in used)
+        if not candidates:
+            break
+        distance, chosen = candidates[0]
+        used.add(chosen)
+        if distance > BOUNDARY_JUMP_PX:
+            reasons.append(f"fly {lid} → {chosen} {distance:.0f} px away")
+        if len(candidates) > 1 and candidates[1][0] - distance < BOUNDARY_MARGIN_PX:
+            reasons.append(f"fly {lid}: {chosen} at {distance:.0f} px, {candidates[1][1]} at {candidates[1][0]:.0f} px")
+    return reasons
+
+
+def unsure_boundaries(dbfile, chunksize, n_animals):
+    """[(first frame of the chunk after, reasons)] of the tracked chunk boundaries the integration may link wrongly.
+    ~20 ms; cached per database mtime."""
+    if n_animals < 2:
+        return []
+    mtime = os.path.getmtime(dbfile)
+    cached = _boundary_cache.get(dbfile)
+    if cached and cached[0] == mtime and cached[1] == n_animals:
+        return cached[2]
+    first, last = tracked_frame_range(dbfile)
+    out = []
+    if first is not None:
+        boundaries = [c * chunksize for c in range(first // chunksize + 1, last // chunksize + 1)]
+        frames = [f for b in boundaries for f in (b - 1, b)]
+        rows = {}
+        with sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True) as conn:
+            for i in range(0, len(frames), 500):
+                part = frames[i:i + 500]
+                for fn, lid, x, y in conn.execute(
+                        "SELECT r.frame_number, i.local_identity, r.x, r.y FROM ROI_0 r JOIN IDENTITY i "
+                        "ON i.frame_number = r.frame_number AND i.in_frame_index = r.in_frame_index "
+                        f"WHERE r.frame_number IN ({','.join('?' * len(part))})", part):
+                    rows.setdefault(fn, []).append((int(lid or 0), float(x), float(y)))
+        for b in boundaries:
+            reasons = link_boundary(rows.get(b - 1, []), rows.get(b, []), n_animals)
+            if reasons:
+                out.append((b, reasons))
+    _boundary_cache[dbfile] = (mtime, n_animals, out)
+    return out
+
+
+def unsure_boundaries_async(dbfile, chunksize, n_animals):
+    """The cached unsure_boundaries, or None while they are checked in a background thread
+    (7-50 s on a database the HDD has not read lately; ~10 ms once its pages are cached)."""
+    cached = _boundary_cache.get(dbfile)
+    try:
+        if cached and cached[0] == os.path.getmtime(dbfile) and cached[1] == n_animals:
+            return cached[2]
+    except OSError:
+        return []
+    with _lock:
+        if dbfile in _boundary_running:
+            return None
+        _boundary_running.add(dbfile)
+
+    def work():
+        try:
+            unsure_boundaries(dbfile, chunksize, n_animals)
+        except Exception:
+            logger.exception("Could not check the chunk boundaries of %s", dbfile)
+            _boundary_cache[dbfile] = (os.path.getmtime(dbfile), n_animals, [])
+        finally:
+            with _lock:
+                _boundary_running.discard(dbfile)
+
+    threading.Thread(target=work, name="boundaries", daemon=True).start()
+    return None
+
+
+def add_boundary_scenes(scenes, boundaries, chunksize):
+    """Scenes plus one per unsure boundary; a scene already holding both sides of a boundary gets its reason."""
+    scenes = [dict(sc) for sc in scenes]
+    for b, reasons in boundaries:
+        reason = f"chunk {b // chunksize - 1}→{b // chunksize} link: " + "; ".join(reasons)
+        covering = next((sc for sc in scenes if sc["start"] <= b - 1 and b < sc["start"] + sc["length"]), None)
+        if covering is not None:
+            covering["reason"] = "; ".join(r for r in (covering.get("reason"), reason) if r)
+            covering["boundary"] = b
+        else:
+            scenes.append({"start": max(0, b - BOUNDARY_CONTEXT), "length": 2 * BOUNDARY_CONTEXT,
+                           "reason": reason, "boundary": b})
+    scenes.sort(key=lambda sc: sc["start"])
+    return scenes
+
+
 def read_problems(basedir):
     """Frames annotated here that still had a problem after the last integration
     (flyhostel's validator_problem_frames.csv): {mtime, frames: [{frame_number, problems}]} or None."""
@@ -525,6 +653,11 @@ def read_problems(basedir):
             frames.setdefault(int(row["frame_number"]), []).append(row["problem"])
     return {"mtime": os.path.getmtime(path),
             "frames": [{"frame_number": fn, "problems": p} for fn, p in sorted(frames.items())]}
+
+
+def _running_job(job_id):
+    job = _jobs.get(str(job_id)) if job_id is not None else None
+    return job.to_dict() if job is not None and job.status == "running" else None
 
 
 def _author():
@@ -565,6 +698,10 @@ def register_box_annotations(app, get_state):
         if error:
             return error
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
+        boundaries = unsure_boundaries_async(state["dbfile"], state["chunksize"], state["n_animals"])
+        scenes = add_boundary_scenes(scenes, boundaries or [], state["chunksize"])
+        # boundaries None: still being checked, the client asks again
+        source = {**source, "boundaries": None if boundaries is None else len(boundaries)}
         clocks = _clocks(state["dbfile"], [sc["start"] for sc in scenes])
         for sc in scenes:
             sc["clock"] = clocks.get(sc["start"])
@@ -586,7 +723,7 @@ def register_box_annotations(app, get_state):
             "labels": [str(i) for i in range(1, state["n_animals"] + 1)], "tags": TAGS,
             "scenes": scenes, "source": source, "annotated": annotated,
             "database": os.path.join(_validation_folder(state["basedir"]), DB_NAME),
-            "integrating": _integrating.get(state["experiment"]),
+            "integrating": _running_job(_integrating.get(state["experiment"])),
             "problems": read_problems(state["basedir"]),
             "flagged": flagged, "proposed_frames": proposed, "proposal_run": run,
             "proposing": _proposing.get(state["experiment"]),
@@ -845,20 +982,33 @@ def register_box_annotations(app, get_state):
         for key, flag in (("start_zt", "--start-zt"), ("end_zt", "--end-zt")):
             if body.get(key) not in (None, ""):
                 range_args += [flag, str(float(body[key]))]
-        command += range_args or ["--frames-from-annotation"]
+        if range_args:
+            command += range_args
+        elif mode == "save" or body.get("range") == "annotated":
+            # save: the range of the integrated feathers
+            command += ["--frames-from-annotation"]
+        else:
+            first, last = tracked_frame_range(state["dbfile"])
+            if first is None:
+                return jsonify({"error": "nothing tracked in ROI_0"}), 400
+            chunksize = state["chunksize"]
+            command += ["--fn-interval", str(first // chunksize * chunksize), str((last // chunksize + 1) * chunksize)]
         if mode == "save" and not os.path.exists(os.path.join(folder, "IDENTITY_VAL.feather")):
             return jsonify({"error": "integrate first: no IDENTITY_VAL.feather in the validation folder"}), 400
 
         # the report prints links to the frames still with problems (links.annotate_url), with the address of this browser
         public_url = request.host_url.rstrip("/")
+        who = _author()
 
         def work(job):
             job.update(0, status="running")
             env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""),
                        VALIDATOR_PUBLIC_URL=public_url)
             lines = []
+            # own session: Stop kills its worker processes too
             process = subprocess.Popen(command, cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, bufsize=1)
+                                       text=True, bufsize=1, start_new_session=True)
+            _integration_procs[experiment] = process
             for line in process.stdout:
                 lines.append(line.rstrip("\n"))
                 del lines[:-200]
@@ -866,7 +1016,13 @@ def register_box_annotations(app, get_state):
                 if match:
                     job.update(0, progress=min(0.99, int(match.group(1)) / 100))
             code = process.wait()
-            job.result = {"mode": mode, "command": " ".join(command), "exit_code": code, "tail": lines[-60:]}
+            _integration_procs.pop(experiment, None)
+            stopped = job.id in _stopped
+            job.result = {"mode": mode, "command": " ".join(command), "exit_code": code, "tail": lines[-60:],
+                          "stopped": stopped}
+            if stopped:
+                job.update(0, status="failed", error="stopped")
+                raise RuntimeError("stopped by " + who)
             if code != 0:
                 job.update(0, status="failed", error=f"exit code {code}")
                 raise RuntimeError(f"{os.path.basename(executable)} ended with exit code {code}")
@@ -876,3 +1032,31 @@ def register_box_annotations(app, get_state):
         job = start_job(title, [to_flat(experiment)], work)
         _integrating[experiment] = job.id
         return jsonify(job.to_dict()), 202
+
+    @app.route("/api/annotate/integrate/stop", methods=["POST"])
+    def annotate_integrate_stop():
+        """Kill the running integrate / save of the loaded experiment (its whole process group)."""
+        state, error = state_or_error()
+        if error:
+            return error
+        experiment = state["experiment"]
+        job = _jobs.get(str(_integrating.get(experiment)))
+        process = _integration_procs.get(experiment)
+        if job is None or job.status != "running" or process is None or process.poll() is not None:
+            return jsonify({"error": "no integration of this experiment is running"}), 409
+        _stopped.add(job.id)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        def kill_later():      # workers that ignore SIGTERM
+            time.sleep(10)
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        threading.Thread(target=kill_later, daemon=True).start()
+        logger.info("Integration job %s of %s stopped by %s", job.id, experiment, _author())
+        return jsonify({"stopped": job.id})
