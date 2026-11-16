@@ -95,11 +95,20 @@ def _validation_folder(basedir):
     return os.path.join(basedir, "flyhostel", "validation")
 
 
+def sidecar_path(basedir):
+    return os.path.join(_validation_folder(basedir), DB_NAME)
+
+
 def _connect(basedir, create=False):
-    path = os.path.join(_validation_folder(basedir), DB_NAME)
+    path = sidecar_path(basedir)
     if not create and not os.path.exists(path):
         return None
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return connect_path(path)
+
+
+def connect_path(path):
+    """An annotations database (the sidecar or a copy of it, gdrive_exchange.py), made / upgraded to the schema"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     con = sqlite3.connect(path, timeout=30)
     con.executescript("""
         CREATE TABLE IF NOT EXISTS boxes (frame_number INTEGER, x0 REAL, y0 REAL, x1 REAL, y1 REAL, label TEXT);
@@ -661,7 +670,11 @@ def _running_job(job_id):
 
 
 def _author():
-    return session.get("user") or os.environ.get("USER") or "anonymous"
+    """The login user, else the annotator name of the Drive exchange tab (gdrive_exchange.py), else $USER"""
+    if session.get("user"):
+        return session["user"]
+    from idtrackerai_validator_server.gdrive_exchange import read_config
+    return read_config()["annotator"] or os.environ.get("USER") or "anonymous"
 
 
 def register_box_annotations(app, get_state):

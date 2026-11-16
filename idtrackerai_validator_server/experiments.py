@@ -9,7 +9,7 @@ database) under arenas/N; see flyhostel.utils.experiment.
 """
 import os
 
-from flyhostel.utils.experiment import experiment_to_relpath, get_experiment_identifier
+from idtrackerai_validator_server.compat import experiment_to_relpath, get_experiment_identifier
 
 # index.txt: databases of experiment folders (depth 4) and of their arenas (depth 6).
 # Other folders at depth 4 are pruned, so find does not walk the experiments' contents.

@@ -146,10 +146,10 @@ def _local_sizes(top):
     return {relpath: size for relpath, (size, _, _) in dm._walk(top).items()}
 
 
-def _rclone_copy(source, target, on_bytes):
-    """rclone copy, calling on_bytes(bytes transferred) from its stats. Raises on failure."""
+def _rclone_copy(source, target, on_bytes, extra=()):
+    """rclone copy (plus `extra` arguments), calling on_bytes(bytes transferred) from its stats. Raises on failure."""
     cmd = [dropbox.RCLONE, "copy", source, target, "--transfers", "4", "--checkers", "8",
-           "--use-json-log", "--stats", "5s", "--stats-log-level", "NOTICE"]
+           "--use-json-log", "--stats", "5s", "--stats-log-level", "NOTICE", *extra]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     errors = []
     for line in proc.stderr:

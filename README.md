@@ -63,7 +63,7 @@ conda activate validator
 cd $HOME/opt/idtrackerai-validator-server
 ./build_frontend.sh
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install .
+pip install ".[full]"
 ```
 
 `build_frontend.sh` compiles the React client in `idtrackerai-validator-client/`
@@ -74,19 +74,46 @@ during the install instead:
 
 ```
 rm -rf idtrackerai_validator_server/frontend
-pip install .
+pip install ".[full]"
 ```
 
-`pip install .` builds the interface only when `idtrackerai_validator_server/frontend/`
+`pip install` builds the interface only when `idtrackerai_validator_server/frontend/`
 has none; with one already there it installs that one as it is.
 
 idtrackerai needs torch and torchvision at runtime. The first `pip install` gets
 the CPU builds, which are enough to serve the app. Skip it if your environment
 already has torch, for example a CUDA build.
 
-Use `pip install -e .` instead of `pip install .` if you intend to edit the Python
+`[full]` installs everything the lab uses (flyhostel, idtrackerai and imgstore from the
+submodules). Use `pip install -e ".[full]"` instead of `pip install ".[full]"` if you intend to edit the Python
 code. An editable install does **not** build the client, so `./build_frontend.sh`
 is still required.
+
+## Install for annotating only
+
+People who only annotate experiments shared through Google Drive (the **Drive exchange**
+tab) do not need flyhostel, idtrackerai or imgstore. Without them the server keeps the
+Group viewer, Annotate and Drive exchange tabs and grays out the others.
+
+```
+git clone https://github.com/shaliulab/idtrackerai-validator-server
+cd idtrackerai-validator-server
+git submodule update --init idtrackerai-validator-client
+pip install ".[annotator]"
+```
+
+Then install rclone (https://rclone.org/install/) and add a Google Drive remote with
+`rclone config` (name it `gdrive`, storage `drive`, sign in with Google when asked).
+Start the server with an empty folder for the experiments:
+
+```
+mkdir -p $HOME/flyhostel_videos
+FLYHOSTEL_VIDEOS=$HOME/flyhostel_videos start-idtrackerai-validator-server
+```
+
+In the Drive exchange tab set the shared folder (e.g. `gdrive:FlyHostelExchange`) and
+your name, download an experiment and annotate it in the Annotate tab. The tab's
+"How to set up" and the "How to use" tab explain the rest.
 
 ## Install a specific version
 
@@ -112,7 +139,7 @@ cd $HOME/opt/idtrackerai-validator-server
 git pull
 git submodule update --init --recursive
 ./build_frontend.sh
-pip install .
+pip install ".[full]"
 ```
 
 Without them:
@@ -124,7 +151,7 @@ git pull
 git submodule update --init idtrackerai-validator-client flyhostel
 git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
 rm -rf idtrackerai_validator_server/frontend
-pip install .
+pip install ".[full]"
 ```
 
 To go to a specific version instead of the latest, replace `git pull` with

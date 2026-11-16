@@ -14,10 +14,14 @@ import webcolors
 import cv2
 import numpy as np
 import pandas as pd
-from imgstore.interface import VideoCapture
+from idtrackerai_validator_server.compat import HAS_IMGSTORE, HAS_IDTRACKERAI, get_spaced_colors
 
-from idtrackerai.utils.py_utils import get_spaced_colors_util
-from idtrackerai.animals_detection.segmentation import _process_frame
+if HAS_IMGSTORE:
+    from imgstore.interface import VideoCapture
+else:
+    from idtrackerai_validator_server.lite_store import LiteVideoCapture as VideoCapture
+if HAS_IDTRACKERAI:
+    from idtrackerai.animals_detection.segmentation import _process_frame
 
 from idtrackerai_validator_server.experiments import to_flat, to_relpath, experiment_folder
 
@@ -68,6 +72,8 @@ def process_frame(frame, config):
     Returns
         contour_list (list): List of contours. See draw_frame on how to draw them on the frame
     """
+    if not HAS_IDTRACKERAI:
+        raise RuntimeError("segmentation needs idtrackerai, which is not installed")
     config=process_config(config)
     # assert not isinstance(config["min_area"], str)
 
@@ -166,7 +172,7 @@ def draw_frame(frame, tracking_data, number_of_animals, blobs=None, field="ident
         tracking_data (pd.DataFrame): Contains
             x, y, fragment, and whatever field is set to
     """
-    colors=get_spaced_colors_util(number_of_animals, black=False)
+    colors=get_spaced_colors(number_of_animals, black=False)
 
     for i, row in tracking_data.iterrows():
         org=(int(row["x"]), int(row["y"]))
@@ -223,7 +229,11 @@ def list_experiments():
     # cd $FLYHOSTEL_VIDEOS
     # experiments.INDEX_COMMAND > index.txt (Overview tab: "Rebuild index")
     # update_experiments
-    index=pd.read_csv(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt"), header=None)
+    path=os.path.join(os.environ["FLYHOSTEL_VIDEOS"], "index.txt")
+    # an annotator's folder has none until an experiment is downloaded (Drive exchange tab)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {"experiments": []}
+    index=pd.read_csv(path, header=None)
     dbfiles=index[0]
     experiments=[os.path.basename(path).replace(".db", "") for path in dbfiles]
     return {"experiments": experiments}

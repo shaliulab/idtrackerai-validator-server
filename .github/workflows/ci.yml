@@ -121,7 +121,7 @@ jobs:
       # flyhostel now comes from the wheel's own file:// dependency, which also
       # exercises flyhostel's resolution of idtrackerai and ethoscopy.
       - name: Install as documented
-        run: /tmp/testenv/bin/pip install .
+        run: /tmp/testenv/bin/pip install ".[full]"
 
       - name: Check the environment is consistent
         run: |
@@ -182,6 +182,60 @@ jobs:
           echo "--- unknown API route must 404, not serve HTML ---"
           code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/api/nonexistent)
           test "$code" = "404" || { echo "unknown API route returned $code"; exit 1; }
+
+          echo "all probes passed"
+
+      - name: Server log
+        if: always()
+        run: cat /tmp/server.log || true
+
+  # An annotator's install: the wheel with the [annotator] extra only, no flyhostel / idtrackerai / imgstore
+  # (compat.py). The server must start, report what it left out and answer the Drive exchange routes.
+  annotator-smoke-test:
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install the wheel for annotating
+        run: |
+          python -m venv /tmp/annotator
+          /tmp/annotator/bin/pip install --upgrade pip
+          /tmp/annotator/bin/pip install "$(ls dist/*.whl)[annotator]"
+          /tmp/annotator/bin/pip check
+          ! /tmp/annotator/bin/python -c "import flyhostel" 2>/dev/null
+
+      - name: Serve and probe
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/videos          # no index.txt: an annotator's folder before the first download
+          export FLYHOSTEL_VIDEOS=/tmp/videos
+          cd /tmp
+          /tmp/annotator/bin/start-idtrackerai-validator-server --port 5000 --no-browser > /tmp/server.log 2>&1 &
+          server_pid=$!
+          for i in $(seq 1 120); do
+            curl -sf -o /dev/null http://localhost:5000/ && break
+            if ! kill -0 "$server_pid" 2>/dev/null; then cat /tmp/server.log; exit 1; fi
+            sleep 1
+          done
+
+          echo "--- features ---"
+          curl -sf http://localhost:5000/api/features | tee /tmp/features.json
+          python -c "import json; f = json.load(open('/tmp/features.json')); assert not f['flyhostel'] and 'ethogram' in f['missing'], f"
+
+          echo "--- experiment list ---"
+          curl -sf http://localhost:5000/api/list
+
+          echo "--- Drive exchange status (no rclone here: answers, not connected) ---"
+          curl -sf http://localhost:5000/api/exchange/status
 
           echo "all probes passed"
 

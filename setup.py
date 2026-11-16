@@ -2,6 +2,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 from setuptools import setup, find_packages
 from setuptools.command.build_py import build_py
 
@@ -14,21 +15,26 @@ with open(HERE / "README.md", encoding="utf-8") as fh:
 
 
 def vendored(dist_name, path, extras=None):
-    """PEP 508 direct reference to a submodule checkout.
+    """PEP 508 direct reference to a submodule checkout, or None when it is not checked out.
 
     Absolute path required: pip resolves relative paths against the working
     directory, not this file. `dist_name` must match the name declared in that
     package's own setup.py, or pip rejects it as a metadata mismatch.
     """
     if not ((path / "setup.py").exists() or (path / "pyproject.toml").exists()):
-        raise SystemExit(
-            "{} is not checked out, and {} is not on PyPI.\n"
-            "Run: git submodule update --init --recursive".format(path.name, dist_name)
+        sys.stderr.write(
+            "warning: {} is not checked out and {} is not on PyPI: the [full] extra leaves it out.\n"
+            "Run: git submodule update --init --recursive\n".format(path.name, dist_name)
         )
+        return None
     name = "{}[{}]".format(dist_name, ",".join(extras)) if extras else dist_name
     return "{} @ {}".format(name, path.as_uri())
 
 
+# The core: the Annotate tab, the Group viewer and the Drive exchange tab on an experiment downloaded from
+# Google Drive (compat.py). flyhostel, idtrackerai and imgstore are installed from source and only needed for
+# the analysis tabs: the [full] extra. An annotator installs `pip install ".[annotator]"`, the lab
+# `pip install -e ".[full]"`.
 install_requires = [
     "flask>=2.2.5",
     "Flask-SQLAlchemy>=3.0.5",
@@ -36,16 +42,25 @@ install_requires = [
     "flask_cors>=4.0.0",
     "pandas>=1.3.5",
     "numpy>=1.21.6,<2",
-    # opencv comes from idtrackerai via flyhostel, pinned to <4. Declaring a
-    # different opencv variant here installs a second, conflicting copy of cv2.
+    # opencv is not declared here: in [full] it comes from idtrackerai via flyhostel, pinned to <4, and a
+    # different opencv variant would install a second, conflicting copy of cv2; [annotator] declares one.
     "webcolors",
     "h5py",
     "waitress",
     "cheroot",
     "pyyaml",
     "psutil",
+    "requests",
     # rois.py reads idtrackerai v5 .toml settings; tomllib is stdlib from 3.11 on.
     "tomli; python_version < '3.11'",
+]
+
+extras_require = {
+    # opencv comes from idtrackerai in the full install; without it, the server still needs one
+    # (frames are read with OpenCV: lite_store.py), and matplotlib for the identity colours
+    "annotator": ["opencv-python-headless<5", "matplotlib"],
+}
+extras_require["full"] = [r for r in [
     # Imported at startup through flyhostel but declared by neither it
     # (plotly: flyhostel.data.pose.ethogram.plot) nor ethoscopy (tabulate and
     # hmmlearn: behavpy_HMM_class; astropy: behavpy_periodogram_class;
@@ -60,7 +75,7 @@ install_requires = [
     vendored("flyhostel", HERE / "flyhostel", extras=["idtrackerai"]),
     # flyhostel requires a version newer than the latest on PyPI (0.4.19).
     vendored("imgstore-shaliulab", HERE / "flyhostel" / "libraries" / "imgstore"),
-]
+] if r]
 
 
 class BuildWithFrontend(build_py):
@@ -113,6 +128,7 @@ setup(
     license="MIT",
     python_requires='>=3.10',
     install_requires=install_requires,
+    extras_require=extras_require,
     entry_points={
         'console_scripts': [
             "start-idtrackerai-validator-server=idtrackerai_validator_server.main:main",

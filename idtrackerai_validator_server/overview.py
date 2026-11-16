@@ -54,7 +54,7 @@ from flask import jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.experiments import INDEX_COMMAND
-from flyhostel.utils.experiment import normalize_arena
+from idtrackerai_validator_server.compat import normalize_arena
 
 logger = logging.getLogger(__name__)
 

@@ -20,12 +20,16 @@ from flask import session
 import h5py
 from pathlib import Path
 
-from flyhostel.data.human_validation.utils import check_if_validated
-from flyhostel.utils import (
+import importlib
+
+from idtrackerai_validator_server.compat import (
+    check_if_validated,
     get_identities,
     get_number_of_animals,
     get_square_width,
-    get_square_height,    
+    get_square_height,
+    MISSING,
+    features as install_features,
 )
 
 
@@ -44,16 +48,11 @@ from idtrackerai_validator_server.backend import (
     frame_time_from_index,
 )
 from idtrackerai_validator_server.auth import register_auth
-from idtrackerai_validator_server.pe_validation import register_pe_validation
-from idtrackerai_validator_server.ethogram import register_ethogram
-from idtrackerai_validator_server.leg_validation import register_leg_validation
-from idtrackerai_validator_server.deg_labels import register_deg_labels
 from idtrackerai_validator_server.jobs import register_jobs
 from idtrackerai_validator_server.ethoscope import register_ethoscope
 from idtrackerai_validator_server.overview import (
     register_overview, scan_not_analyzed, sheet_flies, merge_light_cycle, LIGHT_CYCLE_COLUMNS, _clean,
 )
-from idtrackerai_validator_server.metadata_sync import register_metadata_sync
 from idtrackerai_validator_server.validation_csv import register_validation_csv
 from idtrackerai_validator_server.cvat import register_cvat
 from idtrackerai_validator_server.cvat_launch import register_cvat_launch
@@ -61,22 +60,66 @@ from idtrackerai_validator_server.data_management import register_data_managemen
 from idtrackerai_validator_server.restore import register_restore
 from idtrackerai_validator_server.dropbox_files import register_dropbox_files
 from idtrackerai_validator_server.qc import register_qc
-from idtrackerai_validator_server.pose import register_pose, get_h5_file, close_h5_files
 from idtrackerai_validator_server.monitor import register_monitor
 from idtrackerai_validator_server.resources import register_resources
-from idtrackerai_validator_server.data_collector import register_data_collector
-from idtrackerai_validator_server.sleap_labels import register_sleap_labels
-from idtrackerai_validator_server.sleap_train import register_sleap_train
 from idtrackerai_validator_server.gpu_queue import register_gpu_queue
 from idtrackerai_validator_server.box_annotations import register_box_annotations
-from idtrackerai_validator_server.environment import IncubatorEnvironment
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
 )
 from idtrackerai_validator_server import rois as roi_sources
-from idtrackerai_validator_server.utils import (
-    sleep_bouts, find_sleep_bout, SLEEP_CACHE as _sleep_cache, load_interactions, find_interaction, interactions_path,
-)
+from idtrackerai_validator_server.gdrive_exchange import register_gdrive_exchange
+
+
+def _optional(module, *names):
+    """Attributes of an idtrackerai_validator_server module that needs flyhostel (or another package not
+    every install has, see compat.py), or None for each when it does not import (recorded in MISSING)."""
+    try:
+        mod = importlib.import_module(f"idtrackerai_validator_server.{module}")
+    except ImportError as error:
+        MISSING[module] = str(error)
+        logging.getLogger(__name__).warning("%s left out: %s", module, error)
+        return (None,) * len(names) if len(names) > 1 else None
+    values = tuple(getattr(mod, name) for name in names)
+    return values if len(names) > 1 else values[0]
+
+
+register_pe_validation = _optional("pe_validation", "register_pe_validation")
+register_ethogram = _optional("ethogram", "register_ethogram")
+register_leg_validation = _optional("leg_validation", "register_leg_validation")
+register_deg_labels = _optional("deg_labels", "register_deg_labels")
+register_metadata_sync = _optional("metadata_sync", "register_metadata_sync")
+register_data_collector = _optional("data_collector", "register_data_collector")
+register_pose, get_h5_file, close_h5_files = _optional("pose", "register_pose", "get_h5_file", "close_h5_files")
+register_sleap_labels = _optional("sleap_labels", "register_sleap_labels")
+register_sleap_train = _optional("sleap_train", "register_sleap_train")
+IncubatorEnvironment = _optional("environment", "IncubatorEnvironment")
+(sleep_bouts, find_sleep_bout, _sleep_cache, load_interactions, find_interaction,
+ interactions_path) = _optional("utils", "sleep_bouts", "find_sleep_bout", "SLEEP_CACHE", "load_interactions",
+                                "find_interaction", "interactions_path")
+if close_h5_files is None:
+    def get_h5_file(*args, **kwargs):
+        return None
+
+    def close_h5_files():
+        pass
+if _sleep_cache is None:
+    _sleep_cache = {}
+if IncubatorEnvironment is None:
+    class IncubatorEnvironment:
+        """No incubator readings without flyhostel"""
+
+        def open(self, basedir):
+            return None
+
+        def at(self, frame_time):
+            return {"temperature": None, "humidity": None}
+
+
+def _register(register, *args, **kwargs):
+    """register(app, ...) unless its module was left out"""
+    if register is not None:
+        register(app, *args, **kwargs)
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -126,13 +169,13 @@ CORS(app)
 # Login form and session cookie when VALIDATOR_USERNAME and VALIDATOR_PASSWORD are set
 register_auth(app)
 
-register_pe_validation(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
-register_ethogram(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
-register_leg_validation(app)
-register_deg_labels(app)
+_register(register_pe_validation, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+_register(register_ethogram, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+_register(register_leg_validation)
+_register(register_deg_labels)
 register_jobs(app)
 register_overview(app)
-register_metadata_sync(app)
+_register(register_metadata_sync)
 register_validation_csv(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_cvat(app, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 register_cvat_launch(app)
@@ -141,7 +184,7 @@ register_restore(app)
 register_dropbox_files(app)
 register_monitor(app)
 register_resources(app)
-register_data_collector(app)
+_register(register_data_collector)
 
 
 def _qc_state():
@@ -172,9 +215,9 @@ def _pose_state():
             "centroid": _fly_centroid}
 
 
-register_pose(app, get_state=_pose_state)
-register_sleap_labels(app, get_state=_pose_state)
-register_sleap_train(app)
+_register(register_pose, get_state=_pose_state)
+_register(register_sleap_labels, get_state=_pose_state)
+_register(register_sleap_train)
 
 
 def _ethoscope_rows():
@@ -221,6 +264,7 @@ def _annotate_state():
 
 
 register_box_annotations(app, get_state=_annotate_state)
+register_gdrive_exchange(app, get_loaded=lambda: SELECTED_EXPERIMENT, get_commit=lambda: GIT_VERSION)
 # after every module registering a kind of GPU job (data_collector, sleap_train)
 register_gpu_queue(app)
 
@@ -564,6 +608,12 @@ def _git_version():
 GIT_VERSION = _git_version()
 
 
+@app.route("/api/features", methods=['GET'])
+def get_features():
+    """What this install has (compat.py): flyhostel / idtrackerai / imgstore, and the modules left out"""
+    return jsonify(install_features())
+
+
 @app.route("/api/version", methods=['GET'])
 def get_version():
     return jsonify(GIT_VERSION)
@@ -667,6 +717,8 @@ def navigate_sleep(direction, identity, frame_number):
     if direction not in ('prev', 'next'):
         return jsonify({"error": "direction must be prev or next"}), 400
 
+    if find_sleep_bout is None:
+        return jsonify({"error": "sleep bouts need flyhostel, which is not installed"}), 503
     experiment = to_flat(SELECTED_EXPERIMENT)
     bout = find_sleep_bout(sleep_bouts(experiment, identity, FRAMERATE), frame_number, direction)
     return jsonify({"frame_number": int(bout[0]) if bout else None})
@@ -989,6 +1041,8 @@ def navigate_interaction(direction, identity, frame_number):
         return _experiment_required()
     if direction not in ('prev', 'next'):
         return jsonify({"error": "direction must be prev or next"}), 400
+    if load_interactions is None:
+        return jsonify({"error": "interactions need flyhostel, which is not installed"}), 503
     experiment = to_flat(SELECTED_EXPERIMENT)
     frames = load_interactions(experiment).get(identity)
     return jsonify({"frame_number": find_interaction(frames, frame_number, direction)})
