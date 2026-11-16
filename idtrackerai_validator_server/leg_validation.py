@@ -258,7 +258,8 @@ def register_leg_validation(app):
                 return jsonify({"error": "pass ?fly= or ?sample="}), 400
             seed = request.args.get("seed", default=0, type=int)
         if not fly and which == "model":
-            # the queue of leg_movements_model.py: events where its classifier is least sure, in the order of the file
+            # the review queue of leg_movements_model.py (events where its classifier is least sure, or high-scoring events during
+            # contacts), in the order of the file
             df = _model_queue()
             if df is None:
                 return jsonify({"error": "no model/queue.csv in LEG_MOVEMENTS_DIR: run leg_movements_model.py"}), 404
