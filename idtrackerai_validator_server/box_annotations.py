@@ -43,6 +43,7 @@ Routes
     POST   /api/annotate/integrate/stop      kills the running integration / write of the loaded experiment
 """
 import csv
+import glob
 import json
 import logging
 import os
@@ -869,6 +870,73 @@ def experiment_meta(root, experiment):
             "columns": [[c, sorted(counts[c].items(), key=lambda kv: (-kv[1], kv[0]))] for c in order]}
 
 
+# --- what the scene proposer looked at: the tracking it read, the database's tracked range, its scenes ---
+_input_cache = {}            # feather path -> ((mtime, size), (first, last))
+
+
+def _feather_range(path):
+    """(first, last) frame_number of the tracking data make-identogram wrote and read
+    (flyhostel/validation/<experiment>_tracking_data.feather); cached per mtime / size; None without pyarrow."""
+    key = _mtime_size(path)
+    cached = _input_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        import pyarrow.compute as pc
+        import pyarrow.feather as pf
+        column = pf.read_table(path, columns=["frame_number"], memory_map=True)["frame_number"]
+        bounds = pc.min_max(column)
+        result = (int(bounds["min"].as_py()), int(bounds["max"].as_py())) if len(column) else None
+    except Exception as error:
+        logger.warning("Cannot read the frame range of %s: %s", path, error)
+        result = None
+    _input_cache[path] = (key, result)
+    return result
+
+
+def scene_coverage(basedir, dbfile, scenes, chunksize):
+    """Frames (with their clock) the scene proposer covered: `input` = the tracking data it read, `tracked` = ROI_0's
+    range now, `recorded` = the store's index.db, `scenes` = first / last scene of scene_qc.csv, `scene_qc` = when it was made; `untracked_chunks`:
+    chunks tracked after the proposer ran (Prepare scenes again)."""
+    folder = _validation_folder(basedir)
+    feathers = sorted(glob.glob(os.path.join(folder, "*_tracking_data.feather")), key=os.path.getmtime)
+    rng = _feather_range(feathers[-1]) if feathers else None
+    try:
+        tracked = tracked_frame_range(dbfile)
+    except sqlite3.Error:
+        tracked = (None, None)
+    first_scene = scenes[0]["start"] if scenes else None
+    last_scene = max((sc["start"] for sc in scenes), default=None)
+    frames = [f for f in (*(rng or ()), *tracked, first_scene, last_scene) if f is not None]
+    clocks = _clocks(dbfile, frames)
+
+    def span(a, b):
+        return None if a is None or b is None else {"first": a, "last": b, "first_clock": clocks.get(a), "last_clock": clocks.get(b)}
+
+    # the recording: the store's own index.db (frame_time on the same clock as the database's STORE_INDEX)
+    recorded = None
+    try:
+        with sqlite3.connect(f"file:{os.path.join(basedir, 'index.db')}?mode=ro", uri=True, timeout=5) as conn:
+            first = conn.execute("SELECT frame_number, frame_time FROM frames ORDER BY frame_number LIMIT 1").fetchone()
+            last = conn.execute("SELECT frame_number, frame_time FROM frames ORDER BY frame_number DESC LIMIT 1").fetchone()
+        if first and last and dbfile in _start_hours:
+            recorded = {"first": first[0], "last": last[0],
+                        "first_clock": _start_hours[dbfile] + first[1] / 1000 if first[1] is not None else None,
+                        "last_clock": _start_hours[dbfile] + last[1] / 1000 if last[1] is not None else None}
+    except sqlite3.Error as error:
+        logger.warning("Cannot read the recording's index.db: %s", error)
+    scene_qc = os.path.join(folder, "scene_qc.csv")
+    missing = None
+    if rng and tracked[1] is not None and chunksize and tracked[1] // chunksize > rng[1] // chunksize:
+        missing = [int(rng[1] // chunksize) + 1, int(tracked[1] // chunksize)]
+    return {"input": span(*rng) if rng else None,
+            "input_path": feathers[-1] if feathers else None,
+            "input_mtime": os.path.getmtime(feathers[-1]) if feathers else None,
+            "tracked": span(*tracked), "recorded": recorded, "scenes": span(first_scene, last_scene),
+            "scene_qc_mtime": os.path.getmtime(scene_qc) if os.path.exists(scene_qc) else None,
+            "untracked_chunks": missing}
+
+
 def _running_job(job_id):
     job = _jobs.get(str(job_id)) if job_id is not None else None
     return job.to_dict() if job is not None and job.status == "running" else None
@@ -917,6 +985,9 @@ def register_box_annotations(app, get_state):
             return error
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
         bundle = source["kind"] == "bundle"
+        # the range the proposer looked at (before the chunk boundaries are added: only scene_qc.csv's scenes)
+        coverage = None if bundle or source["kind"] != "scene_qc" else \
+            scene_coverage(state["basedir"], state["dbfile"], scenes, state["chunksize"])
         # a bundle's database holds only the scene frames: its boundaries are in scenes.json already
         boundaries = [] if bundle else unsure_boundaries_async(state["dbfile"], state["chunksize"], state["n_animals"])
         scenes = add_boundary_scenes(scenes, boundaries or [], state["chunksize"])
@@ -949,6 +1020,7 @@ def register_box_annotations(app, get_state):
             "proposing": _proposing.get(state["experiment"]),
             "preparing": _preparing.get(state["experiment"]),
             "bundle": bundle,
+            "coverage": coverage,
         })
 
     @app.route("/api/annotate/queue", methods=["GET"])
