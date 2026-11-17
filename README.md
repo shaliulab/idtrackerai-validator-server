@@ -102,8 +102,35 @@ git submodule update --init idtrackerai-validator-client
 pip install ".[annotator]"
 ```
 
-Then install rclone (https://rclone.org/install/) and add a Google Drive remote with
-`rclone config` (name it `gdrive`, storage `drive`, sign in with Google when asked).
+The publisher shares the Google Drive exchange folder with your Google account as
+**Editor** and sends you its link, `https://drive.google.com/drive/folders/<FOLDER_ID>`.
+The folder id is not a secret (the sharing gives the access), and you never need the
+publisher's OAuth client id or secret: you sign in with your own Google account.
+
+Install the current rclone (https://rclone.org/install/, e.g.
+`curl https://rclone.org/install.sh | sudo bash`; not the Linux distribution's package,
+usually too old to sign in to Google) and add the remote with `rclone config`:
+
+| Prompt | Answer |
+|---|---|
+| `n/s/q>` | `n` (new remote) |
+| `name>` | `gdrive` |
+| `Storage>` | `drive` (Google Drive) |
+| `client_id>`, `client_secret>` | Enter (empty: rclone's own client) |
+| `scope>` | `1` (full access; `drive.file` would hide the other people's files) |
+| `root_folder_id>` | the `<FOLDER_ID>` of the link |
+| `service_account_file>` | Enter |
+| `Edit advanced config?` | `n` |
+| `Use web browser to automatically authenticate?` | `y`, and sign in with the Google account the folder is shared with |
+| `Configure this as a Shared Drive?` | `n` |
+| `Keep this remote?` | `y`, then `q` |
+
+Without a browser (e.g. over ssh) answer `n` to the browser question and run the
+`rclone authorize "drive"` it prints on a computer that has one (same rclone version),
+then paste the result back. `rclone lsd gdrive:` should list the published experiments.
+Never share the output of `rclone config` / `rclone config show`: it holds the sign-in
+token, which opens the whole Drive of the account.
+
 Start the server with an empty folder for the experiments:
 
 ```
@@ -111,8 +138,11 @@ mkdir -p $HOME/flyhostel_videos
 FLYHOSTEL_VIDEOS=$HOME/flyhostel_videos start-idtrackerai-validator-server
 ```
 
-In the Drive exchange tab set the shared folder (e.g. `gdrive:FlyHostelExchange`) and
-your name, download an experiment and annotate it in the Annotate tab. Experiments
+Open http://localhost:5000. In the Drive exchange tab set the shared folder to `gdrive:`
+(the remote name and a colon, nothing after it: `root_folder_id` already points at the
+folder; with a shortcut to the folder in My Drive instead, `gdrive:FlyHostelExchange`)
+and your name, Save (the badge says connected), download an experiment, annotate it in
+the Annotate tab and upload your annotations. Experiments
 published as a minimal bundle hold only the frames of the scenes to check (a few hundred
 MB instead of the whole recording). The tab's
 "How to set up" and the "How to use" tab explain the rest.
