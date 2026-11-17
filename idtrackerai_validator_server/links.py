@@ -42,3 +42,13 @@ def frame_url(experiment, frame_number, tab="annotate", base_url=None):
 
 def annotate_url(experiment, frame_number, base_url=None):
     return frame_url(experiment, frame_number, tab="annotate", base_url=base_url)
+
+
+def pe_url(experiment, identity=None, burst_id=None, fly=None, base_url=None):
+    """Link opening the PE tab on a fly (identity, or its fly id `<flat experiment>__NN`) and,
+    with burst_id, on that burst of PE bouts (App.js peRequest -> PEValidator.js)."""
+    params = {"tab": "proboscis_extension", "experiment": to_flat(experiment),
+              "fly": fly or f"{to_flat(experiment)}__{int(identity):02d}"}
+    if burst_id is not None:
+        params["burst"] = int(burst_id)
+    return f"{(base_url or public_base()).rstrip('/')}/?{urlencode(params)}"

@@ -146,6 +146,93 @@ def _fly_id(experiment, identity):
     return f"{flat}__{str(int(identity)).zfill(2)}"
 
 
+def _traces_file(exp, fly):
+    """the extract_burst_traces output of a fly"""
+    return os.path.join(_media_dir(exp), f"{fly}_traces.feather")
+
+
+def burst_trace(exp, fly, burst_id):
+    """What /api/pe/trace returns for ONE burst (also drawn by pe_composition.py):
+    per-frame points, bout spans and inter-bout gaps. LookupError when the fly has no
+    trace feather or the burst is not in it."""
+    fps = get_framerate(to_flat(exp))
+
+    traces_file = _traces_file(exp, fly)
+    if not os.path.exists(traces_file):
+        raise LookupError(f"no trace feather for {fly}")
+    d = _load_traces_cached(traces_file, fly)
+    d = d[d["burst_id"] == burst_id].sort_values("frame_number").copy()
+
+    if d.empty:
+        raise LookupError(f"burst {burst_id} not in trace")
+
+    # normalize like the R script: t from 0, dist from its min
+    f0 = int(d["frame_number"].min())
+    d["t_s"] = (d["frame_number"] - f0) / fps
+    dmin = d["dist_mm"].min(skipna=True)
+    d["dist_rel"] = d["dist_mm"] - dmin
+
+    # per-bout spans (duration) and inter-bout gaps, computed once here
+    spans = (d.dropna(subset=["bout_in_burst"])
+            .groupby("bout_in_burst")["t_s"].agg(["min", "max"])
+            .reset_index().sort_values("min"))
+    spans_out = [{"bout_in_burst": int(r["bout_in_burst"]),
+                "t0": float(r["min"]), "t1": float(r["max"]),
+                "dur": float(r["max"] - r["min"])} for _, r in spans.iterrows()]
+    gaps_out = []
+    for a, b in zip(spans_out[:-1], spans_out[1:]):
+        gaps_out.append({"g0": a["t1"], "g1": b["t0"], "gap": b["t0"] - a["t1"]})
+
+    return {
+        "fly": fly, "burst_id": burst_id, "fps": fps, "start_frame": f0,
+        "points": [{"t_s": round(float(t), 4),
+                "dist": None if pd.isna(v) else round(float(v), 4),
+                "conf": None if pd.isna(cf) else round(float(cf), 4),
+                "bout_uid": None if pd.isna(u) else int(u),
+                "is_peak": bool(p)}
+               for t, v, cf, u, p in zip(d["t_s"], d["dist_rel"],
+                                         d["prob_conf"], d["bout_uid"],
+                                         d["is_peak"])],
+        "spans": spans_out, "gaps": gaps_out,
+    }
+
+
+def burst_window(exp, fly, burst_id):
+    """Same frame range the trace panel plots, so times line up exactly."""
+    tf = _traces_file(exp, fly)
+    if not os.path.exists(tf):
+        return None
+    fr = _load_traces_cached(tf, fly)
+    fr = fr.loc[fr["burst_id"] == burst_id, "frame_number"]
+    return (int(fr.min()), int(fr.max()) + 1) if len(fr) else None
+
+
+def burst_segments(exp, fly, burst_id, method="hyst"):
+    """What /api/pe/segments returns: automatic and ground-truth segments overlapping
+    the burst, in trace seconds, and whether its window was marked done."""
+    win = burst_window(exp, fly, burst_id)
+    if win is None:
+        return {"auto": [], "gt": [], "done": False, "params": None}
+    f0, f1 = win
+    fps = get_framerate(to_flat(exp))
+    t = lambda f: round((f - f0) / fps, 4)
+    with sqlite3.connect(RESEG_DB) as c:
+        auto = c.execute("SELECT start_frame, end_frame FROM auto_segments "
+                         "WHERE method=? AND fly=? AND end_frame>? AND start_frame<? "
+                         "ORDER BY start_frame", (method, fly, f0, f1)).fetchall()
+        gt = c.execute("SELECT start_frame, end_frame FROM gt_segments "
+                       "WHERE fly=? AND end_frame>? AND start_frame<? "
+                       "ORDER BY start_frame", (fly, f0, f1)).fetchall()
+        done = c.execute("SELECT 1 FROM gt_windows WHERE fly=? AND win_start<=? "
+                         "AND win_end>=?", (fly, f0, f1)).fetchone() is not None
+        run = c.execute("SELECT params FROM auto_runs WHERE method=? AND fly=?",
+                        (method, fly)).fetchone()
+    seg = lambda s, e: {"t0": t(s), "t1": t(e), "start_frame": s, "end_frame": e}
+    return {"auto": [seg(s, e) for s, e in auto],
+            "gt": [seg(s, e) for s, e in gt],
+            "done": done, "params": run[0] if run else None}
+
+
 def register_pe_validation(app, get_selected_experiment):
     """Attach the PE-validation routes to an existing Flask `app`.
     `get_selected_experiment` is a 0-arg callable returning the current experiment
@@ -329,67 +416,14 @@ def register_pe_validation(app, get_selected_experiment):
     @app.route("/api/pe/trace", methods=["GET"])
     def pe_trace():
         """Per-frame trace + bout spans + inter-bout gaps for ONE burst.
-        Query: ?identity=1&burst_id=2639"""
-        import time; t0 = time.time()
+        Query: ?fly=<fly id>&burst_id=2639"""
         exp, err = _experiment_or_400()
         if err:
             return err
-        fly = request.args["fly"]
-        burst_id = int(request.args["burst_id"])
-
-        experiment, identity = fly.split("__")
-        identity = int(identity)
-
-        fps = get_framerate(to_flat(exp))
-
-        traces_file = os.path.join(_media_dir(exp), f"{fly}_traces.feather")   # the extract_burst_traces output
-        if not os.path.exists(traces_file):
-            return jsonify({"error": f"no trace feather for {fly}"}), 404
-        d = _load_traces_cached(traces_file, fly)
-        d = d[d["burst_id"] == burst_id].sort_values("frame_number").copy()
-
-        if d.empty:
-            return jsonify({"error": f"burst {burst_id} not in trace"}), 404
-
-        # normalize like the R script: t from 0, dist from its min
-        f0 = int(d["frame_number"].min())
-        d["t_s"] = (d["frame_number"] - f0) / fps
-        dmin = d["dist_mm"].min(skipna=True)
-        d["dist_rel"] = d["dist_mm"] - dmin
-
-        # per-bout spans (duration) and inter-bout gaps, computed once here
-        spans = (d.dropna(subset=["bout_in_burst"])
-                .groupby("bout_in_burst")["t_s"].agg(["min", "max"])
-                .reset_index().sort_values("min"))
-        spans_out = [{"bout_in_burst": int(r["bout_in_burst"]),
-                    "t0": float(r["min"]), "t1": float(r["max"]),
-                    "dur": float(r["max"] - r["min"])} for _, r in spans.iterrows()]
-        gaps_out = []
-        for a, b in zip(spans_out[:-1], spans_out[1:]):
-            gaps_out.append({"g0": a["t1"], "g1": b["t0"], "gap": b["t0"] - a["t1"]})
-
-        return jsonify({
-            "fly": fly, "burst_id": burst_id, "fps": fps, "start_frame": f0,
-            "points": [{"t_s": round(float(t), 4),
-                    "dist": None if pd.isna(v) else round(float(v), 4),
-                    "conf": None if pd.isna(cf) else round(float(cf), 4),   # NEW
-                    "bout_uid": None if pd.isna(u) else int(u),
-                    "is_peak": bool(p)}
-                   for t, v, cf, u, p in zip(d["t_s"], d["dist_rel"],
-                                             d["prob_conf"], d["bout_uid"],  # NEW: prob_conf
-                                             d["is_peak"])],
-            "spans": spans_out, "gaps": gaps_out,
-        })
-
-
-    def _burst_window(exp, fly, burst_id):
-        """Same frame range the trace panel plots, so times line up exactly."""
-        tf = os.path.join(_media_dir(exp), f"{fly}_traces.feather")
-        if not os.path.exists(tf):
-            return None
-        fr = _load_traces_cached(tf, fly)
-        fr = fr.loc[fr["burst_id"] == burst_id, "frame_number"]
-        return (int(fr.min()), int(fr.max()) + 1) if len(fr) else None
+        try:
+            return jsonify(burst_trace(exp, request.args["fly"], int(request.args["burst_id"])))
+        except LookupError as error:
+            return jsonify({"error": error.args[0]}), 404
 
     @app.route("/api/pe/segments", methods=["GET"])
     def pe_segments():
@@ -397,28 +431,7 @@ def register_pe_validation(app, get_selected_experiment):
         if err:
             return err
         fly, bid = request.args["fly"], int(request.args["burst_id"])
-        method = request.args.get("method", "hyst")
-        win = _burst_window(exp, fly, bid)
-        if win is None:
-            return jsonify({"auto": [], "gt": [], "done": False, "params": None})
-        f0, f1 = win
-        fps = get_framerate(to_flat(exp))
-        t = lambda f: round((f - f0) / fps, 4)
-        with sqlite3.connect(RESEG_DB) as c:
-            auto = c.execute("SELECT start_frame, end_frame FROM auto_segments "
-                             "WHERE method=? AND fly=? AND end_frame>? AND start_frame<? "
-                             "ORDER BY start_frame", (method, fly, f0, f1)).fetchall()
-            gt = c.execute("SELECT start_frame, end_frame FROM gt_segments "
-                           "WHERE fly=? AND end_frame>? AND start_frame<? "
-                           "ORDER BY start_frame", (fly, f0, f1)).fetchall()
-            done = c.execute("SELECT 1 FROM gt_windows WHERE fly=? AND win_start<=? "
-                             "AND win_end>=?", (fly, f0, f1)).fetchone() is not None
-            run = c.execute("SELECT params FROM auto_runs WHERE method=? AND fly=?",
-                            (method, fly)).fetchone()
-        seg = lambda s, e: {"t0": t(s), "t1": t(e), "start_frame": s, "end_frame": e}
-        return jsonify({"auto": [seg(s, e) for s, e in auto],
-                        "gt": [seg(s, e) for s, e in gt],
-                        "done": done, "params": run[0] if run else None})
+        return jsonify(burst_segments(exp, fly, bid, request.args.get("method", "hyst")))
 
     @app.route("/api/pe/gt_segment", methods=["POST"])
     def pe_gt_segment():
@@ -442,7 +455,7 @@ def register_pe_validation(app, get_selected_experiment):
         if err:
             return err
         d = request.get_json(force=True)
-        win = _burst_window(exp, d["fly"], int(d["burst_id"]))
+        win = burst_window(exp, d["fly"], int(d["burst_id"]))
         if win is None:
             return jsonify({"error": "no trace for this burst"}), 404
         with sqlite3.connect(RESEG_DB) as c:

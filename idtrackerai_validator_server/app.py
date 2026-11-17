@@ -86,6 +86,7 @@ def _optional(module, *names):
 
 
 register_pe_validation = _optional("pe_validation", "register_pe_validation")
+register_pe_composition = _optional("pe_composition", "register_pe_composition")
 register_ethogram = _optional("ethogram", "register_ethogram")
 register_leg_validation = _optional("leg_validation", "register_leg_validation")
 register_deg_labels = _optional("deg_labels", "register_deg_labels")
@@ -171,6 +172,7 @@ CORS(app)
 register_auth(app)
 
 _register(register_pe_validation, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
+_register(register_pe_composition, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 _register(register_ethogram, get_selected_experiment=lambda: SELECTED_EXPERIMENT)
 _register(register_leg_validation)
 _register(register_deg_labels)
