@@ -52,13 +52,15 @@ import subprocess
 import signal
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 from flask import jsonify, request, session
 
 from idtrackerai_validator_server import links, qc
-from idtrackerai_validator_server.experiments import to_flat
+from idtrackerai_validator_server.compat import get_number_of_animals
+from idtrackerai_validator_server.experiments import is_validated, to_flat
 from idtrackerai_validator_server.jobs import _jobs, start_job
 from idtrackerai_validator_server.exchange_bundle import bundle_info, read_bundle_scenes
 
@@ -674,6 +676,140 @@ def read_problems(basedir):
             "frames": [{"frame_number": fn, "problems": p} for fn, p in sorted(frames.items())]}
 
 
+# --- validation queue: analyzed experiments without the validated tables, with this person's progress ---
+QUEUE_FILE = os.environ.get("ANNOTATE_QUEUE_FILE",
+                            os.path.expanduser("~/.config/idtrackerai-validator/annotate_queue.json"))
+QUEUE_ORDER = {"in_progress": 0, "to_do": 1, "no_scenes": 2, "annotated": 3}
+_progress_cache = {}          # dbfile -> (key, progress)
+_progress_lock = threading.Lock()
+
+
+def _is_mine(author, me):
+    """A save of this person: their own, or the labels they carried to other frames ("<me> (fragments of frame N)")"""
+    return bool(author) and (author == me or author.startswith(me + " ("))
+
+
+def _mtime_size(path):
+    try:
+        stat = os.stat(path)
+        return stat.st_mtime, stat.st_size
+    except OSError:
+        return None
+
+
+def experiment_progress(basedir, experiment, n_animals, me):
+    """Scenes of an experiment (scene_qc.csv, else the QC tab's runs; the chunk boundaries are left out:
+    checking them reads the database) and the frames saved in its sidecar: per scene done = every frame
+    saved (by anyone), `mine` = frames this person saved. Cached per sidecar / scene_qc.csv mtime and size."""
+    sidecar = sidecar_path(basedir)
+    key = (_mtime_size(sidecar), _mtime_size(os.path.join(_validation_folder(basedir), "scene_qc.csv")), me)
+    with _progress_lock:
+        cached = _progress_cache.get(basedir)
+    if cached and cached[0] == key:
+        return cached[1]
+    scenes, source = read_scenes(basedir, experiment, n_animals)
+    saved, mine, last_mine = set(), 0, None
+    if key[0] is not None:
+        try:
+            con = sqlite3.connect(f"file:{sidecar}?mode=ro", uri=True, timeout=5)
+            try:
+                for fn, author, updated in con.execute("SELECT frame_number, author, updated FROM frames"):
+                    saved.add(fn)
+                    if _is_mine(author, me):
+                        mine += 1
+                        if updated is not None and (last_mine is None or updated > last_mine):
+                            last_mine = updated
+            finally:
+                con.close()
+        except sqlite3.Error as error:
+            logger.warning("Cannot read %s: %s", sidecar, error)
+    done = sum(all(fn in saved for fn in range(sc["start"], sc["start"] + sc["length"])) for sc in scenes)
+    if not scenes:
+        status = "no_scenes"
+    elif done == len(scenes):
+        status = "annotated"
+    elif mine:
+        status = "in_progress"
+    else:
+        status = "to_do"
+    progress = {"status": status, "scenes": len(scenes), "scenes_done": done, "scene_source": source["kind"],
+                "annotated": len(saved), "mine": mine, "last_mine": last_mine}
+    with _progress_lock:
+        _progress_cache[basedir] = (key, progress)
+    return progress
+
+
+def read_hidden(me):
+    try:
+        with open(QUEUE_FILE) as handle:
+            return set(json.load(handle).get("hidden", {}).get(me, []))
+    except (OSError, ValueError):
+        return set()
+
+
+def write_hidden(me, experiment, hidden):
+    try:
+        with open(QUEUE_FILE) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    names = set(data.setdefault("hidden", {}).get(me, []))
+    (names.add if hidden else names.discard)(experiment)
+    data["hidden"][me] = sorted(names)
+    os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=1)
+    os.replace(tmp, QUEUE_FILE)
+    return names
+
+
+def validation_queue(root, me):
+    """Every database of index.txt (analyzed) without the validated tables (experiments.VALIDATED_TABLES),
+    with its number of animals and this person's progress. ~25 s cold on the HDDs (sqlite_master of
+    every database), then cached per file."""
+    index = os.path.join(root, "index.txt")
+    try:
+        with open(index) as handle:
+            paths = [line.strip() for line in handle if line.strip()]
+    except OSError:
+        return [], 0
+    hidden = read_hidden(me)
+
+    def one(relpath):
+        path = os.path.normpath(os.path.join(root, relpath))
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return None
+        if stat.st_size == 0:
+            return None
+        validated = is_validated(path, stat)
+        if validated:
+            return None
+        experiment = os.path.basename(path)[:-len(".db")] if path.endswith(".db") else os.path.basename(path)
+        basedir = os.path.dirname(path)
+        try:
+            n_animals = get_number_of_animals(experiment)
+        except Exception:     # unreadable conf: still listed
+            n_animals = None
+        item = {"experiment": experiment, "relpath": os.path.relpath(basedir, root), "n_animals": n_animals,
+                "date": (m.group(1) if (m := re.search(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", experiment)) else None),
+                "db_mtime": stat.st_mtime, "hidden": experiment in hidden, "unreadable": validated is None}
+        try:
+            item.update(experiment_progress(basedir, experiment, n_animals or 1, me))
+        except Exception as error:
+            logger.warning("Validation queue: cannot read the scenes of %s: %s", experiment, error)
+            item.update({"status": "no_scenes", "scenes": 0, "scenes_done": 0, "annotated": 0, "mine": 0,
+                         "last_mine": None, "error": str(error)})
+        return item
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        items = [item for item in pool.map(one, paths) if item is not None]
+    items.sort(key=lambda it: (QUEUE_ORDER[it["status"]], -(it["last_mine"] or 0), it["date"] or "", it["experiment"]))
+    return items, len(paths)
+
+
 def _running_job(job_id):
     job = _jobs.get(str(job_id)) if job_id is not None else None
     return job.to_dict() if job is not None and job.status == "running" else None
@@ -755,6 +891,22 @@ def register_box_annotations(app, get_state):
             "preparing": _preparing.get(state["experiment"]),
             "bundle": bundle,
         })
+
+    @app.route("/api/annotate/queue", methods=["GET"])
+    def annotate_queue():
+        """The validation queue (validation_queue) of the person asking: `me`, `items`, `analyzed`."""
+        me = _author()
+        items, analyzed = validation_queue(os.environ["FLYHOSTEL_VIDEOS"], me)
+        return jsonify({"me": me, "items": items, "analyzed": analyzed})
+
+    @app.route("/api/annotate/queue/hide", methods=["POST"])
+    def annotate_queue_hide():
+        """{"experiment", "hidden": bool}: take it out of this person's queue (or back in)"""
+        body = request.get_json(silent=True) or {}
+        if not body.get("experiment"):
+            return jsonify({"error": "experiment required"}), 400
+        hidden = write_hidden(_author(), to_flat(body["experiment"]), bool(body.get("hidden", True)))
+        return jsonify({"hidden": sorted(hidden)})
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["GET"])
     def annotate_frame(frame_number):

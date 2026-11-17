@@ -3,6 +3,9 @@
     GET /api/ethoscope/flies   the flies (ethoscope_metadata rows) and the ethoscope run
                                of each (`available` = at least one fly has one)
     GET /api/ethoscope/sleep   per fly the sleep trace scored from its ROI
+    GET /api/ethoscope/snapshots, /api/ethoscope/snapshot/<identity>/<id>
+                               the run's IMG_SNAPSHOTS (whole frame every ~5 min) on the
+                               trace's clock, and one of them cropped to the fly's ROI
 
 The metadata sheets give each fly `machine_name`, `date` and `region_id` (its ROI) of
 the ethoscope it lived in, plus `reference_hour` (ZT0). As scopr's `build_query`, the
@@ -43,7 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
 import numpy as np
-from flask import jsonify, request
+from flask import Response, jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
 
@@ -437,6 +440,79 @@ def _fly_trace(fly, params):
     return result
 
 
+# --- snapshots: IMG_SNAPSHOTS (id, t ms since the run start, img JPEG of the whole frame, every ~5 min) ---
+SNAPSHOT_PAD = 14            # px around the ROI in a crop
+_snap_cache = {}             # path -> ((mtime, size), [(rowid, t ms)], {roi_idx: (x, y, w, h)}, (width, height))
+_snap_lock = Lock()
+
+
+def _snapshot_index(path):
+    """Snapshots of a run (rowid, t), its ROIs and frame size; cached per file mtime / size (listing t
+    reads every blob page: ~4 s cold for 2000 snapshots)."""
+    stat = os.stat(path)
+    key = (stat.st_mtime, stat.st_size)
+    with _snap_lock:
+        cached = _snap_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1:]
+    con = _connect(path)
+    try:
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        snaps = con.execute("SELECT rowid, t FROM IMG_SNAPSHOTS ORDER BY t").fetchall() if "IMG_SNAPSHOTS" in tables else []
+        rois = {int(r[0]): tuple(int(v) for v in r[1:]) for r in con.execute("SELECT roi_idx, x, y, w, h FROM ROI_MAP")} \
+            if "ROI_MAP" in tables else {}
+        meta = dict(con.execute("SELECT field, value FROM METADATA").fetchall())
+    finally:
+        con.close()
+    size = (_number(meta.get("frame_width")), _number(meta.get("frame_height")))
+    with _snap_lock:
+        if len(_snap_cache) >= 64:
+            _snap_cache.pop(next(iter(_snap_cache)))
+        _snap_cache[path] = (key, snaps, rois, size)
+    return snaps, rois, size
+
+
+def fly_snapshots(fly):
+    """The snapshots of a fly's run on the trace's clock: `snapshots` [[id, t]] (t = s since ZT0 of the
+    day the run started, as the trace, or since the start without reference_hour), its ROI, the frame
+    size and `moved_t` (when it went into the FlyHostel, same clock: later snapshots show an empty tube)."""
+    snaps, rois, size = _snapshot_index(fly["path"])
+    start_unix, _ = _run_info(fly["path"])
+    ref = fly["reference_hour"]
+    offset = _ms_after_ref(start_unix, ref) if ref is not None else 0.0
+    moved = fly.get("moved_at")
+    return {"snapshots": [[rowid, round((t + offset) / 1000.0, 1)] for rowid, t in snaps],
+            "roi": rois.get(fly["region_id"]), "frame": size,
+            "moved_t": None if moved is None else round(((moved - start_unix) * 1000 + offset) / 1000.0, 1)}
+
+
+def snapshot_jpeg(path, rowid, roi=None, crop=True, width=None):
+    """JPEG of one snapshot: cropped to the ROI (± SNAPSHOT_PAD), or the whole frame with the ROI outlined;
+    scaled down to `width` px."""
+    import cv2
+    con = _connect(path)
+    try:
+        row = con.execute("SELECT img FROM IMG_SNAPSHOTS WHERE rowid = ?", (rowid,)).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        raise KeyError(rowid)
+    if roi is None and width is None:
+        return bytes(row[0])
+    img = cv2.imdecode(np.frombuffer(row[0], np.uint8), cv2.IMREAD_COLOR)
+    if roi is not None:
+        x, y, w, h = roi
+        if crop:
+            p = SNAPSHOT_PAD
+            img = img[max(0, y - p):y + h + p, max(0, x - p):x + w + p]
+        else:
+            cv2.rectangle(img, (x - 3, y - 3), (x + w + 3, y + h + 3), (40, 120, 230), 3)
+    if width and img.shape[1] > width:
+        img = cv2.resize(img, (int(width), max(1, round(img.shape[0] * width / img.shape[1]))), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    return buf.tobytes()
+
+
 def _params():
     params = {}
     for k, default in DEFAULTS.items():
@@ -485,6 +561,46 @@ def register_ethoscope(app, get_rows):
         except RuntimeError as e:
             return jsonify({"error": str(e)}), 409
         return jsonify(job.to_dict()), 202
+
+    @app.route("/api/ethoscope/snapshots", methods=["GET"])
+    def ethoscope_snapshots():
+        """Per fly with a run: its snapshots on the trace's clock (fly_snapshots); one listing per run."""
+        experiment, flies = _flies()
+        todo = [f for f in flies if f["path"]]
+
+        def one(fly):
+            try:
+                return fly["identity"], fly_snapshots(fly)
+            except Exception as error:
+                logger.exception("ethoscope snapshots of %s fly %s", experiment, fly["identity"])
+                return fly["identity"], {"snapshots": [], "error": str(error)}
+
+        # flies of one run share the listing: list each path once first
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda p: _snapshot_index(p) if os.path.exists(p) else None, sorted({f["path"] for f in todo})))
+            out = dict(pool.map(one, todo))
+        return jsonify({"experiment": experiment, "flies": {str(k): v for k, v in out.items()}})
+
+    @app.route("/api/ethoscope/snapshot/<int:identity>/<int:rowid>", methods=["GET"])
+    def ethoscope_snapshot(identity, rowid):
+        """JPEG of snapshot `rowid` of the fly's run: ?crop=roi (default: its ROI) or full (ROI outlined), &w= px"""
+        _, flies = _flies()
+        fly = next((f for f in flies if f["identity"] == identity and f["path"]), None)
+        if fly is None:
+            return jsonify({"error": f"fly {identity} has no ethoscope run"}), 404
+        try:
+            width = int(request.args["w"]) if request.args.get("w") else None
+        except ValueError:
+            return jsonify({"error": "w must be an integer"}), 400
+        _, rois, _ = _snapshot_index(fly["path"])
+        try:
+            data = snapshot_jpeg(fly["path"], rowid, rois.get(fly["region_id"]),
+                                 crop=request.args.get("crop", "roi") != "full", width=width)
+        except KeyError:
+            return jsonify({"error": f"no snapshot {rowid}"}), 404
+        response = Response(data, mimetype="image/jpeg")
+        response.headers["Cache-Control"] = "private, max-age=86400"
+        return response
 
     @app.route("/api/ethoscope/sleep", methods=["GET"])
     def ethoscope_sleep():

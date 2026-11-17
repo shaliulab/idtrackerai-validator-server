@@ -7,7 +7,10 @@ folder relative to $FLYHOSTEL_VIDEOS (slash form, SELECTED_EXPERIMENT).
 Multi-arena recordings crop each arena into its own imgstore (with its own
 database) under arenas/N; see flyhostel.utils.experiment.
 """
+import logging
 import os
+import sqlite3
+import threading
 
 from idtrackerai_validator_server.compat import experiment_to_relpath, get_experiment_identifier
 
@@ -39,3 +42,35 @@ def to_flat(experiment):
 def experiment_folder(relpath):
     """Top-level experiment folder (FlyHostel<N>/<X>X/<date>) of an experiment or arena."""
     return os.path.join(*to_relpath(relpath).split(os.sep)[:3])
+
+
+# A validated experiment: its database holds these tables (save-human-annotations writes them).
+# The Data collector, the Overview and the Annotate tab's list of experiments to validate use it.
+VALIDATED_TABLES = ("ROI_0_VAL", "IDENTITY_VAL", "CONCATENATION_VAL")
+_validated_cache = {}  # path -> ((mtime, size), validated)
+_validated_lock = threading.Lock()
+logger = logging.getLogger(__name__)
+
+
+def is_validated(path, stat=None):
+    """Whether a database holds every VALIDATED_TABLES table, opened read-only; cached per file
+    until its mtime or size changes; None when unreadable."""
+    stat = stat or os.stat(path)
+    key = (stat.st_mtime, stat.st_size)
+    with _validated_lock:
+        cached = _validated_cache.get(path)
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            names = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        finally:
+            con.close()
+    except sqlite3.Error as error:
+        logger.warning("Cannot read the tables of %s: %s", path, error)
+        return None
+    validated = all(table in names for table in VALIDATED_TABLES)
+    with _validated_lock:
+        _validated_cache[path] = (key, validated)
+    return validated

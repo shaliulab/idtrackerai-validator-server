@@ -58,6 +58,7 @@ except ImportError:  # python < 3.11
     import tomli as tomllib
 
 from idtrackerai_validator_server import gpu_queue, rois
+from idtrackerai_validator_server.experiments import is_validated
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.overview import sheet_files
 
@@ -196,35 +197,10 @@ done
     return experiments, now
 
 
-VALIDATED_TABLES = ("ROI_0_VAL", "IDENTITY_VAL")
-_validated_cache = {}  # path -> ((mtime, size), validated)
-
-
-def is_validated(path, stat):
-    """Whether a database holds the validated tables (ROI_0_VAL and IDENTITY_VAL), opened
-    read-only; cached per file until its mtime or size changes."""
-    key = (stat.st_mtime, stat.st_size)
-    cached = _validated_cache.get(path)
-    if cached and cached[0] == key:
-        return cached[1]
-    try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
-        try:
-            names = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        finally:
-            con.close()
-        validated = all(table in names for table in VALIDATED_TABLES)
-    except sqlite3.Error as error:
-        logger.warning("Cannot read the tables of %s: %s", path, error)
-        return None
-    _validated_cache[path] = (key, validated)
-    return validated
-
-
 def databases(folder):
     """Databases of a folder and of its arenas (paths relative to it): the *db files other than
     index.db, the ones the index lists (an experiment with one is analyzed); `validated` = it
-    holds ROI_0_VAL and IDENTITY_VAL (None when unreadable)."""
+    holds the validated tables (experiments.VALIDATED_TABLES; None when unreadable)."""
     out = []
     for pattern in ("*db", "arenas/*/*db"):
         for path in sorted(glob.glob(os.path.join(folder, pattern))):

@@ -53,7 +53,7 @@ import pandas as pd
 from flask import jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
-from idtrackerai_validator_server.experiments import INDEX_COMMAND
+from idtrackerai_validator_server.experiments import INDEX_COMMAND, VALIDATED_TABLES
 from idtrackerai_validator_server.compat import normalize_arena
 
 logger = logging.getLogger(__name__)
@@ -197,7 +197,7 @@ def _read_experiment(root, relpath):
                 "('ethoscope_metadata', 'chunks', 'chunksize', 'framerate')"
             ).fetchall())
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        record["has_val"] = "IDENTITY_VAL" in tables
+        record["has_val"] = all(table in tables for table in VALIDATED_TABLES)
 
         try:
             first, last = (int(c) for c in fields["chunks"].split(","))
