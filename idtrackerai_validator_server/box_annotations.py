@@ -60,6 +60,7 @@ from flask import jsonify, request, session
 from idtrackerai_validator_server import links, qc
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.jobs import _jobs, start_job
+from idtrackerai_validator_server.exchange_bundle import bundle_info, read_bundle_scenes
 
 logger = logging.getLogger(__name__)
 
@@ -491,8 +492,17 @@ def check_boxes(boxes, n_animals):
     return out
 
 
+BUNDLE_ERROR = ("this is a minimal bundle from the Drive exchange (the scene frames only): scenes, proposals and the "
+                "integration are made by the publisher on the whole experiment")
+
+
 def read_scenes(basedir, experiment, n_animals):
     """[{start, length, reason}] of the frames to check, and where they come from."""
+    # a minimal bundle of the Drive exchange: the scenes as listed where it was made (boundaries included)
+    if bundle_info(basedir) is not None:
+        scenes = read_bundle_scenes(basedir)
+        if scenes is not None:
+            return scenes, {"kind": "bundle", "path": os.path.join(_validation_folder(basedir), "scenes.json")}
     path = os.path.join(_validation_folder(basedir), "scene_qc.csv")
     if os.path.exists(path):
         scenes = []
@@ -711,7 +721,9 @@ def register_box_annotations(app, get_state):
         if error:
             return error
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
-        boundaries = unsure_boundaries_async(state["dbfile"], state["chunksize"], state["n_animals"])
+        bundle = source["kind"] == "bundle"
+        # a bundle's database holds only the scene frames: its boundaries are in scenes.json already
+        boundaries = [] if bundle else unsure_boundaries_async(state["dbfile"], state["chunksize"], state["n_animals"])
         scenes = add_boundary_scenes(scenes, boundaries or [], state["chunksize"])
         # boundaries None: still being checked, the client asks again
         source = {**source, "boundaries": None if boundaries is None else len(boundaries)}
@@ -741,6 +753,7 @@ def register_box_annotations(app, get_state):
             "flagged": flagged, "proposed_frames": proposed, "proposal_run": run,
             "proposing": _proposing.get(state["experiment"]),
             "preparing": _preparing.get(state["experiment"]),
+            "bundle": bundle,
         })
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["GET"])
@@ -877,6 +890,8 @@ def register_box_annotations(app, get_state):
         state, error = state_or_error()
         if error:
             return error
+        if bundle_info(state["basedir"]) is not None:
+            return jsonify({"error": BUNDLE_ERROR}), 400
         experiment = state["experiment"]
         running = _jobs.get(str(_proposing.get(experiment)))
         if running is not None and running.status == "running":
@@ -918,6 +933,8 @@ def register_box_annotations(app, get_state):
         state, error = state_or_error()
         if error:
             return error
+        if bundle_info(state["basedir"]) is not None:
+            return jsonify({"error": BUNDLE_ERROR}), 400
         body = request.get_json(silent=True) or {}
         experiment = state["experiment"]
         running = _jobs.get(str(_preparing.get(experiment)))
@@ -976,6 +993,8 @@ def register_box_annotations(app, get_state):
         state, error = state_or_error()
         if error:
             return error
+        if bundle_info(state["basedir"]) is not None:
+            return jsonify({"error": BUNDLE_ERROR}), 400
         body = request.get_json(silent=True) or {}
         mode = body.get("mode", "integrate")
         if mode not in ("integrate", "save"):

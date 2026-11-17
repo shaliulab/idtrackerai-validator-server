@@ -15,6 +15,10 @@ Layout, one folder per experiment (flat name):
     <flat>/base/validator_annotations.db   the publisher's annotations at publish time (snapshot)
     <flat>/full/...                        kind "full": the experiment folder (the live annotations
                                            database and exchange.json left out)
+    <flat>/minimal/...                     kind "minimal": the bundle of exchange_bundle.py (scene clips,
+                                           cut-down database, contours, scenes.json), laid out as an
+                                           experiment folder; built in $EXCHANGE_CACHE/bundles/<flat>/ and
+                                           synced (--checksum: unchanged clips are not sent again)
     <flat>/annotations/<name>/validator_annotations.db, meta.json   each annotator's copy
 
 Roles (`<basedir>/flyhostel/validation/exchange.json`): the publisher (publishes, imports
@@ -24,8 +28,9 @@ snapshot's rowid (`snapshot_rowid`), an annotator records where their downloaded
 (`base_rowid`, their own work comes after it) and the last snapshot merged (`pulled_rowid`,
 in the publisher's numbering); meta.json carries both to the publisher.
 
-Kind "minimal" (scene clips, cut-down database: step 2 of the design) is not written yet;
-publishing it answers 400.
+An annotator's copy keeps the kind it was downloaded as (exchange.json `kind`): a pull refreshes
+full copies' PULL_FILES from full/, and minimal copies from the whole minimal/ bundle (new scenes
+and their clips come with it).
 
 Routes (/api/exchange/*): status + config, experiments on Drive, local state of an
 experiment, and jobs: publish, download, upload (annotator), import (publisher: plan of an
@@ -47,6 +52,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import jsonify, request, session
 
 from idtrackerai_validator_server import annotation_merge as merge
+from idtrackerai_validator_server import exchange_bundle
 from idtrackerai_validator_server import box_annotations as boxes_mod
 from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.jobs import start_job, _jobs
@@ -70,6 +76,8 @@ FULL_EXCLUDES = ["flyhostel/validation/validator_annotations.db", "flyhostel/val
                  f"flyhostel/validation/{LOCAL_STATE}", "*.db-journal", ".downloading/**"]
 # what a pull refreshes from full/: the scenes and the integration's problem frames
 PULL_FILES = ["flyhostel/validation/scene_qc.csv", "flyhostel/validation/validator_problem_frames.csv"]
+# what an annotations-only publish of a minimal bundle refreshes (its scenes are fixed in the bundle)
+PULL_FILES_MINIMAL = ["flyhostel/validation/validator_problem_frames.csv"]
 
 _busy = {}                  # flat name -> job id of the transfer running on it
 _busy_lock = threading.Lock()
@@ -234,6 +242,24 @@ def _folder_files(basedir):
     return out
 
 
+def _tree_files(folder):
+    """{relpath: size} of every file under folder"""
+    out = {}
+    for top, _, files in os.walk(folder):
+        for name in files:
+            path = os.path.join(top, name)
+            out[os.path.relpath(path, folder)] = os.path.getsize(path)
+    return out
+
+
+def bundle_dir(flat):
+    return os.path.join(_cache(), "bundles", flat)
+
+
+def generate_dbfile(flat):
+    return os.path.join(basedir_of(flat), to_flat(flat) + ".db")
+
+
 def _databases(files):
     return sorted(p for p in files if "/" not in p and p.endswith("db") and p != "index.db" and files[p] > 0)
 
@@ -249,6 +275,8 @@ def local_info(experiment):
     if os.path.exists(sidecar):
         out["annotations"] = merge.summary(sidecar)
     out["scene_qc"] = os.path.exists(os.path.join(_validation(basedir), "scene_qc.csv"))
+    bundle = exchange_bundle.bundle_info(basedir)
+    out["bundle"] = None if bundle is None else {k: bundle.get(k) for k in ("n_scenes", "frames", "created_at", "has_contours")}
     return out
 
 
@@ -317,18 +345,32 @@ def publish(job, experiment, kind, annotations_only, publisher, commit):
         snapshot_rowid = _snapshot_sidecar(basedir, base)
         job.update(0, status="done", progress=1.0)
 
-        # 2. the folder (or, annotations only, the validation files a pull refreshes)
+        # 2. the folder or the bundle (or, annotations only, the validation files a pull refreshes)
         job.update(1, status="running")
-        files = _folder_files(basedir)
-        total = sum(files.values())
-        extra = [arg for pattern in _excludes(basedir) for arg in ("--exclude", pattern)]
+        bundle = None
         if annotations_only:
             if not previous:
-                raise RuntimeError("not on Drive yet: publish it whole first")
-            for rel in PULL_FILES:
+                raise RuntimeError("not on Drive yet: publish it first")
+            files = (previous or {}).get("files") or {}
+            total = (previous or {}).get("bytes", 0)
+            bundle = (previous or {}).get("bundle")
+            for rel in (PULL_FILES if kind == "full" else PULL_FILES_MINIMAL):
                 if os.path.exists(os.path.join(basedir, rel)):
-                    _rclone("copyto", os.path.join(basedir, rel), _remote(flat, "full", rel), timeout=600)
+                    _rclone("copyto", os.path.join(basedir, rel), _remote(flat, kind, rel), timeout=600)
+        elif kind == "minimal":
+            # build (70 %), then sync: clips of chunks without scenes any more go
+            folder = bundle_dir(flat)
+            info = exchange_bundle.export(basedir, folder, lambda f, text=None: job.update(1, progress=0.7 * f))
+            bundle = {k: info.get(k) for k in ("n_scenes", "frames", "first_frame", "has_contours", "scene_source")}
+            files = _tree_files(folder)
+            total = sum(files.values())
+            _rclone_copy(folder, _remote(flat, "minimal"),
+                         lambda done: job.update(1, progress=min(0.99, 0.7 + 0.3 * done / max(1, total))),
+                         extra=["--checksum"], command="sync")
         else:
+            files = _folder_files(basedir)
+            total = sum(files.values())
+            extra = [arg for pattern in _excludes(basedir) for arg in ("--exclude", pattern)]
             _rclone_copy(basedir, _remote(flat, "full"),
                          lambda done: job.update(1, progress=min(0.99, done / max(1, total))), extra=extra)
         job.update(1, status="done", progress=1.0)
@@ -343,7 +385,7 @@ def publish(job, experiment, kind, annotations_only, publisher, commit):
             "publisher": publisher, "host": socket.gethostname(), "app_commit": commit,
             "snapshot_rowid": snapshot_rowid, "annotated_frames": merge.summary(base)["frames"],
             "bytes": total, "n_files": len(files), "databases": _databases(files),
-            "files": files,
+            "files": files, "bundle": bundle,
         }
         _put_json(_remote(flat, "manifest.json"), manifest)
         job.update(2, status="done", progress=1.0)
@@ -362,8 +404,9 @@ def download(job, experiment):
     manifest = _cat_json(_remote(flat, "manifest.json"))
     if manifest is None:
         raise RuntimeError(f"{flat} has no manifest on Drive (not published, or still being published)")
-    if manifest.get("kind") != "full":
-        raise RuntimeError(f"{flat} is published as {manifest.get('kind')}: only full experiments can be downloaded yet")
+    kind = manifest.get("kind")
+    if kind not in KINDS:
+        raise RuntimeError(f"{flat} is published as {kind}, which this version of the app does not know: update it")
     relpath = manifest.get("relpath") or to_relpath(flat)
     root = _root()
     final = os.path.join(root, relpath)
@@ -384,7 +427,7 @@ def download(job, experiment):
 
     job.update(0, status="running")
     total = max(1, manifest.get("bytes", 0))
-    _rclone_copy(_remote(flat, "full"), tmp, lambda done: job.update(0, progress=min(0.99, (have + done) / total)))
+    _rclone_copy(_remote(flat, kind), tmp, lambda done: job.update(0, progress=min(0.99, (have + done) / total)))
     wrong = sorted(rel for rel, size in files.items()
                    if not os.path.exists(os.path.join(tmp, rel)) or os.path.getsize(os.path.join(tmp, rel)) != size)
     if wrong:
@@ -397,7 +440,7 @@ def download(job, experiment):
     _rclone("copyto", _remote(flat, "base", boxes_mod.DB_NAME), sidecar, timeout=1800)
     merge.reset_exchange(sidecar)
     base_rowid = merge.summary(sidecar)["last_rowid"]
-    write_local(tmp, {"role": "annotator", "experiment": flat, "remote": read_config()["remote"], "kind": "full",
+    write_local(tmp, {"role": "annotator", "experiment": flat, "remote": read_config()["remote"], "kind": kind,
                       "downloaded_at": time.time(), "published_at": manifest.get("published_at"),
                       "publisher": manifest.get("publisher"),
                       "base_rowid": base_rowid, "pulled_rowid": manifest.get("snapshot_rowid", 0)})
@@ -415,7 +458,8 @@ def download(job, experiment):
         open(index, "a").close()
     added = _add_to_index(root, relpath, manifest.get("databases") or [])
     job.update(1, status="done", progress=1.0)
-    job.result = {"experiment": flat, "path": final, "bytes": manifest.get("bytes"), "index_lines_added": added}
+    job.result = {"experiment": flat, "kind": kind, "path": final, "bytes": manifest.get("bytes"),
+                  "index_lines_added": added}
 
 
 def _parents(path, stop):
@@ -499,20 +543,30 @@ def pull_plan(job, experiment):
         raise RuntimeError(f"{flat} is no longer on Drive")
     copy = os.path.join(_cache(), f"{flat}__base.db")
     _rclone("copyto", _remote(flat, "base", boxes_mod.DB_NAME), copy, timeout=1800)
-    refreshed = []
-    for rel in PULL_FILES:
+    refreshed, bundle_updated = [], False
+    if state.get("kind") == "minimal":
+        # the whole bundle (new scenes, their clips and rows); unchanged files are skipped by checksum
+        before = (exchange_bundle.bundle_info(basedir) or {}).get("created_at")
         try:
-            _rclone("copyto", _remote(flat, "full", rel), os.path.join(basedir, rel), timeout=600)
-            refreshed.append(rel)
+            _rclone_copy(_remote(flat, "minimal"), basedir, lambda done: None, extra=["--checksum"])
+            refreshed.append("bundle")
         except RuntimeError as error:
-            logger.info("Not refreshed %s: %s", rel, error)
+            logger.info("Bundle not refreshed: %s", error)
+        bundle_updated = (exchange_bundle.bundle_info(basedir) or {}).get("created_at") != before
+    else:
+        for rel in PULL_FILES:
+            try:
+                _rclone("copyto", _remote(flat, "full", rel), os.path.join(basedir, rel), timeout=600)
+                refreshed.append(rel)
+            except RuntimeError as error:
+                logger.info("Not refreshed %s: %s", rel, error)
     me = state.get("annotator") or annotator_name() or "annotator"
     sidecar = boxes_mod.sidecar_path(basedir)
     the_plan = merge.plan(sidecar, copy, source=PUBLISHER, me=me,
                           remote_since=state.get("pulled_rowid", 0), local_since=state.get("base_rowid", 0))
     _plans[job.id] = (flat, the_plan, "pull", {"copy": copy, "manifest": manifest})
     job.update(0, status="done", progress=1.0)
-    job.result = {"experiment": flat, "kind": "pull", "refreshed": refreshed,
+    job.result = {"experiment": flat, "kind": "pull", "refreshed": refreshed, "bundle_updated": bundle_updated,
                   "published_at": manifest.get("published_at"), **_summarize(the_plan)}
 
 
@@ -623,8 +677,6 @@ def register_gdrive_exchange(app, get_loaded=lambda: None, get_commit=lambda: No
         kind = body.get("kind", "full")
         if kind not in KINDS:
             return jsonify({"error": f"kind must be one of {KINDS}"}), 400
-        if kind == "minimal":
-            return jsonify({"error": "minimal publishing (scene clips) is not available yet: publish the whole experiment"}), 400
         basedir = basedir_of(flat)
         if not os.path.isdir(basedir):
             return jsonify({"error": f"{basedir} does not exist"}), 404
@@ -635,8 +687,13 @@ def register_gdrive_exchange(app, get_loaded=lambda: None, get_commit=lambda: No
         publisher = annotator_name() or "publisher"
         annotations_only = bool(body.get("annotations_only"))
         title = f"Drive: publish {flat}" + (" (annotations)" if annotations_only else "")
-        return run(flat, title, ["Snapshot of the annotations", "Experiment folder" if not annotations_only else "Scenes",
-                                 "Annotations and manifest"],
+        if exchange_bundle.bundle_info(basedir) is not None:
+            return jsonify({"error": "this is a minimal bundle: only a whole experiment can be published"}), 409
+        if kind == "minimal" and not annotations_only and not os.path.exists(generate_dbfile(flat)):
+            return jsonify({"error": "a minimal bundle needs the experiment's tracking database"}), 400
+        step = ("Scenes" if annotations_only else
+                "Scene clips and database (built, then sent)" if kind == "minimal" else "Experiment folder")
+        return run(flat, title, ["Snapshot of the annotations", step, "Annotations and manifest"],
                    lambda job: publish(job, flat, kind, annotations_only, publisher, commit()))
 
     @app.route("/api/exchange/download", methods=["POST"])

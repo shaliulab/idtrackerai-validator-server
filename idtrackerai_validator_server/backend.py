@@ -24,6 +24,8 @@ if HAS_IDTRACKERAI:
     from idtrackerai.animals_detection.segmentation import _process_frame
 
 from idtrackerai_validator_server.experiments import to_flat, to_relpath, experiment_folder
+from idtrackerai_validator_server.lite_store import LiteVideoCapture
+from idtrackerai_validator_server.exchange_bundle import bundle_info
 
 logger=logging.getLogger(__name__)
 
@@ -281,7 +283,12 @@ def load_experiment(basedir_suffix, chunk, db_manager):
     # load videocapture object
     store_path = os.path.join(basedir, "metadata.yaml")
     logger.debug("Initializing %s - chunk %s", store_path, chunk)
-    cap = VideoCapture(store_path, chunk)  # Replace with your video file
+    # a minimal bundle of the Drive exchange (exchange_bundle.py): clips of the scene frames only
+    bundle = bundle_info(basedir)
+    if bundle is not None:
+        cap = LiteVideoCapture(store_path, chunk, exact=True)
+    else:
+        cap = VideoCapture(store_path, chunk)
 
     if cap is None:
         logger.error(f"Could not load VideoCapture {store_path}")
@@ -298,7 +305,7 @@ def load_experiment(basedir_suffix, chunk, db_manager):
                     "cannot read the METADATA of the database (an ethoscope_metadata without rows? fill the "
                     "metadata sheet, then update the experiment's metadata from the Overview tab); see the server log"
                 )
-            frame_number = chunksize * chunk
+            frame_number = bundle["first_frame"] if bundle is not None else chunksize * chunk
             frame, (frame_number, frame_timestamp) = cap.get_image(frame_number)
         except Exception as error:
             logger.error(error)

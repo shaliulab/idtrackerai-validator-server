@@ -47,6 +47,7 @@ from idtrackerai_validator_server.backend import (
     load_experiment_without_database,
     frame_time_from_index,
 )
+from idtrackerai_validator_server.exchange_bundle import bundle_info, bundle_contours
 from idtrackerai_validator_server.auth import register_auth
 from idtrackerai_validator_server.jobs import register_jobs
 from idtrackerai_validator_server.ethoscope import register_ethoscope
@@ -295,6 +296,8 @@ db_manager = None
 # Experiments without database (not analyzed yet, e.g. idtrackerai still running):
 # {frame_min, frame_max, index_db, chunk, flies (metadata sheet rows)}; None otherwise
 STORE_INFO = None
+# bundle.json of a minimal bundle of the Drive exchange (exchange_bundle.py), else None
+BUNDLE = None
 HAS_BLOBS = False
 NUMBER_OF_ANIMALS = None
 # Incubator temperature / humidity of the loaded experiment
@@ -317,7 +320,7 @@ def _open_experiment(experiment):
     """Open `experiment` (slash form) and set the globals. Without database, only its
     recording (and the blobs_collections idtrackerai has written) can be shown."""
     global SELECTED_EXPERIMENT, cap, db_manager, offset, CHUNKSIZE, FRAMERATE, IDTRACKERAI_CONFIG
-    global STORE_INFO, HAS_BLOBS, NUMBER_OF_ANIMALS
+    global STORE_INFO, HAS_BLOBS, NUMBER_OF_ANIMALS, BUNDLE
     basedir = os.path.join(os.environ["FLYHOSTEL_VIDEOS"], experiment)
     if has_database(experiment):
         manager = DatabaseManager(app, db, with_fragments=WITH_FRAGMENTS, experiment=experiment, use_val=default_use_val(experiment))
@@ -346,6 +349,7 @@ def _open_experiment(experiment):
     offset, CHUNKSIZE, FRAMERATE = experiment_metadata
     IDTRACKERAI_CONFIG = config
     STORE_INFO = store_info
+    BUNDLE = bundle_info(basedir)
     HAS_BLOBS = blobs
     NUMBER_OF_ANIMALS = _number_of_animals(experiment, store_info["flies"] if store_info else None)
     ENVIRONMENT.open(basedir)
@@ -355,7 +359,9 @@ def _experiment_info():
     basedir = None if SELECTED_EXPERIMENT is None else os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT)
     return {"experiment": SELECTED_EXPERIMENT, "has_database": db_manager is not None, "has_blobs": HAS_BLOBS,
             # the folder, and where it really is (FlyHostel<N> links point to other drives)
-            "basedir": basedir, "realpath": basedir and os.path.realpath(basedir)}
+            "basedir": basedir, "realpath": basedir and os.path.realpath(basedir),
+            # a minimal bundle: only the scene frames, for the Annotate tab
+            "bundle": BUNDLE is not None}
 
 
 if SELECTED_EXPERIMENT is not None:
@@ -531,6 +537,8 @@ def load():
         lock.release()
 
     first_frame = (STORE_INFO["chunk"] if STORE_INFO else first_chunk) * CHUNKSIZE
+    if BUNDLE is not None:
+        first_frame = BUNDLE["first_frame"]
     return jsonify({"message": "success", "first_frame": first_frame,
                     "use_val": bool(db_manager is not None and db_manager.use_val), **_experiment_info()})
 
@@ -804,6 +812,9 @@ def _default_contours(frame_number, source_id=None, source=None, config=None):
     key = ((source_id, source.get("mtime")) if source else None, frame_number)
     with _contours_lock:
         cached = _contours_cache.get(key)
+    if cached is None and BUNDLE is not None and source is None:
+        # segmented from the original frames when the bundle was made
+        cached = bundle_contours(os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT), frame_number), None
     if cached is None:
         image, _ = _read_frame(frame_number)
         if image is None:

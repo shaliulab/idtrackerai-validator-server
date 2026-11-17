@@ -10,6 +10,10 @@ LiteVideoCapture has the part of imgstore.interface.VideoCapture the server uses
 get_image(frame_number) -> (gray image, (frame_number, frame_time)) and `_cap` with
 frame_min, frame_max, _metadata, index_db_path. One OpenCV capture is kept open and read
 forward; any other frame is a seek (CAP_PROP_POS_FRAMES).
+
+`exact=True` (a minimal bundle of the Drive exchange, exchange_bundle.py: its "chunks" are clips of
+the scene frames only): a frame not in the index raises ValueError instead of giving the nearest one
+before it; a clip replaced on disk (an update pulled from Drive) is opened again.
 """
 import os
 import sqlite3
@@ -38,9 +42,13 @@ class _Store:
     def _connect(self):
         return sqlite3.connect(f"file:{self.index_db_path}?mode=ro", uri=True, timeout=10)
 
-    def locate(self, frame_number):
-        """(chunk, frame_idx, frame_time) of a frame number, or of the nearest frame listed before it"""
+    def locate(self, frame_number, exact=False):
+        """(chunk, frame_idx, frame_time, frame_number) of a frame number, or of the nearest frame listed before it
+        (exact: None when not listed)"""
         with self._connect() as con:
+            if exact:
+                return con.execute("SELECT chunk, frame_idx, frame_time, frame_number FROM frames WHERE frame_number = ?",
+                                   (frame_number,)).fetchone()
             row = con.execute("SELECT chunk, frame_idx, frame_time, frame_number FROM frames WHERE frame_number <= ? "
                               "ORDER BY frame_number DESC LIMIT 1", (frame_number,)).fetchone()
             if row is None:
@@ -54,25 +62,36 @@ class _Store:
 
 class LiteVideoCapture:
 
-    def __init__(self, store_path, chunk=None):
+    def __init__(self, store_path, chunk=None, exact=False):
         self._cap = _Store(store_path)
         self._lock = threading.Lock()
-        self._video = None       # (chunk, cv2.VideoCapture, index of the next frame it reads)
+        self.exact = exact
+        self._video = None       # [chunk, cv2.VideoCapture, index of the next frame it reads, (inode, mtime)]
 
     def _open(self, chunk):
-        if self._video and self._video[0] == chunk:
+        path = self._cap.video(chunk)
+        stamp = None
+        if self.exact:
+            try:
+                st = os.stat(path)
+                stamp = (st.st_ino, st.st_mtime)
+            except OSError:
+                pass
+        if self._video and self._video[0] == chunk and self._video[3] == stamp:
             return self._video
         if self._video:
             self._video[1].release()
-        path = self._cap.video(chunk)
         capture = cv2.VideoCapture(path)
         if not capture.isOpened():
             raise FileNotFoundError(f"cannot open {path}")
-        self._video = [chunk, capture, 0]
+        self._video = [chunk, capture, 0, stamp]
         return self._video
 
     def get_image(self, frame_number):
-        chunk, frame_idx, frame_time, frame_number = self._cap.locate(frame_number)
+        found = self._cap.locate(frame_number, exact=self.exact)
+        if found is None:
+            raise ValueError(f"frame {frame_number} is not in this bundle (only the scene frames are)")
+        chunk, frame_idx, frame_time, frame_number = found
         with self._lock:
             video = self._open(chunk)
             if video[2] != frame_idx:

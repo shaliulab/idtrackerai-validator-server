@@ -146,9 +146,10 @@ def _local_sizes(top):
     return {relpath: size for relpath, (size, _, _) in dm._walk(top).items()}
 
 
-def _rclone_copy(source, target, on_bytes, extra=()):
-    """rclone copy (plus `extra` arguments), calling on_bytes(bytes transferred) from its stats. Raises on failure."""
-    cmd = [dropbox.RCLONE, "copy", source, target, "--transfers", "4", "--checkers", "8",
+def _rclone_copy(source, target, on_bytes, extra=(), command="copy"):
+    """rclone copy (or `command`, e.g. sync; plus `extra` arguments), calling on_bytes(bytes transferred) from its
+    stats. Raises on failure."""
+    cmd = [dropbox.RCLONE, command, source, target, "--transfers", "4", "--checkers", "8",
            "--use-json-log", "--stats", "5s", "--stats-log-level", "NOTICE", *extra]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     errors = []
@@ -162,7 +163,7 @@ def _rclone_copy(source, target, on_bytes, extra=()):
         elif entry.get("level") == "error":
             errors.append(f"{entry.get('object', '')}: {entry.get('msg', '')}".strip(": "))
     if proc.wait() != 0:
-        raise RuntimeError(f"rclone copy failed ({len(errors)} error(s)){': ' + errors[-1] if errors else ''}")
+        raise RuntimeError(f"rclone {command} failed ({len(errors)} error(s)){': ' + errors[-1] if errors else ''}")
 
 
 def restore_experiment(root, experiment, on_progress):

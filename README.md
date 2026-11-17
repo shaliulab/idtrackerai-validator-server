@@ -112,7 +112,9 @@ FLYHOSTEL_VIDEOS=$HOME/flyhostel_videos start-idtrackerai-validator-server
 ```
 
 In the Drive exchange tab set the shared folder (e.g. `gdrive:FlyHostelExchange`) and
-your name, download an experiment and annotate it in the Annotate tab. The tab's
+your name, download an experiment and annotate it in the Annotate tab. Experiments
+published as a minimal bundle hold only the frames of the scenes to check (a few hundred
+MB instead of the whole recording). The tab's
 "How to set up" and the "How to use" tab explain the rest.
 
 ## Install a specific version
