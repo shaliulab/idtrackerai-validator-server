@@ -767,6 +767,7 @@ def validation_queue(root, me):
     except OSError:
         return [], 0
     hidden = read_hidden(me)
+    from idtrackerai_validator_server.gdrive_exchange import read_local    # it imports this module
 
     def one(relpath):
         path = os.path.normpath(os.path.join(root, relpath))
@@ -788,6 +789,10 @@ def validation_queue(root, me):
         item = {"experiment": experiment, "relpath": os.path.relpath(basedir, root), "n_animals": n_animals,
                 "date": (m.group(1) if (m := re.search(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", experiment)) else None),
                 "db_mtime": stat.st_mtime, "hidden": experiment in hidden, "unreadable": validated is None}
+        # Drive exchange of this copy (flyhostel/validation/exchange.json): published from here, or downloaded
+        local = read_local(basedir) or {}
+        item["exchange"] = {k: local.get(k) for k in ("role", "kind", "published_at", "downloaded_at", "publisher")} \
+            if local.get("role") else None
         try:
             item.update(experiment_progress(basedir, experiment, n_animals or 1, me))
         except Exception as error:
