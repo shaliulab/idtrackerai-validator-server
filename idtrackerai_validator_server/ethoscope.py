@@ -367,6 +367,8 @@ def score_sleep(t, xy, interacted, params):
     sizes = np.diff(np.r_[starts, len(t)])
     valid = (sizes > 1) & ~np.logical_or.reduceat(bad, starts)
     windows = win[starts][valid]
+    if not len(windows):          # too few rows (an empty tube): no window with a velocity
+        return None
     moving_w = max_v[valid] > 1
     # regular grid of windows: missing ones are not moving (interpolated)
     w0 = int(windows[0])
@@ -745,9 +747,10 @@ def register_ethoscope(app, get_rows):
                     with _progress_lock:
                         _progress[token]["done"] += 1
 
+        # one fly after the other: reading a ROI hands the GIL back and forth on every row (sqlite3), so threads
+        # only fought over it (40 flies: > 2 min with 8 threads, ~25 s in turn) and starved the other requests
         try:
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                done = {f["key"]: r for f, r in zip(todo, pool.map(one, todo))}
+            done = {f["key"]: one(f) for f in todo}
         finally:
             if token:
                 with _progress_lock:
