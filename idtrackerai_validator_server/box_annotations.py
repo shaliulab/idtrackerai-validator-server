@@ -932,14 +932,44 @@ def scene_coverage(basedir, dbfile, scenes, chunksize):
         logger.warning("Cannot read the recording's index.db: %s", error)
     scene_qc = os.path.join(folder, "scene_qc.csv")
     missing = None
-    if rng and tracked[1] is not None and chunksize and tracked[1] // chunksize > rng[1] // chunksize:
+    # older make-identogram versions left out the last chunk: one chunk short is not a sign the scenes are old
+    if rng and tracked[1] is not None and chunksize and tracked[1] // chunksize > rng[1] // chunksize + 1:
         missing = [int(rng[1] // chunksize) + 1, int(tracked[1] // chunksize)]
     return {"input": span(*rng) if rng else None,
             "input_path": feathers[-1] if feathers else None,
             "input_mtime": os.path.getmtime(feathers[-1]) if feathers else None,
             "tracked": span(*tracked), "recorded": recorded, "scenes": span(first_scene, last_scene),
             "scene_qc_mtime": os.path.getmtime(scene_qc) if os.path.exists(scene_qc) else None,
-            "untracked_chunks": missing}
+            "untracked_chunks": missing,
+            "outdated": scenes_outdated(basedir, dbfile, chunksize)}
+
+
+def scenes_outdated(basedir, dbfile, chunksize):
+    """Why scene_qc.csv may be older than the tracking, or None. Quick signs only (the content check of every chunk takes
+    minutes): the tracking was concatenated again (idtrackerai/concatenation-overlap.csv, rewritten by every idtrackerai.nf
+    run) after the tracking data the scenes were made from was exported, or the database is tracked more than one chunk
+    beyond it (older make-identogram versions left out the last chunk: one chunk short is not a sign) or not as far."""
+    folder = _validation_folder(basedir)
+    scene_qc = os.path.join(folder, "scene_qc.csv")
+    if not os.path.exists(scene_qc):
+        return None
+    feathers = sorted(glob.glob(os.path.join(folder, "*_tracking_data.feather")), key=os.path.getmtime)
+    made = os.path.getmtime(feathers[-1]) if feathers else os.path.getmtime(scene_qc)
+    overlap = os.path.join(basedir, "idtrackerai", "concatenation-overlap.csv")
+    if os.path.exists(overlap) and os.path.getmtime(overlap) > made + 60:
+        return (f"the tracking was redone on {time.strftime('%Y-%m-%d %H:%M', time.localtime(os.path.getmtime(overlap)))}, "
+                f"after the scenes were made ({time.strftime('%Y-%m-%d %H:%M', time.localtime(made))})")
+    rng = _feather_range(feathers[-1]) if feathers else None
+    if rng and chunksize:
+        try:
+            last = tracked_frame_range(dbfile)[1]
+        except sqlite3.Error:
+            last = None
+        # further than the scenes' input (beyond the one-chunk shortfall), or not as far (tracked again over a shorter range)
+        if last is not None and (last // chunksize > rng[1] // chunksize + 1 or last // chunksize < rng[1] // chunksize):
+            return (f"the database is tracked up to chunk {int(last // chunksize)}, the scenes were made from the tracking "
+                    f"up to chunk {int(rng[1] // chunksize)}")
+    return None
 
 
 def _running_job(job_id):

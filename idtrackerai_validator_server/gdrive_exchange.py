@@ -199,6 +199,17 @@ def _validation(basedir):
     return os.path.join(basedir, "flyhostel", "validation")
 
 
+def _chunksize(flat):
+    """chunksize of an experiment from its dbfile's METADATA, or None"""
+    import sqlite3
+    try:
+        with sqlite3.connect(f"file:{generate_dbfile(flat)}?mode=ro", uri=True, timeout=5) as con:
+            row = con.execute("SELECT value FROM METADATA WHERE field = 'chunksize'").fetchone()
+        return int(float(row[0])) if row else None
+    except Exception:
+        return None
+
+
 def read_local(basedir):
     try:
         with open(os.path.join(_validation(basedir), LOCAL_STATE)) as handle:
@@ -691,6 +702,16 @@ def register_gdrive_exchange(app, get_loaded=lambda: None, get_commit=lambda: No
             return jsonify({"error": "this is a minimal bundle: only a whole experiment can be published"}), 409
         if kind == "minimal" and not annotations_only and not os.path.exists(generate_dbfile(flat)):
             return jsonify({"error": "a minimal bundle needs the experiment's tracking database"}), 400
+        # the scenes sent are scene_qc.csv's: ask first when it is older than the tracking
+        if not body.get("outdated_ok"):
+            try:
+                chunksize = _chunksize(flat)
+                reason = boxes_mod.scenes_outdated(basedir, generate_dbfile(flat), chunksize)
+            except Exception as error:      # never block a publish on the check itself
+                logger.warning("scenes_outdated %s: %s", flat, error)
+                reason = None
+            if reason:
+                return jsonify({"error": f"scene_qc.csv may be out of date: {reason}", "outdated": reason}), 409
         step = ("Scenes" if annotations_only else
                 "Scene clips and database (built, then sent)" if kind == "minimal" else "Experiment folder")
         return run(flat, title, ["Snapshot of the annotations", step, "Annotations and manifest"],
