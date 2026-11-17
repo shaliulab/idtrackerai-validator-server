@@ -19,6 +19,9 @@ selections movements, movements_near and movements_away sample the counted movem
 Besides the verdict, a review says whether the moving leg touches the other fly, during the movement or in the second before it
 (touches: yes, the leg clearly lands on it; graze, it barely brushes it or one cannot tell; no, a gap stays; no_partner = no other fly
 in the clip). Databases made before graze existed are rebuilt once at start-up to allow it (the CHECK of the column).
+Separately, touched_by_partner (yes / no) says whether the other fly touches the focal fly (any part of the partner on any part of
+the focal fly, during the movement or in the second before it): touches is what the focal fly's moving leg does, touched_by_partner
+what the partner does, so an event can be no and yes. The column is added at start-up to databases made before it.
 
 Events are not tied to the loaded experiment: the tab plays each fly's HLS movie (motionmapper/<NN>/movie, as the Ethograms tab)
 at the time of the event, so a random sample can mix flies of every experiment. Verdicts go to their own sqlite file,
@@ -44,6 +47,7 @@ LEG_DB = os.environ.get("LEG_ANNOTATIONS_DB") or os.path.join(os.path.dirname(os
 VERDICTS = ("middle", "groom", "walk", "posture", "pose_error", "other", "unsure")
 WHICH_LEG = ("left", "right", "both")
 TOUCHES = ("yes", "graze", "no", "no_partner")
+TOUCHED_BY_PARTNER = ("yes", "no")
 MOVEMENT_COLUMNS = ["p_middle", "movement", "near", "partner"]
 MOVEMENT_SELECTIONS = {"movements": None, "movements_near": True, "movements_away": False}
 IMMOBILE_S = 10   # "while immobile": immobile in the sleep trace for at least this long when the event starts
@@ -125,6 +129,10 @@ def _init_db():
             c.execute(f"ALTER TABLE leg_annotations ADD COLUMN touches TEXT CHECK (touches IS NULL OR touches IN ({touches}))")
         else:
             _allow_new_touches(c)
+        if "touched_by_partner" not in columns:
+            values = ",".join(f"'{v}'" for v in TOUCHED_BY_PARTNER)
+            c.execute("ALTER TABLE leg_annotations ADD COLUMN touched_by_partner TEXT "
+                      f"CHECK (touched_by_partner IS NULL OR touched_by_partner IN ({values}))")
 
 
 def _allow_new_touches(c):
@@ -312,7 +320,8 @@ def register_leg_validation(app):
         movies = {f: has_movie(f) for f in df["fly"].unique()}
         for r in rows:
             a = notes.get((r["fly"], *_key(r["start"], r["end"])), {})
-            r.update(verdict=a.get("verdict"), which_leg=a.get("which_leg"), touches=a.get("touches"), notes=a.get("notes") or "",
+            r.update(verdict=a.get("verdict"), which_leg=a.get("which_leg"), touches=a.get("touches"),
+                     touched_by_partner=a.get("touched_by_partner"), notes=a.get("notes") or "",
                      reviewer=a.get("reviewer"), has_movie=movies[r["fly"]])
         return jsonify(rows)
 
@@ -339,8 +348,8 @@ def register_leg_validation(app):
 
     @app.route("/api/legs/annotate", methods=["POST"])
     def legs_annotate():
-        """{fly, event, start, end, leg, verdict, which_leg, touches, notes}: saves the review of an event; all of verdict,
-        which_leg, touches and notes empty deletes it."""
+        """{fly, event, start, end, leg, verdict, which_leg, touches, touched_by_partner, notes}: saves the review of an event;
+        all of verdict, which_leg, touches, touched_by_partner and notes empty deletes it."""
         d = request.get_json(force=True)
         need = ("fly", "start", "end")
         if not all(k in d for k in need):
@@ -352,22 +361,27 @@ def register_leg_validation(app):
         touches = d.get("touches") or None
         if touches is not None and touches not in TOUCHES:
             return jsonify({"error": f"touches must be one of {TOUCHES}"}), 400
+        touched_by_partner = d.get("touched_by_partner") or None
+        if touched_by_partner is not None and touched_by_partner not in TOUCHED_BY_PARTNER:
+            return jsonify({"error": f"touched_by_partner must be one of {TOUCHED_BY_PARTNER}"}), 400
         if verdict is not None and verdict not in VERDICTS:
             return jsonify({"error": f"verdict must be one of {VERDICTS}"}), 400
         if which_leg is not None and which_leg not in WHICH_LEG:
             return jsonify({"error": f"which_leg must be one of {WHICH_LEG}"}), 400
         start, end = _key(d["start"], d["end"])
         with sqlite3.connect(LEG_DB) as c:
-            if verdict is None and which_leg is None and touches is None and notes is None:
+            if verdict is None and which_leg is None and touches is None and touched_by_partner is None and notes is None:
                 c.execute("DELETE FROM leg_annotations WHERE fly=? AND start=? AND end=?", (d["fly"], start, end))
                 return jsonify({"ok": True, "deleted": True})
             c.execute("""
-                INSERT INTO leg_annotations (fly, start, end, event, leg, verdict, which_leg, touches, notes, reviewer, reviewed_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO leg_annotations (fly, start, end, event, leg, verdict, which_leg, touches, touched_by_partner, notes,
+                                             reviewer, reviewed_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(fly, start, end) DO UPDATE SET event=excluded.event, leg=excluded.leg, verdict=excluded.verdict,
-                    which_leg=excluded.which_leg, touches=excluded.touches, notes=excluded.notes, reviewer=excluded.reviewer,
+                    which_leg=excluded.which_leg, touches=excluded.touches,
+                    touched_by_partner=excluded.touched_by_partner, notes=excluded.notes, reviewer=excluded.reviewer,
                     reviewed_at=excluded.reviewed_at
-            """, (d["fly"], start, end, d.get("event"), d.get("leg"), verdict, which_leg, touches, notes, _reviewer(),
+            """, (d["fly"], start, end, d.get("event"), d.get("leg"), verdict, which_leg, touches, touched_by_partner, notes, _reviewer(),
                   datetime.datetime.utcnow().isoformat()))
         return jsonify({"ok": True, "reviewer": _reviewer()})
 
@@ -377,7 +391,7 @@ def register_leg_validation(app):
         notes = pd.DataFrame(list(_annotations().values()))
         if notes.empty:
             notes = pd.DataFrame(columns=["fly", "start", "end", "event", "leg", "verdict", "which_leg", "notes", "reviewer",
-                                          "reviewed_at", "touches"])
+                                          "reviewed_at", "touches", "touched_by_partner"])
         detector = []
         for fly in notes["fly"].unique():
             if os.path.exists(_events_path(fly)):
