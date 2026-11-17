@@ -22,8 +22,8 @@ one box per row, the bounding box of the segmented blob holding its centroid (at
 local identity (0 → not assigned).
 
 Frames to check: the failed scenes of the validation pipeline's scene_qc.csv (make-identogram +
-auto-annotate-qc, scenes ≤ MAX_SCENE_LENGTH frames as export-images), else the runs of bad frames of
-the QC tab's cached result. Plus the unsure chunk boundaries (`unsure_boundaries`): the integration links each
+auto-annotate-qc, as vsc-scripts' manual/validation/main.sh, made by Prepare scenes; scenes ≤ MAX_SCENE_LENGTH frames
+as export-images; the QC tab's runs of bad frames are not used). Plus the unsure chunk boundaries (`unsure_boundaries`): the integration links each
 fly of a chunk to the next by its nearest centroid (flyhostel's make_identity_table), which can go wrong when a fly
 is missing on either side, jumps, or another fly is almost as close; those boundaries are added as scenes of
 2 × BOUNDARY_CONTEXT frames (or their reason appended to a scene that already covers them).
@@ -58,7 +58,7 @@ import cv2
 import numpy as np
 from flask import jsonify, request, session
 
-from idtrackerai_validator_server import links, qc
+from idtrackerai_validator_server import links
 from idtrackerai_validator_server.compat import get_number_of_animals
 from idtrackerai_validator_server.experiments import is_validated, to_flat
 from idtrackerai_validator_server.jobs import _jobs, start_job
@@ -539,16 +539,7 @@ def read_scenes(basedir, experiment, n_animals):
                 scenes.append({"start": start, "length": length, "reason": ", ".join(reasons)})
         scenes.sort(key=lambda s: s["start"])
         return scenes, {"kind": "scene_qc", "path": path}
-    # the QC tab's runs of bad frames, if it ran on the machine tables
-    dbfiles = [f for f in os.listdir(basedir) if f.endswith(".db") and f != "index.db"]
-    if dbfiles:
-        dbfile = os.path.join(basedir, dbfiles[0])
-        cached = qc._read_cache(qc._cache_path(experiment, "IDENTITY", n_animals), os.path.getmtime(dbfile))
-        if cached:
-            runs = cached.get("result", cached).get("runs", [])
-            scenes = [{"start": int(r[0]), "length": int(r[2]), "reason": f"min {r[3]} flies identified"} for r in runs]
-            scenes.sort(key=lambda s: s["start"])
-            return scenes, {"kind": "qc", "path": None}
+    # only the validation pipeline's scenes (Prepare scenes): the QC tab's runs of bad frames are not used
     return [], {"kind": None, "path": None}
 
 
@@ -698,7 +689,7 @@ def _mtime_size(path):
 
 
 def experiment_progress(basedir, experiment, n_animals, me):
-    """Scenes of an experiment (scene_qc.csv, else the QC tab's runs; the chunk boundaries are left out:
+    """Scenes of an experiment (scene_qc.csv; the chunk boundaries are left out:
     checking them reads the database) and the frames saved in its sidecar: per scene done = every frame
     saved (by anyone), `mine` = frames this person saved. Cached per sidecar / scene_qc.csv mtime and size."""
     sidecar = sidecar_path(basedir)
@@ -810,6 +801,74 @@ def validation_queue(root, me):
     return items, len(paths)
 
 
+# --- validation queue: metadata of one experiment, shown on hover ---
+# per-fly identifiers and bookkeeping, never shown; the rest is shown when it takes more than one value in the sheets
+META_SKIP = {"Dropbox_link", "basedir", "row_id", "flyhostel_number", "flyhostel_date", "flyhostel_time", "comment",
+             "region_id", "machine_name", "date", "identity", "fly_no", "meta", "reason", "node", "physical_arena",
+             "side", "fly_opposite", "GBX_opposite", "number_of_animals", "tube"}
+META_FIRST = ("genotype", "sex", "light_cycle", "age_min", "age_max", "incubator", "GBX", "reference_hour")
+_varying = {"key": None, "columns": set()}
+_meta_cache = {}              # db path -> (mtime, meta)
+_meta_lock = threading.Lock()
+
+
+def varying_columns():
+    """Columns of the metadata sheets (latest export of each) taking at least two values, minus META_SKIP;
+    cached per file mtime. Empty set (= show every column) when the sheets cannot be read."""
+    try:
+        from idtrackerai_validator_server.overview import _clean, sheet_files
+        files = sorted(sheet_files()[0].values())
+        key = tuple((f, os.path.getmtime(f)) for f in files)
+    except Exception as error:
+        logger.warning("Validation queue: cannot read the metadata sheets: %s", error)
+        return set()
+    with _meta_lock:
+        if _varying["key"] == key:
+            return _varying["columns"]
+    values = {}
+    for path in files:
+        with open(path, newline="") as handle:
+            for row in csv.DictReader(handle):
+                for column, value in row.items():
+                    value = _clean(value)
+                    if column and value is not None:
+                        values.setdefault(column, set()).add(value)
+    columns = {c for c, v in values.items() if len(v) > 1 and c not in META_SKIP}
+    with _meta_lock:
+        _varying.update(key=key, columns=columns)
+    return columns
+
+
+def experiment_meta(root, experiment):
+    """Fly metadata of an analyzed experiment (its database's ethoscope_metadata, read as the Overview does:
+    light cycle merged): per column [[value, flies]], key columns first, then the ones that vary in the sheets."""
+    from idtrackerai_validator_server.experiments import to_relpath
+    from idtrackerai_validator_server.overview import _read_experiment
+    relpath = os.path.join(to_relpath(experiment), experiment + ".db")
+    path = os.path.join(root, relpath)
+    mtime = os.path.getmtime(path)
+    with _meta_lock:
+        cached = _meta_cache.get(path)
+    if cached and cached[0] == mtime:
+        record = cached[1]
+    else:
+        record = _read_experiment(root, relpath)
+        with _meta_lock:
+            _meta_cache[path] = (mtime, record)
+    varying = varying_columns()
+    counts = {}
+    for fly in record["flies"]:
+        for column, value in fly.items():
+            if column in META_SKIP or column == "arena" or (varying and column not in varying and column not in META_FIRST):
+                continue
+            counts.setdefault(column, {}).setdefault(value, 0)
+            counts[column][value] += 1
+    order = [c for c in META_FIRST if c in counts] + sorted(c for c in counts if c not in META_FIRST)
+    return {"experiment": experiment, "flies": len(record["flies"]), "arena": record.get("arena"),
+            "group_size": record.get("group_size"), "duration_h": record.get("duration_h"), "error": record.get("error"),
+            "columns": [[c, sorted(counts[c].items(), key=lambda kv: (-kv[1], kv[0]))] for c in order]}
+
+
 def _running_job(job_id):
     job = _jobs.get(str(job_id)) if job_id is not None else None
     return job.to_dict() if job is not None and job.status == "running" else None
@@ -898,6 +957,17 @@ def register_box_annotations(app, get_state):
         me = _author()
         items, analyzed = validation_queue(os.environ["FLYHOSTEL_VIDEOS"], me)
         return jsonify({"me": me, "items": items, "analyzed": analyzed})
+
+    @app.route("/api/annotate/queue/meta", methods=["GET"])
+    def annotate_queue_meta():
+        """?experiment=<flat>: experiment_meta, shown when hovering its row of the validation queue"""
+        experiment = to_flat(request.args.get("experiment", ""))
+        if not experiment or "/" in experiment or ".." in experiment:
+            return jsonify({"error": "experiment required"}), 400
+        try:
+            return jsonify(experiment_meta(os.environ["FLYHOSTEL_VIDEOS"], experiment))
+        except OSError:
+            return jsonify({"error": f"no database for {experiment}"}), 404
 
     @app.route("/api/annotate/queue/hide", methods=["POST"])
     def annotate_queue_hide():

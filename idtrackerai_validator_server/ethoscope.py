@@ -3,7 +3,7 @@
     GET /api/ethoscope/flies   the flies (ethoscope_metadata rows) and the ethoscope run
                                of each (`available` = at least one fly has one)
     GET /api/ethoscope/sleep   per fly the sleep trace scored from its ROI
-    GET /api/ethoscope/snapshots, /api/ethoscope/snapshot/<identity>/<id>
+    GET /api/ethoscope/snapshots, /api/ethoscope/snapshot?fly=<key>&id=
                                the run's IMG_SNAPSHOTS (whole frame every ~5 min) on the
                                trace's clock, and one of them cropped to the fly's ROI
 
@@ -194,7 +194,8 @@ def fly_entries(rows, experiment=None):
         date = _clean(row.get("date"))
         region = _number(row.get("region_id"))
         ref = _number(row.get("reference_hour"))
-        fly = {"identity": identity, "machine_name": machine, "date": date,
+        fly = {"identity": identity, "key": str(identity), "label": f"Fly {identity}", "in_experiment": True,
+               "machine_name": machine, "date": date,
                "region_id": int(region) if region is not None else None,
                "reference_hour": ref, "path": None, "run": None, "error": None,
                "moved_at": _unix(f"{_clean(row.get('flyhostel_date')) or ''}_{_clean(row.get('flyhostel_time')) or ''}") or default_move}
@@ -513,6 +514,107 @@ def snapshot_jpeg(path, rowid, roi=None, crop=True, width=None):
     return buf.tobytes()
 
 
+# --- other flies of the runs: the whole ethoscope run(s), or every run started the same date (a batch) ---
+SCOPES = ("experiment", "run", "batch")
+_sheet_cache = {"key": None, "index": {}}
+_sheet_lock = Lock()
+
+
+def sheet_index():
+    """{(machine_name, date YYYY-MM-DD, region_id): sheet row} from the latest export of every metadata
+    sheet (overview.sheet_files; the sheets also list flies that stayed in the ethoscopes); cached per
+    file mtime. Empty when the sheets cannot be read."""
+    import csv
+    try:
+        from idtrackerai_validator_server.overview import sheet_files
+        files = sorted(sheet_files()[0].values())
+        key = tuple((p, os.path.getmtime(p)) for p in files)
+    except Exception as error:
+        logger.warning("ethoscope: cannot list the metadata sheets: %s", error)
+        return {}
+    with _sheet_lock:
+        if _sheet_cache["key"] == key:
+            return _sheet_cache["index"]
+    index = {}
+    for path in files:
+        with open(path, newline="") as handle:
+            for row in csv.DictReader(handle):
+                machine, date, region = _clean(row.get("machine_name")), _clean(row.get("date")), _number(row.get("region_id"))
+                if machine and date and region is not None:
+                    index.setdefault((machine, date[:10], int(region)), row)
+    with _sheet_lock:
+        _sheet_cache.update(key=key, index=index)
+    return index
+
+
+def runs_on(date):
+    """{path: (machine_name, run)}: the last run of every machine started on `date` (as find_run)"""
+    machines = {}
+    for folder in glob.glob(os.path.join(RESULTS_DIR, "*", "*", f"{glob.escape(date[:10])}_*")):
+        machine = os.path.basename(os.path.dirname(folder))
+        if RUN_RE.match(os.path.basename(folder)):
+            machines.setdefault(machine, []).append(folder)
+    out = {}
+    for machine in machines:
+        found = find_run(machine, date)
+        if found:
+            out[found[0]] = (machine, found[1])
+    return out
+
+
+def _run_rois(path):
+    con = _connect(path)
+    try:
+        return sorted(int(r[0]) for r in con.execute("SELECT roi_idx FROM ROI_MAP"))
+    finally:
+        con.close()
+
+
+def extra_fly(machine, run, path, region, row, default_ref):
+    """A fly of a run that is not in the loaded experiment: its sheet row (if any) gives genotype, sex,
+    reference_hour and when it went into the FlyHostel."""
+    row = row or {}
+    ref = _number(row.get("reference_hour"))
+    moved = _unix(f"{_clean(row.get('flyhostel_date')) or ''}_{_clean(row.get('flyhostel_time')) or ''}")
+    basedir = _clean(row.get("basedir"))
+    m = re.search(r"(FlyHostel\d+/\d+X/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", basedir or "")
+    fly = {"identity": None, "key": f"{machine}/{run}/{region}", "in_experiment": False,
+           "label": f"{machine.replace('ETHOSCOPE_', 'E')} ROI {region}",
+           "machine_name": machine, "date": run[:10], "region_id": region,
+           "reference_hour": ref if ref is not None else default_ref, "path": path, "run": run, "error": None,
+           "moved_at": moved, "experiment": m.group(1) if m else None, "in_sheet": bool(row)}
+    for c in FLY_COLUMNS:
+        fly[c] = _clean(row.get(c))
+    return fly
+
+
+def scope_flies(flies, scope):
+    """The experiment's flies plus, for scope `run`, the other ROIs of their runs, for `batch` every ROI of
+    every run started on the same dates."""
+    if scope not in ("run", "batch"):
+        return flies
+    runs = {f["path"]: (f["machine_name"], f["run"]) for f in flies if f["path"]}
+    if scope == "batch":
+        for date in sorted({run[:10] for _, run in runs.values()}):
+            for path, value in runs_on(date).items():
+                runs.setdefault(path, value)
+    refs = [f["reference_hour"] for f in flies if f["reference_hour"] is not None]
+    default_ref = max(set(refs), key=refs.count) if refs else None
+    taken = {(f["path"], f["region_id"]) for f in flies}
+    sheet = sheet_index()
+    extra = []
+    for path, (machine, run) in sorted(runs.items(), key=lambda kv: kv[1]):
+        try:
+            rois = _run_rois(path)
+        except sqlite3.Error as error:
+            logger.warning("ethoscope: ROI_MAP of %s: %s", path, error)
+            continue
+        for region in rois:
+            if (path, region) not in taken:
+                extra.append(extra_fly(machine, run, path, region, sheet.get((machine, run[:10], region)), default_ref))
+    return flies + extra
+
+
 def _params():
     params = {}
     for k, default in DEFAULTS.items():
@@ -528,12 +630,16 @@ def _params():
 def register_ethoscope(app, get_rows):
     """get_rows() -> (experiment, list of metadata row dicts) of the loaded experiment, or None."""
 
-    def _flies():
+    def _flies(scope="experiment"):
         state = get_rows()
         if state is None:
             return None, []
         experiment, rows = state
-        return experiment, fly_entries(rows or [], experiment)
+        return experiment, scope_flies(fly_entries(rows or [], experiment), scope)
+
+    def _scope():
+        scope = request.args.get("scope", "experiment")
+        return scope if scope in SCOPES else "experiment"
 
     @app.route("/api/ethoscope/flies", methods=["GET"])
     def ethoscope_flies():
@@ -564,30 +670,44 @@ def register_ethoscope(app, get_rows):
 
     @app.route("/api/ethoscope/snapshots", methods=["GET"])
     def ethoscope_snapshots():
-        """Per fly with a run: its snapshots on the trace's clock (fly_snapshots); one listing per run."""
-        experiment, flies = _flies()
+        """Per fly with a run (key -> fly_snapshots, ?scope= as /sleep): its snapshots on the trace's clock;
+        one listing per run."""
+        experiment, flies = _flies(_scope())
         todo = [f for f in flies if f["path"]]
 
         def one(fly):
             try:
-                return fly["identity"], fly_snapshots(fly)
+                return fly["key"], fly_snapshots(fly)
             except Exception as error:
-                logger.exception("ethoscope snapshots of %s fly %s", experiment, fly["identity"])
-                return fly["identity"], {"snapshots": [], "error": str(error)}
+                logger.exception("ethoscope snapshots of %s fly %s", experiment, fly["key"])
+                return fly["key"], {"snapshots": [], "error": str(error)}
 
         # flies of one run share the listing: list each path once first
         with ThreadPoolExecutor(max_workers=4) as pool:
             list(pool.map(lambda p: _snapshot_index(p) if os.path.exists(p) else None, sorted({f["path"] for f in todo})))
             out = dict(pool.map(one, todo))
-        return jsonify({"experiment": experiment, "flies": {str(k): v for k, v in out.items()}})
+        return jsonify({"experiment": experiment, "flies": out})
 
-    @app.route("/api/ethoscope/snapshot/<int:identity>/<int:rowid>", methods=["GET"])
-    def ethoscope_snapshot(identity, rowid):
-        """JPEG of snapshot `rowid` of the fly's run: ?crop=roi (default: its ROI) or full (ROI outlined), &w= px"""
-        _, flies = _flies()
-        fly = next((f for f in flies if f["identity"] == identity and f["path"]), None)
+    @app.route("/api/ethoscope/snapshot", methods=["GET"])
+    def ethoscope_snapshot():
+        """JPEG of snapshot `id` of fly `fly` (its key: an identity of the experiment, or
+        <machine_name>/<run>/<roi>): ?crop=roi (default: its ROI) or full (ROI outlined), &w= px"""
+        key = request.args.get("fly", "")
+        try:
+            rowid = int(request.args["id"])
+        except (KeyError, ValueError):
+            return jsonify({"error": "id required"}), 400
+        if "/" in key:
+            parts = key.split("/")
+            if len(parts) != 3 or not all(SAFE_RE.match(p) for p in parts) or not parts[2].isdigit():
+                return jsonify({"error": f"bad fly {key}"}), 400
+            dbs = sorted(glob.glob(os.path.join(RESULTS_DIR, "*", parts[0], parts[1], "*.db")))
+            fly = {"path": dbs[-1], "region_id": int(parts[2])} if dbs else None
+        else:
+            _, flies = _flies()
+            fly = next((f for f in flies if f["key"] == key and f["path"]), None)
         if fly is None:
-            return jsonify({"error": f"fly {identity} has no ethoscope run"}), 404
+            return jsonify({"error": f"fly {key} has no ethoscope run"}), 404
         try:
             width = int(request.args["w"]) if request.args.get("w") else None
         except ValueError:
@@ -604,7 +724,7 @@ def register_ethoscope(app, get_rows):
 
     @app.route("/api/ethoscope/sleep", methods=["GET"])
     def ethoscope_sleep():
-        experiment, flies = _flies()
+        experiment, flies = _flies(_scope())
         params = _params()
         todo = [f for f in flies if f["path"]]
 
@@ -612,10 +732,10 @@ def register_ethoscope(app, get_rows):
             try:
                 return {**fly, "trace": _fly_trace(fly, params)}
             except Exception as error:
-                logger.exception("ethoscope sleep of %s fly %s", experiment, fly["identity"])
+                logger.exception("ethoscope sleep of %s fly %s", experiment, fly["key"])
                 return {**fly, "trace": None, "error": str(error)}
 
         with ThreadPoolExecutor(max_workers=8) as pool:
-            done = {f["identity"]: r for f, r in zip(todo, pool.map(one, todo))}
-        out = [done.get(f["identity"], {**f, "trace": None}) for f in flies]
+            done = {f["key"]: r for f, r in zip(todo, pool.map(one, todo))}
+        out = [done.get(f["key"], {**f, "trace": None}) for f in flies]
         return jsonify({"experiment": experiment, "params": params, "flies": out})
