@@ -123,7 +123,7 @@ Releases are tagged (see https://github.com/shaliulab/idtrackerai-validator-serv
 To install one, check out its tag before getting the submodules:
 
 ```
-git checkout v1.2.3
+git checkout v1.2.4
 ```
 
 and then follow the steps above from "Get the submodules".
@@ -157,7 +157,7 @@ pip install ".[full]"
 ```
 
 To go to a specific version instead of the latest, replace `git pull` with
-`git fetch --tags` followed by `git checkout v1.2.3` (the version you want).
+`git fetch --tags` followed by `git checkout v1.2.4` (the version you want).
 
 Then restart the server so it runs the new version (see "Stop and restart" under
 "Run" below), and reload the page in the browser.
