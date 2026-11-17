@@ -517,6 +517,8 @@ def snapshot_jpeg(path, rowid, roi=None, crop=True, width=None):
 # --- other flies of the runs: the whole ethoscope run(s), or every run started the same date (a batch) ---
 SCOPES = ("experiment", "run", "batch")
 _sheet_cache = {"key": None, "index": {}}
+_progress = {}                # token of a /sleep request -> {done, total, t}
+_progress_lock = Lock()
 _sheet_lock = Lock()
 
 
@@ -724,9 +726,13 @@ def register_ethoscope(app, get_rows):
 
     @app.route("/api/ethoscope/sleep", methods=["GET"])
     def ethoscope_sleep():
+        token = request.args.get("progress")      # the client polls /api/ethoscope/sleep/progress with it
         experiment, flies = _flies(_scope())
         params = _params()
         todo = [f for f in flies if f["path"]]
+        if token:
+            with _progress_lock:
+                _progress[token] = {"done": 0, "total": len(todo), "t": time.time()}
 
         def one(fly):
             try:
@@ -734,8 +740,44 @@ def register_ethoscope(app, get_rows):
             except Exception as error:
                 logger.exception("ethoscope sleep of %s fly %s", experiment, fly["key"])
                 return {**fly, "trace": None, "error": str(error)}
+            finally:
+                if token:
+                    with _progress_lock:
+                        _progress[token]["done"] += 1
 
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            done = {f["key"]: r for f, r in zip(todo, pool.map(one, todo))}
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                done = {f["key"]: r for f, r in zip(todo, pool.map(one, todo))}
+        finally:
+            if token:
+                with _progress_lock:
+                    _progress.pop(token, None)
+                    # forget tokens of requests that never ended
+                    for k in [k for k, v in _progress.items() if time.time() - v["t"] > 3600]:
+                        _progress.pop(k)
         out = [done.get(f["key"], {**f, "trace": None}) for f in flies]
         return jsonify({"experiment": experiment, "params": params, "flies": out})
+
+    @app.route("/api/ethoscope/sleep/progress", methods=["GET"])
+    def ethoscope_sleep_progress():
+        """?token= of a running /sleep request: flies scored so far (`done`, `total`); null once it ended"""
+        with _progress_lock:
+            entry = _progress.get(request.args.get("token", ""))
+            return jsonify(dict(entry) if entry else None)
+
+    @app.route("/api/ethoscope/scopes", methods=["GET"])
+    def ethoscope_scopes():
+        """How many flies (ROIs with a local run) and runs each scope would plot, from ROI_MAP only"""
+        _, flies = _flies()
+        out = {}
+        for scope in SCOPES:
+            try:
+                chosen = scope_flies(flies, scope)
+            except Exception as error:
+                logger.warning("ethoscope scope %s: %s", scope, error)
+                out[scope] = None
+                continue
+            out[scope] = {"flies": sum(1 for f in chosen if f["path"]),
+                          "runs": len({f["path"] for f in chosen if f["path"]}),
+                          "in_sheet": sum(1 for f in chosen if f["path"] and (f.get("in_experiment") or f.get("in_sheet")))}
+        return jsonify(out)
