@@ -16,8 +16,9 @@ The counting step (leg_movements_per_fly.py) writes $LEG_MOVEMENTS_DIR/model/mov
 legs alone, while immobile) with the classifier's p_middle, movement (counted as a real movement), near (during a contact with
 another fly or just after it) and partner (that fly). Every event shown gets those columns when it is in the file, and the
 selections movements, movements_near and movements_away sample the counted movements (all, near another fly, away from others).
-Besides the verdict, a review says whether the moving leg touches the other fly (touches: yes, no, no_partner = no other fly in the
-clip).
+Besides the verdict, a review says whether the moving leg touches the other fly, during the movement or in the second before it
+(touches: yes, the leg clearly lands on it; graze, it barely brushes it or one cannot tell; no, a gap stays; no_partner = no other fly
+in the clip). Databases made before graze existed are rebuilt once at start-up to allow it (the CHECK of the column).
 
 Events are not tied to the loaded experiment: the tab plays each fly's HLS movie (motionmapper/<NN>/movie, as the Ethograms tab)
 at the time of the event, so a random sample can mix flies of every experiment. Verdicts go to their own sqlite file,
@@ -42,7 +43,7 @@ LEG_DB = os.environ.get("LEG_ANNOTATIONS_DB") or os.path.join(os.path.dirname(os
 # what the reviewer sees in the clip (keys 1-7 in the tab)
 VERDICTS = ("middle", "groom", "walk", "posture", "pose_error", "other", "unsure")
 WHICH_LEG = ("left", "right", "both")
-TOUCHES = ("yes", "no", "no_partner")
+TOUCHES = ("yes", "graze", "no", "no_partner")
 MOVEMENT_COLUMNS = ["p_middle", "movement", "near", "partner"]
 MOVEMENT_SELECTIONS = {"movements": None, "movements_near": True, "movements_away": False}
 IMMOBILE_S = 10   # "while immobile": immobile in the sleep trace for at least this long when the event starts
@@ -122,6 +123,26 @@ def _init_db():
         if "touches" not in columns:
             touches = ",".join(f"'{v}'" for v in TOUCHES)
             c.execute(f"ALTER TABLE leg_annotations ADD COLUMN touches TEXT CHECK (touches IS NULL OR touches IN ({touches}))")
+        else:
+            _allow_new_touches(c)
+
+
+def _allow_new_touches(c):
+    """SQLite cannot change a CHECK: rebuild the table when its touches column predates a value of TOUCHES (rows kept)"""
+    sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='leg_annotations'").fetchone()[0]
+    if all(f"'{v}'" in sql for v in TOUCHES):
+        return
+    start = sql.index("touches TEXT CHECK")
+    end = sql.index("))", start) + 2
+    touches = ",".join(f"'{v}'" for v in TOUCHES)
+    new_sql = sql[:start] + f"touches TEXT CHECK (touches IS NULL OR touches IN ({touches}))" + sql[end:]
+    columns = ",".join(r[1] for r in c.execute("PRAGMA table_info(leg_annotations)"))
+    c.execute("BEGIN")
+    c.execute(new_sql.replace("CREATE TABLE leg_annotations", "CREATE TABLE leg_annotations_new", 1))
+    c.execute(f"INSERT INTO leg_annotations_new ({columns}) SELECT {columns} FROM leg_annotations")
+    c.execute("DROP TABLE leg_annotations")
+    c.execute("ALTER TABLE leg_annotations_new RENAME TO leg_annotations")
+    c.execute("COMMIT")
 
 
 def _annotations(flies=None):
