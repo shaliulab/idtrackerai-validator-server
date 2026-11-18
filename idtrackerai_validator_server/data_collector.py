@@ -197,6 +197,33 @@ done
     return experiments, now
 
 
+def local_experiments(root, date=None):
+    """Experiment folders here (slash form), of `date` (YYYY-MM-DD) only when given: recordings
+    that are no longer (or never were) on cv2 can still get settings."""
+    pattern = os.path.join(root, "FlyHostel*", "*X", f"{date}_*" if date else "*")
+    return sorted(e for e in (os.path.relpath(p, root) for p in glob.glob(pattern) if os.path.isdir(p))
+                  if EXPERIMENT_RE.match(e))
+
+
+def local_files(folder):
+    """The same listing as `remote_files` gives one experiment, of a local folder."""
+    metadata, files = {}, {}
+    try:
+        with open(os.path.join(folder, "metadata.yaml")) as handle:
+            for line in handle:
+                match = re.match(r"^\s*(chunksize|framerate|created_utc):\s*(.*)$", line)
+                if match:
+                    metadata[match.group(1)] = match.group(2).strip().strip("'\"")
+    except OSError:
+        pass
+    with os.scandir(folder) as entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False):
+                stat = entry.stat(follow_symlinks=False)
+                files[entry.name] = (stat.st_size, stat.st_mtime)
+    return {"metadata": metadata, "files": files}
+
+
 def databases(folder):
     """Databases of a folder and of its arenas (paths relative to it): the *db files other than
     index.db, the ones the index lists (an experiment with one is analyzed); `validated` = it
@@ -1261,32 +1288,45 @@ def register_data_collector(app):
 
     @app.route("/api/collector/dates", methods=["GET"])
     def collector_dates():
-        """Experiments of cv2 grouped by date, newest first."""
+        """Experiments of cv2 and of here grouped by date, newest first (`remote` = on cv2,
+        `local` = folder here); `remote_error` when cv2 could not be listed."""
+        remote_error = None
         try:
-            experiments = remote_experiments()
+            remote = set(remote_experiments())
         except (RuntimeError, subprocess.TimeoutExpired) as error:
-            return jsonify({"error": str(error)}), 502
+            remote, remote_error = set(), str(error)
+        local = set(local_experiments(root))
         dates = {}
-        for experiment in experiments:
+        for experiment in sorted(remote | local):
             date = EXPERIMENT_RE.match(experiment).group(4)
-            dates.setdefault(date, []).append({"experiment": experiment,
-                                               "local": os.path.isdir(os.path.join(root, experiment))})
+            dates.setdefault(date, []).append({"experiment": experiment, "local": experiment in local,
+                                               "remote": experiment in remote})
         return jsonify({
-            "host": REMOTE_HOST, "remote_root": REMOTE_ROOT, "http": HTTP_URL,
+            "host": REMOTE_HOST, "remote_root": REMOTE_ROOT, "http": HTTP_URL, "remote_error": remote_error,
             "dates": [{"date": d, "experiments": dates[d]} for d in sorted(dates, reverse=True)],
         })
 
     @app.route("/api/collector/date/<date>", methods=["GET"])
     def collector_date(date):
         """The experiments of `date` on cv2 with what a fetch would copy (?zt_limit=30)."""
+        remote_error = None
         try:
             zt_limit = float(request.args.get("zt_limit", ZT_LIMIT))
             experiments, now = remote_files(date)
         except ValueError as error:
             return bad_request(error)
         except (RuntimeError, subprocess.TimeoutExpired) as error:
-            return jsonify({"error": str(error)}), 502
-        records = [plan(e, experiments[e], now, zt_limit, root) for e in sorted(experiments)]
+            experiments, now, remote_error = {}, time.time(), str(error)
+        records = [dict(plan(e, experiments[e], now, zt_limit, root), remote=True) for e in sorted(experiments)]
+        # folders here that cv2 does not have (any more): listed from the local files, nothing to fetch
+        for experiment in local_experiments(root, date):
+            if experiment in experiments:
+                continue
+            record = plan(experiment, local_files(os.path.join(root, experiment)), time.time() + RECENT_S,
+                          zt_limit, root)
+            record.update(remote=False, recording=False)
+            records.append(record)
+        records.sort(key=lambda r: r["experiment"])
         drives = {}
         for record in records:
             hostel = record["flyhostel"]
@@ -1294,7 +1334,7 @@ def register_data_collector(app):
                 drives[hostel] = _drive_free(root, record["experiment"])
             record.pop("missing")
         return jsonify({"date": date, "zt_limit": zt_limit, "experiments": records, "free": drives,
-                        "margin": FETCH_MARGIN, "fetching": sorted(_fetching)})
+                        "margin": FETCH_MARGIN, "fetching": sorted(_fetching), "remote_error": remote_error})
 
     @app.route("/api/collector/fetch", methods=["POST"])
     def collector_fetch():
