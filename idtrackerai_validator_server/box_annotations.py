@@ -1290,6 +1290,16 @@ def register_box_annotations(app, get_state):
                 handle.write(PREPARE_VERSION + "\n")
             env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""))
             tails = []
+            # make-identogram --cache reads <flat>_tracking_data.feather whenever it exists, whatever the database: an
+            # export older than the database (tracked again since) would give the scenes of the old tracking
+            stale = []
+            for feather in glob.glob(os.path.join(folder, "*_tracking_data.feather")):
+                if os.path.getmtime(feather) < os.path.getmtime(state["dbfile"]):
+                    os.remove(feather)
+                    stale.append(os.path.basename(feather))
+            if stale:
+                tails.append({"command": "removed tracking exports older than the database: " + ", ".join(stale),
+                              "exit_code": 0, "tail": []})
             for i, command in enumerate(commands):
                 job.update(i, status="running")
                 lines = []
