@@ -29,6 +29,10 @@ the FlyHostel more than once, on consecutive days. A fly is identified by its
 ethoscope run (`machine_name`, `date`, `region_id`); when the same fly is in an
 experiment of the same FlyHostel the day before, this is not its first night
 (`annotate_nights`, the automatic version of the sheets' `experiment_order`).
+`days_in_flyhostel_before` (per fly, and the largest of its flies per experiment):
+days since the first FlyHostel experiment of the same ethoscope fly, in any FlyHostel
+and with any gap, the rule of the analysis pipelines (sleep_transfer keeps per
+ethoscope fly only its earliest flyhostel_date): 0 for a fresh fly.
 
 POST /api/overview/reindex rewrites index.txt in a background job (jobs.py) with
 experiments.INDEX_COMMAND: the databases of the experiment folders, as by hand with
@@ -394,7 +398,8 @@ def annotate_nights(records):
     """New records whose flies carry `flyhostel_night` ("1" = first time in the FlyHostel)
     and `previous_experiment`, and the experiment `first_night`: "yes" (every fly whose
     run is known is on its first night), "no" (none is), "mixed", None (no fly known),
-    `repeat_flies` and `previous_experiments`."""
+    `repeat_flies` and `previous_experiments`; per fly and per experiment (max of its
+    flies, None when no fly is known) `days_in_flyhostel_before`."""
     runs = defaultdict(list)        # fly key -> [(day, experiment)]
     for record in records:
         day = _day(record.get("date"))
@@ -402,6 +407,12 @@ def annotate_nights(records):
             key = _fly_key(record.get("flyhostel"), fly)
             if key and day:
                 runs[key].append((day, record["experiment"]))
+
+    # first FlyHostel day of each ethoscope fly, whatever the FlyHostel (as the analysis pipelines)
+    first_day = {}
+    for key, visits in runs.items():
+        eid = key[1:]
+        first_day[eid] = min([d for d, _ in visits] + ([first_day[eid]] if eid in first_day else []))
 
     nights = {}                     # (key, experiment) -> (night, previous experiment)
 
@@ -420,12 +431,14 @@ def annotate_nights(records):
     out = []
     for record in records:
         day = _day(record.get("date"))
-        flies, known, repeat, previous = [], 0, 0, []
+        flies, known, repeat, previous, days_before = [], 0, 0, [], None
         for fly in record.get("flies", []):
             key = _fly_key(record.get("flyhostel"), fly)
             if key and day:
                 night, prev = night_of(key, day, record["experiment"])
-                fly = {**fly, "flyhostel_night": str(night)}
+                days = (day - first_day[key[1:]]).days
+                days_before = max(days, days_before or 0)
+                fly = {**fly, "flyhostel_night": str(night), "days_in_flyhostel_before": str(days)}
                 known += 1
                 if prev:
                     fly["previous_experiment"] = prev
@@ -435,7 +448,8 @@ def annotate_nights(records):
             flies.append(fly)
         first = None if not known else "yes" if not repeat else "no" if repeat == known else "mixed"
         out.append({**record, "flies": flies, "first_night": first, "repeat_flies": repeat,
-                    "known_flies": known, "previous_experiments": previous})
+                    "known_flies": known, "previous_experiments": previous,
+                    "days_in_flyhostel_before": days_before})
     return out
 
 
