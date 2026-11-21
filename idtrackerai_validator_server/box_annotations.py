@@ -987,9 +987,39 @@ def _cached_scenes(basedir, experiment, n_animals):
     return scenes
 
 
-def continuity_proposal(state, con, frame_number, rows, contours):
+def anchor_labels(dbfile, frame_number, n_animals, labels, splits):
+    """[label per row] of an idtrackerai anchor frame (all N flies identified) in a person's labels: a row whose
+    fragment a person labelled in a saved frame of the chunk takes that label (nearest saved frame before, else after,
+    as inherit_labels); the others keep their local identity when no labelled row took it, else get the labels left."""
+    rows = _machine_rows(dbfile, frame_number)
+    out = [None] * len(rows)
+    taken = set()
+    for i, r in enumerate(rows):
+        key = segment_key(r["fragment"], frame_number, splits)
+        given = labels.get(key) if key is not None else None
+        if not given:
+            continue
+        before = [lab for fn, lab in given if fn < frame_number]
+        after = [lab for fn, lab in given if fn >= frame_number]
+        label = int(before[-1] if before else after[0])
+        if label not in taken:
+            out[i] = label
+            taken.add(label)
+    for i, r in enumerate(rows):
+        if out[i] is None and r["local_identity"] and r["local_identity"] not in taken:
+            out[i] = int(r["local_identity"])
+            taken.add(out[i])
+    left = [lab for lab in range(1, n_animals + 1) if lab not in taken]
+    for i in range(len(rows)):
+        if out[i] is None and left:
+            out[i] = left.pop(0)
+    return out
+
+
+def continuity_proposal(state, con, frame_number, rows, contours, labels=None, splits=None):
     """Boxes of the continuity proposal (continuity.py) of a frame, its flags and anchor, or None (no anchor in the
-    chunk). rows: _machine_rows of the frame; con: the sidecar (None when it does not exist)."""
+    chunk). rows: _machine_rows of the frame; con: the sidecar (None when it does not exist); labels, splits:
+    chunk_fragment_labels, which put an idtrackerai anchor in the person's labels (anchor_labels)."""
     chunk_start = frame_number // state["chunksize"] * state["chunksize"]
     saved_before = None
     if con is not None:
@@ -1000,7 +1030,10 @@ def continuity_proposal(state, con, frame_number, rows, contours):
                 "SELECT x0, y0, x1, y1, label FROM boxes WHERE frame_number = ?", (last[0],))]
             saved_before = (last[0], boxes, last[1])
     scenes = _cached_scenes(state["basedir"], state["experiment"], state["n_animals"])
-    result = continuity.track(state["dbfile"], frame_number, state["chunksize"], state["n_animals"], scenes, saved_before)
+    translate = (lambda fn, _rows: anchor_labels(state["dbfile"], fn, state["n_animals"], labels, splits or {})) \
+        if labels else None
+    result = continuity.track(state["dbfile"], frame_number, state["chunksize"], state["n_animals"], scenes,
+                              saved_before, translate)
     if result is None or len(result["rows"]) != len(rows):
         return None
     width, height = state["size"]()
@@ -1247,7 +1280,7 @@ def register_box_annotations(app, get_state):
             if want != "tracking" and bundle_info(state["basedir"]) is None:
                 con = _connect(state["basedir"])
                 try:
-                    found = continuity_proposal(state, con, frame_number, rows, frame_contours())
+                    found = continuity_proposal(state, con, frame_number, rows, frame_contours(), labels, splits)
                 except (sqlite3.Error, ValueError) as exc:
                     logger.warning("No continuity proposal for frame %s: %s", frame_number, exc)
                     found = None
@@ -1261,9 +1294,10 @@ def register_box_annotations(app, get_state):
                 source = "tracking"
                 width, height = state["size"]()
                 proposal = propose(rows, frame_contours(), width, height)
-        # from idtrackerai's anchor, the continuity labels are idtrackerai's local identities: a person's labels of
-        # the fragments in the chunk go first, as for the other sources (from a saved frame they are the person's)
-        if proposal is not None and not (source == "continuity" and anchor["kind"] == "saved"):
+        # a person's labels of the fragments in the chunk go first, as for the solver and idtrackerai's; the continuity
+        # proposal has them already (its anchor: a saved frame, or idtrackerai's put in them by anchor_labels), and
+        # inheriting on top of it would undo what it followed through a crossing (new fragments keep no label)
+        if proposal is not None and source != "continuity":
             proposal = inherit_labels(proposal, rows, labels, frame_number, splits)
         return jsonify({
             "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",

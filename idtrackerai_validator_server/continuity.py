@@ -270,11 +270,14 @@ def _get_run(key, make):
         return run
 
 
-def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before):
+def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, translate=None):
     """{"rows": [(label or None, note, confidence)] in the frame's row order, "ghosts": [(label, x, y, frame last
     seen)], "flags": [text], "anchor": frame, "anchor_kind": "saved" | "tracking"} or None (no anchor in the chunk).
 
     saved_before: (frame, boxes, updated) of the last frame saved by a person in [chunk start, frame_number), or None.
+    translate(frame, rows) -> [label per row]: the person's labels of an idtrackerai anchor's flies (its local
+    identities are not the person's when they relabelled the chunk: the run would carry idtrackerai's into the new
+    fragments after a crossing, which look like swaps), or None (idtrackerai's local identities).
     """
     frame_number, chunksize = int(frame_number), int(chunksize)
     chunk_start = frame_number // chunksize * chunksize
@@ -289,10 +292,12 @@ def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before):
             rows = read_rows(dbfile, s_fn, s_fn).get(s_fn, [])
             return Run(dbfile, s_fn, "saved", _box_positions(boxes, rows), notches, n_animals)
     elif m_fn is not None:
-        key = (dbfile, "tracking", m_fn)
+        labels = list(translate(m_fn, m_rows)) if translate is not None else [lid for _, _, lid in m_rows]
+        key = (dbfile, "tracking", m_fn, tuple(labels))
 
         def make():
-            return Run(dbfile, m_fn, "tracking", {lid: (x, y, True) for x, y, lid in m_rows}, notches, n_animals)
+            return Run(dbfile, m_fn, "tracking", {lab: (x, y, True) for (x, y, _), lab in zip(m_rows, labels)},
+                       notches, n_animals)
     else:
         return None
     run = _get_run(key, make)
