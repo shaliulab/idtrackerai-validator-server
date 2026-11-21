@@ -59,7 +59,7 @@ import cv2
 import numpy as np
 from flask import jsonify, request, session
 
-from idtrackerai_validator_server import links
+from idtrackerai_validator_server import continuity, links
 from idtrackerai_validator_server.compat import get_number_of_animals
 from idtrackerai_validator_server.experiments import is_validated, to_flat
 from idtrackerai_validator_server.jobs import _jobs, start_job
@@ -972,6 +972,116 @@ def scenes_outdated(basedir, dbfile, chunksize):
     return None
 
 
+_scene_cache = {}   # basedir -> ((path, mtime, size), scenes)
+
+
+def _cached_scenes(basedir, experiment, n_animals):
+    """read_scenes, kept while scene_qc.csv is unchanged (the continuity proposal asks for every frame)."""
+    path = os.path.join(_validation_folder(basedir), "scene_qc.csv")
+    stamp = (path, *_mtime_size(path))
+    hit = _scene_cache.get(basedir)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    scenes, _ = read_scenes(basedir, experiment, n_animals)
+    _scene_cache[basedir] = (stamp, scenes)
+    return scenes
+
+
+def continuity_proposal(state, con, frame_number, rows, contours):
+    """Boxes of the continuity proposal (continuity.py) of a frame, its flags and anchor, or None (no anchor in the
+    chunk). rows: _machine_rows of the frame; con: the sidecar (None when it does not exist)."""
+    chunk_start = frame_number // state["chunksize"] * state["chunksize"]
+    saved_before = None
+    if con is not None:
+        last = con.execute("SELECT frame_number, updated FROM frames WHERE frame_number >= ? AND frame_number < ? "
+                           "ORDER BY frame_number DESC LIMIT 1", (chunk_start, frame_number)).fetchone()
+        if last:
+            boxes = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab} for a, b, c, d, lab in con.execute(
+                "SELECT x0, y0, x1, y1, label FROM boxes WHERE frame_number = ?", (last[0],))]
+            saved_before = (last[0], boxes, last[1])
+    scenes = _cached_scenes(state["basedir"], state["experiment"], state["n_animals"])
+    result = continuity.track(state["dbfile"], frame_number, state["chunksize"], state["n_animals"], scenes, saved_before)
+    if result is None or len(result["rows"]) != len(rows):
+        return None
+    width, height = state["size"]()
+    boxes = propose(rows, contours, width, height)
+    for box, (label, note, confidence) in zip(boxes, result["rows"]):
+        box["label"] = str(label) if label else ""
+        box["note"] = note
+        box["confidence"] = confidence
+    sizes = [(b["x1"] - b["x0"], b["y1"] - b["y0"]) for b in boxes if b["label"]]
+    fly_w, fly_h = (float(np.median([w for w, _ in sizes])), float(np.median([h for _, h in sizes]))) if sizes \
+        else (float(MIN_BOX), float(MIN_BOX))
+    for label, x, y, seen in result["ghosts"]:
+        boxes.append({"x0": max(0.0, x - fly_w / 2), "y0": max(0.0, y - fly_h / 2),
+                      "x1": min(float(width), x + fly_w / 2), "y1": min(float(height), y + fly_h / 2),
+                      "label": str(label), "note": f"kept at the notch: not detected since frame {seen}",
+                      "confidence": "medium"})
+    anchor = {"frame_number": result["anchor"], "kind": result["anchor_kind"]}
+    return boxes, result["flags"], anchor
+
+
+EASY_CACHE_DIR = os.environ.get("CONTINUITY_CACHE_DIR", os.path.expanduser("~/.cache/idtrackerai-validator/continuity"))
+_easy_cache = {}     # dbfile -> (stamp, {scene start: why})
+_easy_running = {}   # dbfile -> (job id, stamp)
+
+
+def _easy_stamp(state):
+    path = os.path.join(_validation_folder(state["basedir"]), "scene_qc.csv")
+    return [continuity.CLASSIFY_VERSION, *_mtime_size(state["dbfile"]), *_mtime_size(path), state["n_animals"],
+            state["chunksize"]]
+
+
+def easy_scenes_async(state):
+    """Scenes of scene_qc.csv the continuity proposal should resolve alone (continuity.classify_scenes):
+    {"scenes": {start: why}} when known (memory, else $CONTINUITY_CACHE_DIR/<flat>.json, while the database and
+    scene_qc.csv are unchanged), else {"pending": job} with a job classifying them started (minutes), or {"error"}
+    when that job failed (not started again until the database or scene_qc.csv change)."""
+    dbfile = state["dbfile"]
+    stamp = _easy_stamp(state)
+    hit = _easy_cache.get(dbfile)
+    if hit and hit[0] == stamp:
+        return {"scenes": hit[1]}
+    path = os.path.join(EASY_CACHE_DIR, f"{to_flat(state['experiment'])}.json")
+    try:
+        with open(path) as handle:
+            saved = json.load(handle)
+        if saved.get("stamp") == stamp:
+            _easy_cache[dbfile] = (stamp, saved["scenes"])
+            return {"scenes": saved["scenes"]}
+    except (OSError, ValueError):
+        pass
+    scenes, _ = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
+    with _lock:
+        job_id, job_stamp = _easy_running.get(dbfile, (None, None))
+        running = _jobs.get(str(job_id))
+        if running is not None and running.status == "running":
+            return {"pending": running.to_dict()}
+        if running is not None and running.status == "failed" and job_stamp == stamp:
+            return {"error": running.error or "the classification failed"}
+
+        def work(job):
+            job.update(0, status="running")
+            result = continuity.classify_scenes(dbfile, scenes, state["chunksize"], state["n_animals"],
+                                                progress=lambda f: job.update(0, progress=min(0.99, f)))
+            easy = {str(start): r["why"] for start, r in result.items() if r["easy"]}
+            _easy_cache[dbfile] = (stamp, easy)
+            try:
+                os.makedirs(EASY_CACHE_DIR, exist_ok=True)
+                tmp = f"{path}.tmp"
+                with open(tmp, "w") as handle:
+                    json.dump({"stamp": stamp, "scenes": easy}, handle)
+                os.replace(tmp, path)
+            except OSError as error:
+                logger.warning("Could not keep the easy scenes in %s: %s", path, error)
+            job.result = {"easy": len(easy), "scenes": len(scenes)}
+            job.update(0, status="done", progress=1.0)
+
+        job = start_job(f"Easy scenes (continuity) of {to_flat(state['experiment'])}", [to_flat(state["experiment"])], work)
+        _easy_running[dbfile] = (job.id, stamp)
+        return {"pending": job.to_dict()}
+
+
 def _running_job(job_id):
     job = _jobs.get(str(job_id)) if job_id is not None else None
     return job.to_dict() if job is not None and job.status == "running" else None
@@ -1020,6 +1130,8 @@ def register_box_annotations(app, get_state):
             return error
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
         bundle = source["kind"] == "bundle"
+        # scenes the continuity proposal should resolve alone (not for a bundle: no continuity proposal there)
+        easy = easy_scenes_async(state) if source["kind"] == "scene_qc" and state["n_animals"] > 1 else None
         # the range the proposer looked at (before the chunk boundaries are added: only scene_qc.csv's scenes)
         coverage = None if bundle or source["kind"] != "scene_qc" else \
             scene_coverage(state["basedir"], state["dbfile"], scenes, state["chunksize"])
@@ -1056,6 +1168,7 @@ def register_box_annotations(app, get_state):
             "preparing": _preparing.get(state["experiment"]),
             "bundle": bundle,
             "coverage": coverage,
+            "easy": easy,
         })
 
     @app.route("/api/annotate/queue", methods=["GET"])
@@ -1117,22 +1230,44 @@ def register_box_annotations(app, get_state):
             with con:
                 labels, splits = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
             con.close()
-        if solver is not None and (saved is None or want) and want != "tracking":
-            proposal, source = solver, "solver"
-        elif saved is None or want:
-            source = "tracking"
-            width, height = state["size"]()
+        anchor = None
+
+        def frame_contours():
             try:
-                contours = state["contours"](frame_number)
+                return state["contours"](frame_number)
             except Exception as exc:
                 logger.warning("No contours for frame %s: %s", frame_number, exc)
-                contours = []
-            proposal = propose(rows, contours, width, height)
-        if proposal is not None:
+                return []
+
+        if solver is not None and (saved is None or want) and want not in ("tracking", "continuity"):
+            proposal, source = solver, "solver"
+        elif saved is None or want:
+            # continuity (identities followed by position) unless idtrackerai's boxes are asked for; idtrackerai's
+            # when it has no anchor in the chunk
+            if want != "tracking" and bundle_info(state["basedir"]) is None:
+                con = _connect(state["basedir"])
+                try:
+                    found = continuity_proposal(state, con, frame_number, rows, frame_contours())
+                except (sqlite3.Error, ValueError) as exc:
+                    logger.warning("No continuity proposal for frame %s: %s", frame_number, exc)
+                    found = None
+                finally:
+                    if con is not None:
+                        con.close()
+                if found is not None:
+                    proposal, flags, anchor = found
+                    source = "continuity"
+            if proposal is None:
+                source = "tracking"
+                width, height = state["size"]()
+                proposal = propose(rows, frame_contours(), width, height)
+        # from idtrackerai's anchor, the continuity labels are idtrackerai's local identities: a person's labels of
+        # the fragments in the chunk go first, as for the other sources (from a saved frame they are the person's)
+        if proposal is not None and not (source == "continuity" and anchor["kind"] == "saved"):
             proposal = inherit_labels(proposal, rows, labels, frame_number, splits)
         return jsonify({
             "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",
-            "flags": flags, "has_solver": solver is not None,
+            "flags": flags, "has_solver": solver is not None, "anchor": anchor,
             "saved": saved is not None, "boxes": proposal if proposal is not None else saved,
             "author": meta[0] if meta else None, "updated": meta[1] if meta else None,
             "machine": rows, "concatenation": _concatenation(state["dbfile"], chunk),
@@ -1163,7 +1298,8 @@ def register_box_annotations(app, get_state):
                 con.execute("INSERT OR REPLACE INTO frames VALUES (?, ?, ?, ?)", (frame_number, author, now, len(boxes)))
                 con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, json.dumps(boxes)))
             con.close()
-        return jsonify({"frame_number": frame_number, "saved": True, "boxes": boxes, "author": author, "updated": now})
+        return jsonify({"frame_number": frame_number, "chunk": frame_number // state["chunksize"], "saved": True,
+                        "boxes": boxes, "author": author, "updated": now})
 
     @app.route("/api/annotate/relabel_fragments", methods=["POST"])
     def annotate_relabel_fragments():
