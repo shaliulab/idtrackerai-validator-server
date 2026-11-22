@@ -525,6 +525,9 @@ def load():
         contours = []
         with _contours_lock:
             _contours_cache.clear()
+        with lock:
+            _frame_cache.clear()
+            globals()["_frame_cache_bytes"] = 0
         _sleep_cache.clear()
         clear_blobs_cache()
         close_h5_files()
@@ -734,14 +737,51 @@ def navigate_sleep(direction, identity, frame_number):
     return jsonify({"frame_number": int(bout[0]) if bout else None})
 
 
+# Decoded frames kept for the requests that follow: the Annotate tab reads each frame twice (its JPEG, then its
+# boxes, which segment it again) in two look-ahead loops at different positions, and imgstore reads forward only
+# when asked for the frame right after the last one (any other is a seek, a reopen in another chunk: ~1 s on a
+# busy machine). So the reader also goes forward up to READ_FORWARD_MAX frames instead of seeking, keeping them.
+FRAME_CACHE_BYTES = 600 * 2**20
+READ_FORWARD_MAX = 60
+_frame_cache = OrderedDict()   # (id(cap), frame_number) -> (image, actual frame number)
+_frame_cache_bytes = 0
+_reader_at = None              # (id(cap), last frame number read)
+
+
+def _keep_frame(key, value):
+    global _frame_cache_bytes
+    if key in _frame_cache:
+        _frame_cache.move_to_end(key)
+        return
+    _frame_cache[key] = value
+    _frame_cache_bytes += value[0].nbytes
+    while _frame_cache_bytes > FRAME_CACHE_BYTES and len(_frame_cache) > 1:
+        _, (old, _) = _frame_cache.popitem(last=False)
+        _frame_cache_bytes -= old.nbytes
+
+
 def _read_frame(frame_number):
-    """(image or None, actual frame number). Only cap.get_image needs the lock:
-    requests overlap (the client prefetches), so images stay in local variables."""
+    """(image or None, actual frame number). Only the reader needs the lock: requests overlap (the client
+    prefetches), so images stay in local variables (cached ones are never written to)."""
+    global _reader_at
     with lock:
+        c = id(cap)
+        hit = _frame_cache.get((c, frame_number))
+        if hit is not None:
+            _frame_cache.move_to_end((c, frame_number))
+            return hit
         try:
-            image, (frame_number, _) = cap.get_image(frame_number)
-            return image, frame_number
+            start = frame_number
+            if _reader_at is not None and _reader_at[0] == c and 1 < frame_number - _reader_at[1] <= READ_FORWARD_MAX:
+                start = _reader_at[1] + 1
+            for fn in range(start, frame_number + 1):
+                image, (actual, _) = cap.get_image(fn)
+                _reader_at = (c, fn)
+                if image is not None:
+                    _keep_frame((c, fn), (image, actual))
+            return image, actual
         except (ValueError, AssertionError) as error:
+            _reader_at = None
             app.logger.error(f"Can't fetch frame {frame_number}: {error}")
             return None, frame_number
 
