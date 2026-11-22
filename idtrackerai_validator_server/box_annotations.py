@@ -1128,6 +1128,27 @@ def _author():
     return read_config()["annotator"] or os.environ.get("USER") or "anonymous"
 
 
+MAX_SAVE_FRAMES = 1000   # frames of one POST /api/annotate/frames
+
+
+def write_frames(state, items):
+    """[(frame, checked boxes)] written in one transaction (a frame twice: the last wins); the responses of
+    POST /api/annotate/frame/<n>, in order."""
+    author, now = _author(), time.time()
+    with _lock:
+        con = _connect(state["basedir"], create=True)
+        with con:
+            for frame_number, boxes in items:
+                con.execute("DELETE FROM boxes WHERE frame_number = ?", (frame_number,))
+                con.executemany("INSERT INTO boxes (frame_number, x0, y0, x1, y1, label, track) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                [(frame_number, b["x0"], b["y0"], b["x1"], b["y1"], b["label"], b.get("track")) for b in boxes])
+                con.execute("INSERT OR REPLACE INTO frames VALUES (?, ?, ?, ?)", (frame_number, author, now, len(boxes)))
+                con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, json.dumps(boxes)))
+        con.close()
+    return [{"frame_number": fn, "chunk": fn // state["chunksize"], "saved": True, "boxes": boxes, "author": author,
+             "updated": now} for fn, boxes in items]
+
+
 def register_box_annotations(app, get_state):
     """get_state() -> None (no database) or a dict with experiment, basedir, dbfile, chunksize,
     n_animals, contours(frame_number) -> list, size() -> (width, height)."""
@@ -1322,18 +1343,33 @@ def register_box_annotations(app, get_state):
             boxes = check_boxes(body.get("boxes") or [], state["n_animals"])
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-        author, now = _author(), time.time()
-        with _lock:
-            con = _connect(state["basedir"], create=True)
-            with con:
-                con.execute("DELETE FROM boxes WHERE frame_number = ?", (frame_number,))
-                con.executemany("INSERT INTO boxes (frame_number, x0, y0, x1, y1, label, track) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                [(frame_number, b["x0"], b["y0"], b["x1"], b["y1"], b["label"], b.get("track")) for b in boxes])
-                con.execute("INSERT OR REPLACE INTO frames VALUES (?, ?, ?, ?)", (frame_number, author, now, len(boxes)))
-                con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, json.dumps(boxes)))
-            con.close()
-        return jsonify({"frame_number": frame_number, "chunk": frame_number // state["chunksize"], "saved": True,
-                        "boxes": boxes, "author": author, "updated": now})
+        return jsonify(write_frames(state, [(frame_number, boxes)])[0])
+
+    @app.route("/api/annotate/frames", methods=["POST"])
+    def annotate_save_many():
+        """{"experiment", "frames": [{"frame_number", "boxes"}]}: several frames saved in one transaction (one per
+        frame cost ~0.1-0.2 s on the HDDs, mostly the journal's syncs: Save all of 368 frames took 79 s).
+        "saved": [as POST /api/annotate/frame/<n>], "errors": {frame: text} (those frames not saved, the others are)."""
+        state, error = state_or_error()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        if body.get("experiment") and to_flat(body["experiment"]) != to_flat(state["experiment"]):
+            return jsonify({"error": "another experiment is loaded"}), 409
+        frames = body.get("frames")
+        if not isinstance(frames, list) or len(frames) > MAX_SAVE_FRAMES:
+            return jsonify({"error": f"frames: a list of at most {MAX_SAVE_FRAMES}"}), 400
+        items, errors = [], {}
+        for entry in frames:
+            try:
+                fn = int(entry["frame_number"])
+            except (KeyError, TypeError, ValueError):
+                return jsonify({"error": f"bad frame {entry!r}"}), 400
+            try:
+                items.append((fn, check_boxes(entry.get("boxes") or [], state["n_animals"])))
+            except ValueError as exc:
+                errors[str(fn)] = str(exc)
+        return jsonify({"saved": write_frames(state, items) if items else [], "errors": errors})
 
     @app.route("/api/annotate/relabel_fragments", methods=["POST"])
     def annotate_relabel_fragments():

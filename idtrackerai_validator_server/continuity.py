@@ -22,6 +22,7 @@ Boxes take `note` / `confidence` (medium = look at it: identity other than idtra
 ambiguous match; low = no label) as the solver's, so the tab marks them; frame-level problems are `flags`.
 """
 import ast
+import bisect
 import logging
 import os
 import sqlite3
@@ -37,13 +38,14 @@ GATE_PX = 60          # best on the 12X frames (30 px: 71 % of frames right, 60:
 NOTCH_PX = 150        # a fly within this of a notch centre is "at the notch"
 AMBIGUOUS_PX = 15     # another fly's last position at most this much further than the chosen one: medium
 STABLE_FRAMES = 10    # an idtrackerai anchor ends this many consecutive frames with every fly identified, none jumping
-SEARCH_STEP = 3000    # frames read at once looking back for an anchor
 MAX_RUNS = 8          # runs kept in memory
 
 _lock = threading.Lock()
 _runs = OrderedDict()   # (dbfile, anchor key) -> Run
 _notches = {}           # dbfile -> [(cx, cy)]
-_anchors = {}           # (dbfile, mtime, before, chunk_start) -> (frame, rows)
+_anchors = OrderedDict()   # (dbfile, mtime, chunk_start, chunksize, n_animals) -> stable_ends
+MAX_ANCHOR_CHUNKS = 200
+_anchor_lock = threading.Lock()
 
 
 def notch_centres(dbfile):
@@ -91,48 +93,53 @@ def stretch_start(scenes, frame_number):
     return start
 
 
-def machine_anchor(dbfile, before, chunk_start, n_animals):
-    """(frame, rows) of the last frame in [chunk_start, before) ending STABLE_FRAMES consecutive frames whose rows are
-    exactly n_animals distinct non-zero local identities, each within GATE_PX of where it was the frame before
-    ((None, None) if none; cached per database mtime)."""
+def stable_ends(dbfile, chunk_start, chunksize, n_animals, chunk_rows=None):
+    """Sorted frames of the chunk ending STABLE_FRAMES consecutive frames whose rows are exactly n_animals distinct
+    non-zero local identities, each within GATE_PX of where it was the frame before: the possible idtrackerai anchors.
+    One read of the chunk (~0.3 s), cached per database mtime; chunk_rows: read_rows of the chunk if at hand."""
     try:
         mtime = os.path.getmtime(dbfile)
     except OSError:
         mtime = None
-    key = (dbfile, mtime, before, chunk_start, n_animals)
-    if key not in _anchors:
-        if len(_anchors) > 1000:
-            _anchors.clear()
-        _anchors[key] = _machine_anchor(dbfile, before, chunk_start, n_animals)
-    return _anchors[key]
+    key = (dbfile, mtime, chunk_start, chunksize, n_animals)
+    with _anchor_lock:
+        hit = _anchors.get(key)
+        if hit is not None:
+            _anchors.move_to_end(key)
+            return hit
+    rows = chunk_rows if chunk_rows is not None else read_rows(dbfile, chunk_start, chunk_start + chunksize - 1)
+    ends, run, before = [], 0, None
+    for fn in range(chunk_start, chunk_start + chunksize):
+        r = rows.get(fn)
+        pos = {lid: (x, y) for x, y, lid in r} if r and len(r) == n_animals else None
+        if pos is not None and (0 in pos or len(pos) != n_animals):
+            pos = None
+        if pos is None:
+            run = 0
+        elif run and all(np.hypot(x - before[lid][0], y - before[lid][1]) < GATE_PX for lid, (x, y) in pos.items()):
+            run += 1
+        else:
+            run = 1
+        before = pos
+        if run >= STABLE_FRAMES:
+            ends.append(fn)
+    with _anchor_lock:
+        _anchors[key] = ends
+        while len(_anchors) > MAX_ANCHOR_CHUNKS:
+            _anchors.popitem(last=False)
+    return ends
 
 
-def _machine_anchor(dbfile, before, chunk_start, n_animals, chunk_rows=None):
-    """chunk_rows: read_rows of the chunk when the caller has them (classify_scenes)."""
-    hi = before - 1
-    good = 0           # consecutive frames (going back) that qualify, ending at `end`
-    end = None
-    later = None       # positions by local identity of the frame after the one looked at
-    while hi >= chunk_start:
-        lo = max(chunk_start, hi - SEARCH_STEP + 1)
-        rows = chunk_rows if chunk_rows is not None else read_rows(dbfile, lo, hi)
-        for fn in range(hi, lo - 1, -1):
-            r = rows.get(fn)
-            pos = {lid: (x, y) for x, y, lid in r} if r and len(r) == n_animals else None
-            if pos is not None and (0 in pos or len(pos) != n_animals):
-                pos = None
-            if pos is not None and later is not None and good and all(
-                    np.hypot(x - later[lid][0], y - later[lid][1]) < GATE_PX for lid, (x, y) in pos.items()):
-                good += 1
-            elif pos is not None:
-                good, end = 1, (fn, r)
-            else:
-                good, end = 0, None
-            later = pos
-            if good >= STABLE_FRAMES:
-                return end
-        hi = lo - 1
-    return None, None
+def machine_anchor(dbfile, before, chunk_start, chunksize, n_animals, chunk_rows=None):
+    """(frame, rows) of the last frame in [chunk_start, before) ending STABLE_FRAMES consecutive frames with every
+    fly identified and none jumping (stable_ends), or (None, None)."""
+    ends = stable_ends(dbfile, chunk_start, chunksize, n_animals, chunk_rows)
+    i = bisect.bisect_left(ends, before) - 1
+    if i < 0:
+        return None, None
+    fn = ends[i]
+    rows = chunk_rows.get(fn) if chunk_rows is not None else read_rows(dbfile, fn, fn).get(fn)
+    return fn, rows
 
 
 def _box_positions(boxes, rows):
@@ -283,7 +290,7 @@ def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, tran
     chunk_start = frame_number // chunksize * chunksize
     notches = notch_centres(dbfile)
     start = stretch_start(scenes, frame_number)
-    m_fn, m_rows = machine_anchor(dbfile, min(start, frame_number), chunk_start, n_animals)
+    m_fn, m_rows = machine_anchor(dbfile, min(start, frame_number), chunk_start, chunksize, n_animals)
     if saved_before is not None and (m_fn is None or saved_before[0] >= m_fn):
         s_fn, boxes, updated = saved_before
         key = (dbfile, "saved", s_fn, updated)
@@ -348,7 +355,7 @@ def classify_scenes(dbfile, scenes, chunksize, n_animals, progress=None):
         else:
             if chunk != chunk_start:
                 chunk, chunk_rows = chunk_start, read_rows(dbfile, chunk_start, chunk_start + chunksize - 1)
-            m_fn, m_rows = _machine_anchor(dbfile, first, chunk_start, n_animals, chunk_rows)
+            m_fn, m_rows = machine_anchor(dbfile, first, chunk_start, chunksize, n_animals, chunk_rows)
             if m_fn is None:
                 why = "no frame before it in the chunk with every fly identified"
         if why is None:
