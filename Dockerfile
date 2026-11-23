@@ -3,12 +3,13 @@
 # idtrackerai validator server: the default install (`pip install .`: Group viewer, Annotate,
 # Drive exchange and the analysis tabs that need nothing else), with rclone and ffmpeg.
 #
-# Build (flyhostel's submodules include private shaliulab repositories cloned over ssh: your ssh
-# agent is forwarded for that one step, no key or token ends up in the image):
+# Build (no GitHub account or ssh key needed: everything comes from public repositories):
 #
-#   eval $(ssh-agent) && ssh-add ~/.ssh/id_rsa      # unless an agent already holds the key
-#   DOCKER_BUILDKIT=1 docker build --ssh default \
-#       --build-arg VALIDATOR_COMMIT=$(git rev-parse --short HEAD) -t idtrackerai-validator .
+#   docker build --build-arg VALIDATOR_COMMIT=$(git rev-parse --short HEAD) -t idtrackerai-validator .
+#
+# The Windows install bundle (wheels + scripts/windows) from the same stages:
+#
+#   docker build --target windows-bundle --output dist/windows .
 #
 # Run: see docker-compose.yml and "Install with Docker" in the README.
 #
@@ -43,19 +44,60 @@ RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 RUN npm run build && test -f build/index.html
 
 # ---------------------------------------------------------------------------------------------
-# 2. The Python packages, in a virtualenv copied into the final image
+# 2. Wheelhouse: the lab's packages (not on PyPI) as wheels, at the commits setup.py pins
+# ---------------------------------------------------------------------------------------------
+# flyhostel, and of its submodules only those it installs (ethoscopy, idtrackerai, imgstore): all
+# public, fetched over https. `pip install .` clones every submodule recursively, private ones
+# included (hence its ssh key); none of those is installed. The wheels' direct references
+# (`flyhostel @ git+…`, `ethoscopy @ file:///…`) are rewritten to `name==version`
+# (scripts/wheelhouse.py), so `pip install --find-links wheels idtrackerai_validator_server` needs
+# neither git, ssh nor GitHub access: the Docker image below and the Windows install use them.
+FROM python:${PYTHON_VERSION}-slim-bookworm AS wheels
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/root/.cache/pip pip install --upgrade pip setuptools wheel
+COPY setup.py /tmp/setup.py
+ARG FLYHOSTEL_COMMIT=""
+WORKDIR /lab/flyhostel
+RUN commit="${FLYHOSTEL_COMMIT:-$(sed -n 's/^ *"flyhostel": "\([0-9a-f]\{40\}\)".*/\1/p' /tmp/setup.py)}" \
+    && imgstore="$(sed -n 's/^ *"flyhostel\/libraries\/imgstore": "\([0-9a-f]\{40\}\)".*/\1/p' /tmp/setup.py)" \
+    && test -n "$commit" && test -n "$imgstore" \
+    && git config --global url."https://github.com/".insteadOf "git@github.com:" \
+    && git init -q . \
+    && git fetch -q --depth 1 https://github.com/shaliulab/flyhostel.git "$commit" \
+    && git checkout -q FETCH_HEAD \
+    && git submodule update --init --depth 1 libraries/ethoscopy libraries/idtrackerai libraries/imgstore \
+    && test "$(git -C libraries/imgstore rev-parse HEAD)" = "$imgstore" \
+    || { echo "flyhostel's libraries/imgstore differs from setup.py's pin" >&2; exit 1; }
+WORKDIR /wheels
+# msgpack-python 0.5.6 (idtrackerai) is an sdist with a C extension: built pure Python (its own
+# fallback), so Windows needs no compiler.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip download --no-deps --no-binary :all: "msgpack-python==0.5.6" -d /tmp/msgpack \
+    && tar xzf /tmp/msgpack/msgpack-python-0.5.6.tar.gz -C /tmp/msgpack \
+    && sed -i "s/^if not hasattr(sys, 'pypy_version_info'):/if False:/" /tmp/msgpack/msgpack-python-0.5.6/setup.py \
+    && pip wheel --no-deps --no-build-isolation -w /wheels /tmp/msgpack/msgpack-python-0.5.6 \
+    && for pkg in /lab/flyhostel /lab/flyhostel/libraries/ethoscopy /lab/flyhostel/libraries/idtrackerai \
+                  /lab/flyhostel/libraries/imgstore; do \
+           pip wheel --no-deps -w /wheels "$pkg" || exit 1; done
+COPY . /src
+COPY --from=frontend /src/build /src/idtrackerai_validator_server/frontend
+COPY --from=frontend /CLIENT_COMMIT /src/idtrackerai_validator_server/frontend/CLIENT_COMMIT
+RUN pip wheel --no-deps -w /wheels /src \
+    && python /src/scripts/wheelhouse.py /wheels \
+    && ls -l /wheels && ! ls /wheels/*.whl | grep -v -e 'none-any.whl$'
+
+# ---------------------------------------------------------------------------------------------
+# Windows bundle (not part of the image): docker build --target windows-bundle --output dist/windows .
+# ---------------------------------------------------------------------------------------------
+FROM scratch AS windows-bundle
+COPY --from=wheels /wheels /wheels
+COPY scripts/windows/ /
+
+# ---------------------------------------------------------------------------------------------
+# 3. The Python packages, in a virtualenv copied into the final image
 # ---------------------------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git openssh-client build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-# GitHub's host key, checked against the fingerprint GitHub publishes
-# (https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints)
-RUN mkdir -p -m 0700 /root/.ssh \
-    && ssh-keyscan -t ed25519 github.com > /root/.ssh/known_hosts 2>/dev/null \
-    && ssh-keygen -lf /root/.ssh/known_hosts | grep -q 'SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU' \
-    || { echo "github.com host key does not match GitHub's published fingerprint" >&2; exit 1; }
-
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -67,23 +109,18 @@ ARG TORCHVISION_VERSION=0.28.0
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --index-url "$TORCH_INDEX" "torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}"
 
-WORKDIR /src
-COPY . .
-COPY --from=frontend /src/build idtrackerai_validator_server/frontend
-COPY --from=frontend /CLIENT_COMMIT idtrackerai_validator_server/frontend/CLIENT_COMMIT
-# flyhostel's submodules are cloned over ssh (the forwarded agent); GIT_SSH_COMMAND keeps the
-# known_hosts check strict. Not editable: the image holds only the installed packages.
 # idtrackerai requires opencv-python, flyhostel and this server the headless build: both unpack into
 # the same cv2/ folder. Keep only the headless one (same version, no libGL / X libraries needed).
-RUN --mount=type=ssh --mount=type=cache,target=/root/.cache/pip \
-    GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=yes" pip install . \
+RUN --mount=type=bind,from=wheels,source=/wheels,target=/wheels \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install --find-links /wheels idtrackerai_validator_server \
     && cv="$(pip show opencv-python-headless | sed -n 's/^Version: //p')" \
     && pip uninstall -y opencv-python opencv-python-headless \
     && pip install --no-deps "opencv-python-headless==${cv}" \
     && python -c "import cv2, flyhostel, idtrackerai, imgstore, idtrackerai_validator_server; print('cv2', cv2.__version__)"
 
 # ---------------------------------------------------------------------------------------------
-# 3. Runtime
+# 4. Runtime
 # ---------------------------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-bookworm
 

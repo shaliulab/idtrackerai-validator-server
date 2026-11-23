@@ -1,7 +1,7 @@
 # idtrackerai validator in Docker. See "Install with Docker" in the README.
 #
 #   export FLYHOSTEL_VIDEOS=/path/to/flyhostel_videos       # folder with index.txt and the experiments
-#   docker compose build                                    # needs an ssh agent holding your GitHub key
+#   docker compose build                                    # ~5 min, no GitHub account needed
 #   docker compose up -d                                    # then open http://localhost:5000
 #
 # Settings go in a .env file next to this one (docker compose reads it) or in the shell:
@@ -12,7 +12,6 @@ services:
     image: idtrackerai-validator:latest
     build:
       context: .
-      ssh: ["default"]                    # flyhostel's private submodules, cloned with your ssh agent
       args:
         UID: "${UID:-1000}"               # owner of what the server writes into the data folder
         GID: "${GID:-1000}"

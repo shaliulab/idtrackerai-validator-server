@@ -181,27 +181,24 @@ Then restart the server so it runs the new version (see "Stop and restart" under
 An alternative to the conda install above: one image with the server, the web
 interface, rclone and ffmpeg (the default install: Group viewer, Annotate, Drive
 exchange and the analysis tabs that need nothing else). You need Docker with BuildKit
-(Docker 23 or newer; on Windows and macOS, Docker Desktop) and, to build the image, an
-ssh key on GitHub with access to the shaliulab repositories.
+(Docker 23 or newer; on Windows and macOS, Docker Desktop). No GitHub account or ssh
+key is needed: the build fetches flyhostel and, of its submodules, only the public ones
+it installs (ethoscopy, idtrackerai, imgstore), at the commits `setup.py` pins.
 
 ## Build
-
-flyhostel's private submodules are cloned with your ssh agent, forwarded to that one
-build step (`--ssh default`): no key ends up in the image.
 
 ```
 git clone https://github.com/shaliulab/idtrackerai-validator-server
 cd idtrackerai-validator-server
-eval $(ssh-agent) && ssh-add ~/.ssh/id_rsa     # skip if `ssh-add -l` lists your key
-docker build --ssh default \
+docker build \
     --build-arg UID=$(id -u) --build-arg GID=$(id -g) \
     --build-arg VALIDATOR_COMMIT=$(git rev-parse --short HEAD) \
     -t idtrackerai-validator .
 ```
 
-The first build takes about 10 minutes and the image is about 3 GB (torch's CPU
-build is most of it). The image builds the web interface from the client commit
-`setup.py` pins; local checkouts of the submodules are not used.
+The build takes about 5 minutes and the image is 2.5 GB (torch's CPU build is
+0.7 GB of it). The image builds the web interface from the client commit `setup.py`
+pins; local checkouts of the submodules are not used.
 
 `UID` / `GID` are the user the server runs as: files it writes into your data folder
 (annotations, caches) belong to that user. Build arguments:
@@ -232,6 +229,8 @@ Open http://localhost:5000. Or, with `docker-compose.yml`:
 export FLYHOSTEL_VIDEOS=/path/to/flyhostel_videos
 docker compose up -d --build
 ```
+
+The image's stages also make the Windows install bundle (see "Install on Windows").
 
 | mount | holds |
 |---|---|
@@ -270,6 +269,30 @@ the Monitor tab (nextflow processes of the host), the PE video's browser engine
 tab's backup drives unless mounted. These are tabs for the lab's server; annotators
 need none of them. Each could be added later as an image of its own (or a larger
 variant of this one) if needed.
+
+# Install on Windows
+
+For annotators: a zip with an installer that needs no administrator rights, GitHub
+account, git or Node.js (the lab's packages and the web interface are inside it).
+
+Make the zip on a Linux computer with Docker (~2 minutes, nothing from GitHub but the
+public repositories):
+
+```
+scripts/make_windows_bundle.sh      # -> dist/idtrackerai-validator-windows-<version>-<commit>.zip
+```
+
+On Windows: unzip it, double click `install.bat` and answer where the experiments go.
+It installs, in `%LOCALAPPDATA%\idtrackerai-validator`, Miniforge, a conda environment
+with Python 3.10, rclone and ffmpeg, torch (CPU) and the validator (10–20 minutes,
+mostly downloads), and puts a "FlyHostel validator" shortcut on the desktop, which
+starts the server and opens http://localhost:5000. `rclone-config.bat` there sets up the
+Drive exchange remote (see "Drive exchange" above). Running a newer bundle's
+`install.bat` updates it and keeps the settings (`settings.json`: experiments folder,
+port, optionally `VALIDATOR_USERNAME` / `VALIDATOR_PASSWORD`). Logs are in its `logs\`.
+`scripts/windows/TESTING.md` is the step-by-step test.
+
+Docker Desktop (WSL2) runs the image of "Install with Docker" on Windows too.
 
 # Setup
 

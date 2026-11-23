@@ -8,3 +8,4 @@ build/
 *whl
 *tar.gz
 *pyc
+dist/
