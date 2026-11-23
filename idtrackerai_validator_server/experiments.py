@@ -8,11 +8,15 @@ Multi-arena recordings crop each arena into its own imgstore (with its own
 database) under arenas/N; see flyhostel.utils.experiment.
 """
 import logging
+import glob
 import os
+import posixpath
+import re
 import sqlite3
 import threading
 
 from idtrackerai_validator_server.compat import experiment_to_relpath, get_experiment_identifier
+from idtrackerai_validator_server.oscompat import to_posix
 
 # index.txt: databases of experiment folders (depth 4) and of their arenas (depth 6).
 # Other folders at depth 4 are pruned, so find does not walk the experiments' contents.
@@ -25,15 +29,40 @@ INDEX_COMMAND = [
 ]
 
 
+_INDEX_DEPTH4 = re.compile(r"\./[^/]+/[^/]+/[^/]+/(arenas/[0-9]+/)?[^/]+db")
+_INDEX_FLYHOSTEL = re.compile(r".*FlyHostel.*db")
+
+
+def index_lines(root):
+    """What INDEX_COMMAND lists, in Python (Windows has no GNU find): "./<relpath>" of the
+    non-empty databases of the experiment folders and of their arenas, links followed."""
+    lines = []
+    for pattern in (("*", "*", "*", "*db"), ("*", "*", "*", "arenas", "*", "*db")):
+        for path in glob.glob(os.path.join(root, *pattern)):
+            line = "./" + os.path.relpath(path, root).replace(os.sep, "/")
+            if (os.path.basename(path) == "index.db" or not _INDEX_DEPTH4.fullmatch(line)
+                    or not _INDEX_FLYHOSTEL.fullmatch(line)):
+                continue
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) > 0:
+                    lines.append(line)
+            except OSError:
+                pass
+    return sorted(lines)
+
+
 def to_relpath(experiment):
-    """Folder of the experiment relative to $FLYHOSTEL_VIDEOS (either form accepted)."""
+    """Folder of the experiment relative to $FLYHOSTEL_VIDEOS (either form accepted), with "/"
+    separators also on Windows."""
+    experiment = to_posix(experiment)
     if "/" in experiment:
-        return os.path.normpath(experiment.strip("/"))
-    return experiment_to_relpath(experiment)
+        return posixpath.normpath(experiment.strip("/"))
+    return to_posix(experiment_to_relpath(experiment))
 
 
 def to_flat(experiment):
     """Flat name of the experiment (either form accepted)."""
+    experiment = to_posix(experiment)
     if "/" not in experiment:
         return experiment
     return get_experiment_identifier(to_relpath(experiment))
@@ -41,7 +70,7 @@ def to_flat(experiment):
 
 def experiment_folder(relpath):
     """Top-level experiment folder (FlyHostel<N>/<X>X/<date>) of an experiment or arena."""
-    return os.path.join(*to_relpath(relpath).split(os.sep)[:3])
+    return "/".join(to_relpath(relpath).split("/")[:3])
 
 
 # A validated experiment: its database holds these tables (save-human-annotations writes them).

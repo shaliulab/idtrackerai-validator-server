@@ -75,6 +75,11 @@ def read_gpus():
     return gpus
 
 
+def _load():
+    """1, 5, 15 min load average (Windows has no os.getloadavg: psutil emulates it)."""
+    return os.getloadavg() if hasattr(os, "getloadavg") else psutil.getloadavg()
+
+
 def _sample():
     cores = psutil.cpu_percent(percpu=True)    # since the previous call
     times = psutil.cpu_times_percent()
@@ -86,7 +91,7 @@ def _sample():
         "cpu": {"percent": sum(cores) / len(cores) if cores else None, "cores": cores,
                 "iowait": getattr(times, "iowait", None),
                 "logical": psutil.cpu_count(), "physical": psutil.cpu_count(logical=False),
-                "load": os.getloadavg()},
+                "load": _load()},
         "memory": {"total": memory.total, "available": memory.available, "used": memory.total - memory.available,
                    "percent": memory.percent, "cache": getattr(memory, "cached", 0) + getattr(memory, "buffers", 0),
                    "swap_total": swap.total, "swap_used": swap.used},

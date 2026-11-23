@@ -44,6 +44,7 @@ from flask import jsonify, request
 from idtrackerai_validator_server import cvat
 from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.jobs import _jobs, start_job
+from idtrackerai_validator_server.oscompat import HAS_PROC, IS_WINDOWS, kill_tree, new_session
 from idtrackerai_validator_server.overview import ARENA_RE, PATH_RE
 
 logger = logging.getLogger(__name__)
@@ -109,19 +110,28 @@ def _write_record(validation, record):
 def _alive(pid, identifier):
     """Whether pid is still a main.sh of this experiment (pids get reused)."""
     try:
-        with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            cmdline = handle.read().split(b"\0")
-    except OSError:
+        if HAS_PROC:
+            with open(f"/proc/{pid}/cmdline", "rb") as handle:
+                cmdline = handle.read().decode(errors="replace").split("\0")
+        else:
+            import psutil
+            cmdline = psutil.Process(pid).cmdline()
+    except Exception:     # OSError, psutil.Error
         return False
-    return any(part.endswith(b"main.sh") for part in cmdline) and identifier.encode() in cmdline
+    return any(part.endswith("main.sh") for part in cmdline) and identifier in cmdline
 
 
 def _running_elsewhere(identifier):
     """pids of main.sh processes of the experiment, started by anyone (shell, nohup, this server)."""
     pids = []
-    for entry in os.listdir("/proc"):
-        if entry.isdigit() and _alive(int(entry), identifier):
-            pids.append(int(entry))
+    if HAS_PROC:
+        candidates = [int(entry) for entry in os.listdir("/proc") if entry.isdigit()]
+    else:
+        import psutil
+        candidates = psutil.pids()
+    for pid in candidates:
+        if _alive(pid, identifier):
+            pids.append(pid)
     return pids
 
 
@@ -133,9 +143,12 @@ def _free_gb(path):
 
 def _du_gb(path):
     try:
+        if IS_WINDOWS:     # no du
+            return sum(os.path.getsize(os.path.join(top, name)) for top, _, names in os.walk(path)
+                       for name in names) / 1e9
         out = subprocess.run(["du", "-sb", path], capture_output=True, text=True, timeout=120).stdout
         return int(out.split()[0]) / 1e9
-    except (subprocess.SubprocessError, ValueError, IndexError):
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
         return None
 
 
@@ -345,8 +358,8 @@ def _watch(identifier, validation, process):
             with _runs_lock:
                 _runs[identifier]["stopped"] = f"stopped: only {free:.0f} GB free on the disk (limit {MIN_FREE_GB} GB)"
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
+                kill_tree(process.pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
                 pass
         try:
             process.wait(timeout=WATCH_EVERY)
@@ -365,6 +378,8 @@ def _watch(identifier, validation, process):
 
 def start(experiment, checks, facts, force):
     relpath, identifier, folder, validation = _paths(experiment)
+    if IS_WINDOWS:
+        raise RuntimeError("main.sh (vsc-scripts' validation pipeline) is a bash script: it runs on Linux only")
     if _running_elsewhere(identifier):
         raise RuntimeError("main.sh is already running for this experiment")
     os.makedirs(validation, exist_ok=True)
@@ -380,7 +395,7 @@ def start(experiment, checks, facts, force):
         handle.write(f"# started from the validator server {time.strftime('%Y-%m-%d %H:%M:%S')}: {' '.join(command)}\n".encode())
         handle.flush()
         process = subprocess.Popen(command, cwd=SCRIPTS, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+                                   stdout=handle, stderr=subprocess.STDOUT, **new_session())
     record = {
         "experiment": relpath, "identifier": identifier, "pid": process.pid, "command": command,
         "log": log, "started": time.time(), "forced": bool(force),

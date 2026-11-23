@@ -44,6 +44,7 @@ from flask import jsonify, request
 from idtrackerai_validator_server import dropbox
 from idtrackerai_validator_server import data_management as dm
 from idtrackerai_validator_server.jobs import start_job
+from idtrackerai_validator_server.oscompat import posix_relpath
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ def deg_annotations(base=DEG_PROJECTS):
     """experiment (slash form) -> {"videos", "labelled", "projects"} over every DEG project."""
     result = {}
     for data in sorted(glob.glob(os.path.join(base, "DEG*", "*", "DATA"))):
-        project = os.path.relpath(os.path.dirname(data), base)
+        project = posix_relpath(os.path.dirname(data), base)
         for entry in os.scandir(data):
             match = DEG_VIDEO_RE.match(entry.name)
             if not match or not entry.is_dir():

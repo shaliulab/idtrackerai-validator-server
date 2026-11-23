@@ -26,7 +26,6 @@ in an arena folder (arenas/K) that is K.conf, a copy of <date>.conf (`sync_arena
 when <date>.toml is saved and before each run).
 """
 import datetime
-import fcntl
 import filecmp
 import glob
 import io
@@ -58,9 +57,11 @@ except ImportError:  # python < 3.11
     import tomli as tomllib
 
 from idtrackerai_validator_server import gpu_queue, rois
+from idtrackerai_validator_server.oscompat import kill_tree, lock, new_session, posix_relpath, unlock
 from idtrackerai_validator_server.experiments import is_validated
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.overview import sheet_files
+
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,7 @@ def local_experiments(root, date=None):
     """Experiment folders here (slash form), of `date` (YYYY-MM-DD) only when given: recordings
     that are no longer (or never were) on cv2 can still get settings."""
     pattern = os.path.join(root, "FlyHostel*", "*X", f"{date}_*" if date else "*")
-    return sorted(e for e in (os.path.relpath(p, root) for p in glob.glob(pattern) if os.path.isdir(p))
+    return sorted(e for e in (posix_relpath(p, root) for p in glob.glob(pattern) if os.path.isdir(p))
                   if EXPERIMENT_RE.match(e))
 
 
@@ -439,7 +440,7 @@ class _Schedule:
     def __enter__(self):
         os.makedirs(os.path.dirname(SCHEDULE_FILE), exist_ok=True)
         self._lock = open(SCHEDULE_FILE + ".lock", "a")
-        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        lock(self._lock)
         try:
             with open(SCHEDULE_FILE) as handle:
                 self.state = json.load(handle)
@@ -459,7 +460,7 @@ class _Schedule:
                     json.dump(self.state, handle, indent=1)
                 os.replace(tmp, SCHEDULE_FILE)
         finally:
-            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            unlock(self._lock)
             self._lock.close()
 
 
@@ -537,7 +538,7 @@ def start_fetch_scheduler(root):
     os.makedirs(os.path.dirname(SCHEDULE_FILE), exist_ok=True)
     handle = open(SCHEDULE_FILE + ".scheduler", "a")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock(handle, blocking=False)
     except OSError:
         handle.close()
         logger.info("data_collector: another server instance runs the fetch schedule")
@@ -994,7 +995,7 @@ def start_preprocess(folder, start_chunk, end_chunk, samples_per_chunk):
         log.flush()
         # own session: keeps running when the server restarts
         process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, env=dict(os.environ, PYTHONUNBUFFERED="1"))
+                                   env=dict(os.environ, PYTHONUNBUFFERED="1"), **new_session())
     return process.pid
 
 
@@ -1132,7 +1133,7 @@ def _relative(root, path):
             prefixes.append((os.path.realpath(os.path.join(root, name)), name))
     for prefix, name in sorted(prefixes, key=lambda p: -len(p[0])):
         if real == prefix or real.startswith(prefix + os.sep):
-            rel = os.path.join(name, os.path.relpath(real, prefix)).strip("/")
+            rel = "/".join([name, posix_relpath(real, prefix)]).strip("/")
             return rel if LOCAL_RE.match(rel) else None
     return None
 
@@ -1640,7 +1641,7 @@ def register_data_collector(app):
         if process is None:
             return jsonify({"error": "preprocess-sample is not running on this experiment"}), 409
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            kill_tree(process.pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             process.terminate()
         return jsonify({"stopped": process.pid})
@@ -1718,7 +1719,7 @@ def register_data_collector(app):
         if process is None:
             return jsonify({"error": "imgstore-crop-arenas is not running on this recording"}), 409
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            kill_tree(process.pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             process.terminate()
         return jsonify({"stopped": process.pid})

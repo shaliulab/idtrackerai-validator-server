@@ -42,12 +42,13 @@ import logging
 import datetime
 import threading
 
-import fcntl
 import signal
 
+import psutil
 from flask import jsonify, request
 
 from idtrackerai_validator_server.experiments import to_flat
+from idtrackerai_validator_server.oscompat import HAS_PROC, IS_WINDOWS, lock, unlock
 
 logger = logging.getLogger(__name__)
 
@@ -153,15 +154,14 @@ def nextflow_runs(folder):
     """nextflow processes running in this folder: pid, started, args."""
     runs = []
     real = os.path.realpath(folder)
-    for pid in os.listdir("/proc"):
+    for pid in _pids():
         if not pid.isdigit():
             continue
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                argv = fh.read().decode(errors="replace").split("\0")
-            if "nextflow.cli.Launcher" not in argv or os.path.realpath(f"/proc/{pid}/cwd") != real:
+            argv = _cmdline(pid)
+            if "nextflow.cli.Launcher" not in argv or os.path.realpath(_cwd(pid)) != real:
                 continue
-            started = os.stat(f"/proc/{pid}").st_mtime
+            started = _started(pid)
         except (OSError, ValueError):
             continue
         args = argv[argv.index("nextflow.cli.Launcher") + 1:]
@@ -173,7 +173,58 @@ def nextflow_runs(folder):
     return runs
 
 
+def _pids():
+    """pids of every process (/proc, else psutil: Windows, macOS)."""
+    if HAS_PROC:
+        return [pid for pid in os.listdir("/proc") if pid.isdigit()]
+    return [str(pid) for pid in psutil.pids()]
+
+
+def _cmdline(pid):
+    """argv of a process; OSError when it cannot be read."""
+    if HAS_PROC:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return fh.read().decode(errors="replace").split("\0")
+    try:
+        return psutil.Process(int(pid)).cmdline()
+    except psutil.Error as error:
+        raise OSError(str(error))
+
+
+def _cwd(pid):
+    if HAS_PROC:
+        return f"/proc/{pid}/cwd"
+    try:
+        return psutil.Process(int(pid)).cwd()
+    except psutil.Error as error:
+        raise OSError(str(error))
+
+
+def _started(pid):
+    if HAS_PROC:
+        return os.stat(f"/proc/{pid}").st_mtime
+    try:
+        return psutil.Process(int(pid)).create_time()
+    except psutil.Error as error:
+        raise OSError(str(error))
+
+
+def _ppid(pid):
+    if HAS_PROC:
+        with open(f"/proc/{pid}/stat") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    try:
+        return psutil.Process(int(pid)).ppid()
+    except psutil.Error as error:
+        raise OSError(str(error))
+
+
 def _process_start(pid):
+    if not HAS_PROC:
+        try:
+            return _started(pid)
+        except OSError:
+            return None
     try:
         with open(f"/proc/{pid}/stat") as fh:
             ticks = int(fh.read().rsplit(")", 1)[1].split()[19])
@@ -231,13 +282,10 @@ def queue_runner(folder):
         return None
     real = os.path.realpath(folder)
     pids = []
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
+    for pid in _pids():
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                argv = fh.read().decode(errors="replace").split("\0")
-            if not any(a.endswith("run_queue.sh") for a in argv[:2]) or os.path.realpath(f"/proc/{pid}/cwd") != real:
+            argv = _cmdline(pid)
+            if not any(a.endswith("run_queue.sh") for a in argv[:2]) or os.path.realpath(_cwd(pid)) != real:
                 continue
         except OSError:
             continue
@@ -256,16 +304,14 @@ def queue_runner(folder):
 
 def _queue_sleep(runner_pids):
     """The `sleep N` run_queue.sh polls with (a child of one of runner_pids): pid and when it ends."""
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
+    if not runner_pids:
+        return None
+    for pid in _pids():
         try:
-            with open(f"/proc/{pid}/stat") as fh:
-                ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+            ppid = _ppid(pid)
             if ppid not in runner_pids:
                 continue
-            with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                argv = [a for a in fh.read().decode(errors="replace").split("\0") if a]
+            argv = [a for a in _cmdline(pid) if a]
         except (OSError, ValueError, IndexError):
             continue
         if len(argv) == 2 and os.path.basename(argv[0]) == "sleep" and argv[1].isdigit():
@@ -649,8 +695,9 @@ def requeue_rows(spec, wanted):
     m, e = spec["mark"], spec["experiment"]
     i = spec["identity"]
     changed = []
-    with open(path, "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    # Windows locks are mandatory: a lock on the CSV would stop it being rewritten below
+    with open(path + ".lock" if IS_WINDOWS else path, "a") as handle:
+        lock(handle)
         try:
             with open(path, newline="", errors="replace") as fh:
                 lines = fh.read().split("\n")
@@ -672,7 +719,7 @@ def requeue_rows(spec, wanted):
                 with open(path, "w", newline="") as fh:    # in place, as run_queue.sh (cat tmp > csv)
                     fh.write("\n".join(lines))
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            unlock(handle)
     return changed
 
 
