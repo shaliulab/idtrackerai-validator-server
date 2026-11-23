@@ -67,6 +67,7 @@ from idtrackerai_validator_server.data_management import register_data_managemen
 from idtrackerai_validator_server.restore import register_restore
 from idtrackerai_validator_server.dropbox_files import register_dropbox_files
 from idtrackerai_validator_server.qc import register_qc
+from idtrackerai_validator_server.swaps import register_swaps
 from idtrackerai_validator_server.monitor import register_monitor
 from idtrackerai_validator_server.resources import register_resources
 from idtrackerai_validator_server.gpu_queue import register_gpu_queue
@@ -205,6 +206,16 @@ def _qc_state():
 
 
 register_qc(app, get_state=_qc_state)
+
+
+def _swaps_state():
+    if db_manager is None:
+        return None
+    return {"experiment": SELECTED_EXPERIMENT, "dbfile": db_manager.dbfile, "use_val": bool(db_manager.use_val),
+            "n_animals": int(NUMBER_OF_ANIMALS), "chunksize": int(CHUNKSIZE), "framerate": float(FRAMERATE)}
+
+
+register_swaps(app, get_state=_swaps_state)
 
 
 def _fly_centroid(frame_number, identity):

@@ -474,6 +474,17 @@ ssh -L 5000:localhost:5000 remote-host
 Open http://localhost:5000 locally. Only one port needs forwarding — the API and
 the interface share it.
 
+# Checking identity swaps
+
+The QC tab has an *Identity swaps* section: it lists the frames where a fly's identity
+may have jumped onto another fly's track — two flies exchanging places, or an identity
+landing where another fly just was — on the machine tracking (`ROI_0` + `IDENTITY`) or
+on the validated tables (`ROI_0_VAL` + `IDENTITY_VAL`). Press *Check swaps* (a background
+job, a few minutes for a long recording), sort the events by score, and open each one in
+the Group viewer or the Annotate tab. Nothing is changed in the database: such jumps can
+be real. Thresholds are in fly body lengths (*Thresholds*), and *CSV* exports the list.
+How the check works and how it was measured: `idtrackerai_validator_server/swaps.py`.
+
 # Development
 
 Working on the client with hot reload, instead of rebuilding each time:
@@ -486,6 +497,12 @@ npm start
 This starts the Vite dev server on port 3000 and proxies API calls to the backend
 on port 5000 (`REACT_APP_BACKEND_PORT` to change it), so run the Python server alongside it. Forward both ports if you
 are working remotely.
+
+Tests of the swap detector (synthetic tracks, no data needed):
+
+```
+python -m unittest tests.test_swaps
+```
 
 The compiled interface in `idtrackerai_validator_server/frontend/` is a build
 artifact and is not tracked by git. To produce distributable artifacts:
