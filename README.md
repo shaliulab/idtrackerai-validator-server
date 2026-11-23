@@ -9,8 +9,9 @@ so no separate frontend server is needed.
 
 # How to install in Linux
 
-Tested on Python 3.10. Building the web interface needs Node.js and npm: install
-them from your package manager or from https://nodejs.org if `npm --version` fails.
+Tested on Python 3.10. You need git, and Node.js with npm to build the web interface
+(install them from your package manager or from https://nodejs.org if `npm --version`
+fails).
 
 ## Download
 
@@ -21,25 +22,8 @@ git clone https://github.com/shaliulab/idtrackerai-validator-server
 cd idtrackerai-validator-server
 ```
 
-## Get the submodules
-
-The web interface (`idtrackerai-validator-client`) and `flyhostel` are git
-submodules, and `flyhostel` has submodules of its own. Some of these use ssh URLs
-(`git@github.com:…`), and some are private lab repositories.
-
-**With access to the shaliulab repositories and an ssh key on GitHub** (lab members):
-
-```
-git submodule update --init --recursive
-```
-
-**Without them**, fetch only the public submodules the validator needs, over https:
-
-```
-git config --global url."https://github.com/".insteadOf "git@github.com:"
-git submodule update --init idtrackerai-validator-client flyhostel
-git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
-```
+No `git submodule update` is needed: `pip install` fetches what it needs at the
+commits this version pins.
 
 ## Make a conda/mamba environment
 
@@ -56,38 +40,48 @@ the server (the prompt then starts with `(validator)`):
 conda activate validator
 ```
 
-## Build the web interface and install
+## Install
+
+**Annotating only** (the Group viewer, Annotate and Drive exchange tabs; see
+"Install for annotating only" below):
 
 ```
-conda activate validator
-cd $HOME/opt/idtrackerai-validator-server
-./build_frontend.sh
+pip install .
+```
+
+**Everything the lab uses** (also flyhostel, idtrackerai and imgstore for the analysis tabs):
+
+```
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install ".[full]"
 ```
 
-`build_frontend.sh` compiles the React client in `idtrackerai-validator-client/`
-and copies it into `idtrackerai_validator_server/frontend/`, where the server
-looks for it. It runs `git submodule update --init --recursive` first, so without
-access to the private submodules it stops there. In that case build the interface
-during the install instead:
+What `pip install` does on its own:
 
-```
-rm -rf idtrackerai_validator_server/frontend
-pip install ".[full]"
-```
+- the web interface: when `idtrackerai_validator_server/frontend/` has none, it is
+  built with npm from the `idtrackerai-validator-client` submodule, or, when the
+  submodule is not checked out, from a clone of its pinned commit (kept in `build/`).
+  With one already there it installs that one as it is, unless pip built it from an
+  older pinned commit (then it is rebuilt).
+- `[full]`: flyhostel (with ethoscopy and idtrackerai from its own submodules) and
+  imgstore at the commits the submodules point at, fetched from GitHub. When the
+  `flyhostel` submodule is checked out, these are installed from it instead, local
+  changes included.
 
-`pip install` builds the interface only when `idtrackerai_validator_server/frontend/`
-has none; with one already there it installs that one as it is.
+flyhostel is fetched with git together with its submodules, which use ssh URLs
+(`git@github.com:…`) and include private lab repositories: `[full]` needs an ssh key on
+GitHub with access to the shaliulab repositories. Without it, use the annotator
+install.
 
 idtrackerai needs torch and torchvision at runtime. The first `pip install` gets
 the CPU builds, which are enough to serve the app. Skip it if your environment
 already has torch, for example a CUDA build.
 
-`[full]` installs everything the lab uses (flyhostel, idtrackerai and imgstore from the
-submodules). Use `pip install -e ".[full]"` instead of `pip install ".[full]"` if you intend to edit the Python
-code. An editable install does **not** build the client, so `./build_frontend.sh`
-is still required.
+Use `pip install -e ".[full]"` instead of `pip install ".[full]"` if you intend to
+edit the Python code. To work on the interface, check out its submodule
+(`git submodule update --init idtrackerai-validator-client`) and rebuild it with
+`./build_frontend.sh` (which runs `git submodule update --init --recursive`
+first).
 
 ## Install for annotating only
 
@@ -98,9 +92,10 @@ Group viewer, Annotate and Drive exchange tabs and grays out the others.
 ```
 git clone https://github.com/shaliulab/idtrackerai-validator-server
 cd idtrackerai-validator-server
-git submodule update --init idtrackerai-validator-client
-pip install ".[annotator]"
+pip install .
 ```
+
+(`pip install ".[annotator]"`, the former command, still works and installs the same.)
 
 The publisher shares the Google Drive exchange folder with your Google account as
 **Editor** and sends you its link, `https://drive.google.com/drive/folders/<FOLDER_ID>`.
@@ -150,41 +145,26 @@ MB instead of the whole recording). The tab's
 ## Install a specific version
 
 Releases are tagged (see https://github.com/shaliulab/idtrackerai-validator-server/releases).
-To install one, check out its tag before getting the submodules:
+To install one, check out its tag and install as above:
 
 ```
 git checkout v1.2.4
+pip install ".[full]"
 ```
-
-and then follow the steps above from "Get the submodules".
 
 ## Update
 
-Get the new code **before** building the interface again: otherwise the old
-interface is rebuilt and installed.
-
-With access to the lab repositories:
-
 ```
 conda activate validator
 cd $HOME/opt/idtrackerai-validator-server
 git pull
-git submodule update --init --recursive
-./build_frontend.sh
-pip install ".[full]"
+pip install ".[full]"      # or: pip install .  (annotating only)
 ```
 
-Without them:
-
-```
-conda activate validator
-cd $HOME/opt/idtrackerai-validator-server
-git pull
-git submodule update --init idtrackerai-validator-client flyhostel
-git -C flyhostel submodule update --init libraries/ethoscopy libraries/idtrackerai libraries/imgstore
-rm -rf idtrackerai_validator_server/frontend
-pip install ".[full]"
-```
+If you checked out the submodules, update them too (`git submodule update --init
+--recursive`, then `./build_frontend.sh`): `pip install` installs from a checked-out
+submodule rather than the pinned commit, and keeps an interface built by
+`build_frontend.sh` as it is.
 
 To go to a specific version instead of the latest, replace `git pull` with
 `git fetch --tags` followed by `git checkout v1.2.4` (the version you want).

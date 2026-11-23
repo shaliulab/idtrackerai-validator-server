@@ -78,9 +78,11 @@ npm run build   # -> build/ (static/js/main.<hash>.js, as the server and CI expe
 ## Installation
 
 ```bash
-pip install -e ".[full]"        # the lab: every tab (flyhostel + imgstore from the submodule, idtrackerai through flyhostel)
-pip install ".[annotator]"      # an annotator: Annotate, Group viewer, Drive exchange (adds opencv-python-headless, matplotlib)
+pip install -e ".[full]"        # the lab: every tab (flyhostel + imgstore from the submodules, idtrackerai through flyhostel)
+pip install .                   # an annotator: Annotate, Group viewer, Drive exchange (".[annotator]" is the same, kept as an alias)
 ```
+
+No submodule checkout is needed (`setup.py`): `PINS` holds the commits the submodules point at (the gitlink is used when readable, with a warning when it differs: bump `PINS` with the submodule). `BuildWithFrontend` builds the client with npm when `frontend/` has no `index.html`, from the submodule or, without it, a clone of the pinned commit in `build/idtrackerai-validator-client-<sha>`; a frontend built from such a clone gets `frontend/CLIENT_COMMIT` and is rebuilt when the pin changes. `[full]`'s `dependency()` uses the checked-out submodule when there is one, else `flyhostel @ git+https://…@<pin>` (pip clones its submodules recursively: ssh URLs, private repositories; an archive does not build, flyhostel's setup.py then has `extras_require` `[None]`) and `imgstore-shaliulab @ https://github.com/shaliulab/imgstore/archive/<pin>.tar.gz` (its tests/data submodule is private).
 
 The `idtrackerai` and `flyhostel` packages are not published to PyPI (installed from source). The core does not need them (`compat.py`): `app.py` registers the modules that import flyhostel only when it imports (`_optional` / `_register`; what was left out: `compat.MISSING`, `GET /api/features`, and the client grays those tabs out), frames are read with `lite_store.py` without imgstore, and there are no contours without idtrackerai. New top-level imports of flyhostel / idtrackerai / imgstore in a core module break the annotator install: go through `compat.py` or `_optional`.
 
