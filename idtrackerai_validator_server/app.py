@@ -525,9 +525,9 @@ def load():
         contours = []
         with _contours_lock:
             _contours_cache.clear()
-        with lock:
-            _frame_cache.clear()
-            globals()["_frame_cache_bytes"] = 0
+        # `lock` is held since above (a plain Lock: taking it again here hung every load)
+        _frame_cache.clear()
+        globals()["_frame_cache_bytes"] = 0
         _sleep_cache.clear()
         clear_blobs_cache()
         close_h5_files()
@@ -577,10 +577,11 @@ def get_frame_range():
         try:
             # tables["IDENTITY"] is already IDENTITY_VAL or IDENTITY,
             # depending on db_manager.use_val — so this respects app.py's choice.
-            min_frame, max_frame = db.session.query(
-                func.min(tables["IDENTITY"].frame_number),
-                func.max(tables["IDENTITY"].frame_number),
-            ).one()
+            # Two queries: sqlite reads MIN or MAX alone from the end of the frame_number index,
+            # both in one query scan all of it (49M rows on FlyHostel1_16X: 29 s from the HDD)
+            column = tables["IDENTITY"].frame_number
+            min_frame = db.session.query(func.min(column)).scalar()
+            max_frame = db.session.query(func.max(column)).scalar()
         except Exception as error:
             logger.error("Error computing frame range: %s", error)
             min_frame, max_frame = None, None
