@@ -28,6 +28,7 @@ import hashlib
 import argparse
 import subprocess
 from collections import defaultdict
+from idtrackerai_validator_server.oscompat import posix_relpath
 
 REMOTE = os.environ.get("DROPBOX_REMOTE", "dropbox:/Data/flyhostel_data/videos").rstrip("/")
 RCLONE = os.environ.get("RCLONE", "rclone")
@@ -85,11 +86,11 @@ def to_relpath(path, root=None):
     root = os.path.abspath(root or os.environ["FLYHOSTEL_VIDEOS"])
     path = os.path.abspath(path)
     if path.startswith(root + os.sep):
-        return os.path.relpath(path, root)
+        return posix_relpath(path, root)
     for name in os.listdir(root):
         target = os.path.realpath(os.path.join(root, name))
         if os.path.isdir(target) and path.startswith(target + os.sep):
-            return os.path.join(name, os.path.relpath(path, target))
+            return name + "/" + posix_relpath(path, target)
     raise ValueError(f"{path} is not in {root}")
 
 

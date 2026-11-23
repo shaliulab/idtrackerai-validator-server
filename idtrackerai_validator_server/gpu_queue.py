@@ -31,7 +31,6 @@ A kind is registered with register_kind(name, label, memory_mb, launch, ...):
         the chunks being encoded finish, no new one starts). job is a queue entry or an external
         job. A paused job (nothing of it running any more) reserves no GPU memory.
 """
-import fcntl
 import json
 import logging
 import os
@@ -45,6 +44,7 @@ import uuid
 import psutil
 from flask import jsonify, request
 
+from idtrackerai_validator_server.oscompat import kill_tree, lock, new_session, unlock, with_exit_code
 from idtrackerai_validator_server.resources import read_gpus
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ class _State:
     def __enter__(self):
         os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
         self._lock = open(QUEUE_FILE + ".lock", "a")
-        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        lock(self._lock)
         try:
             with open(QUEUE_FILE) as handle:
                 self.state = json.load(handle)
@@ -104,7 +104,7 @@ class _State:
                     json.dump(self.state, handle, indent=1)
                 os.replace(tmp, QUEUE_FILE)
         finally:
-            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            unlock(self._lock)
             self._lock.close()
 
 
@@ -116,14 +116,15 @@ def read_state():
 # ---- processes ----
 
 def spawn(cmd, cwd, log_path, env=None, header=None):
-    """cmd in its own session under sh -c, output to log_path, "[exit code N]" appended."""
+    """cmd in its own session under sh -c (a python wrapper on Windows), output to log_path,
+    "[exit code N]" appended."""
     line = " ".join(shlex.quote(part) for part in cmd)
     with open(log_path, "w") as log:
         log.write((header or f"$ cd {shlex.quote(cwd)} && {line}") + "\n")
         log.flush()
-        process = subprocess.Popen(["sh", "-c", f'{line}; rc=$?; echo; echo "[exit code $rc]"'], cwd=cwd,
+        process = subprocess.Popen(with_exit_code(cmd), cwd=cwd,
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                   start_new_session=True, env=env)
+                                   env=env, **new_session())
     return process.pid
 
 
@@ -163,7 +164,7 @@ def exit_code(log_path):
 
 def stop_pid(pid):
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        kill_tree(pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
         try:
             psutil.Process(pid).terminate()
@@ -376,7 +377,7 @@ def start():
     os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
     handle = open(QUEUE_FILE + ".scheduler", "a")
     try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock(handle, blocking=False)
     except OSError:
         handle.close()
         logger.info("gpu_queue: another server instance schedules the GPU queue")

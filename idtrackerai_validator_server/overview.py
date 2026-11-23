@@ -57,7 +57,8 @@ import pandas as pd
 from flask import jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
-from idtrackerai_validator_server.experiments import INDEX_COMMAND, VALIDATED_TABLES
+from idtrackerai_validator_server.experiments import INDEX_COMMAND, VALIDATED_TABLES, index_lines
+from idtrackerai_validator_server.oscompat import IS_WINDOWS, posix_relpath
 from idtrackerai_validator_server.compat import normalize_arena
 
 logger = logging.getLogger(__name__)
@@ -254,7 +255,7 @@ def _sheet_experiment(root, basedir, arena):
     folders = sorted(glob.glob(os.path.join(root, hostel, "*X", f"{date}_{time}", "arenas", str(arena))))
     if len(folders) != 1:
         return None
-    return os.path.relpath(folders[0], root)
+    return posix_relpath(folders[0], root)
 
 
 def scan_not_analyzed(root, known):
@@ -311,12 +312,17 @@ def sheet_flies(root, experiment):
 def rebuild_index(root):
     """Rewrite index.txt; returns the number of databases listed. The old file is only
     replaced once find has produced a list."""
-    result = subprocess.run(INDEX_COMMAND, cwd=root, capture_output=True, text=True, timeout=600)
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if not lines:
-        raise RuntimeError(f"find listed no database (exit {result.returncode}): {result.stderr.strip()[:500]}")
-    if result.returncode != 0:      # e.g. a broken link or an unreadable folder: keep what was found
-        logger.warning("find exited with %s: %s", result.returncode, result.stderr.strip()[:2000])
+    if IS_WINDOWS:      # no GNU find
+        lines = index_lines(root)
+        if not lines:
+            raise RuntimeError(f"no database found under {root}")
+    else:
+        result = subprocess.run(INDEX_COMMAND, cwd=root, capture_output=True, text=True, timeout=600)
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeError(f"find listed no database (exit {result.returncode}): {result.stderr.strip()[:500]}")
+        if result.returncode != 0:      # e.g. a broken link or an unreadable folder: keep what was found
+            logger.warning("find exited with %s: %s", result.returncode, result.stderr.strip()[:2000])
     tmp = os.path.join(root, "index.txt.tmp")
     with open(tmp, "w") as handle:
         handle.write("\n".join(lines) + "\n")

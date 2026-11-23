@@ -57,6 +57,7 @@ from idtrackerai_validator_server import box_annotations as boxes_mod
 from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.jobs import start_job, _jobs
 from idtrackerai_validator_server.restore import _rclone_copy, _add_to_index
+from idtrackerai_validator_server.oscompat import posix_relpath
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,7 @@ def _folder_files(basedir):
             dirs[:] = [d for d in dirs if d != ".downloading" and not (d == "arenas" and "arenas/**" in patterns)]
         for name in files:
             path = os.path.join(top, name)
-            rel = os.path.relpath(path, basedir)
+            rel = posix_relpath(path, basedir)
             if any(fnmatch.fnmatch(rel, pattern) for pattern in patterns):
                 continue
             try:
@@ -259,7 +260,7 @@ def _tree_files(folder):
     for top, _, files in os.walk(folder):
         for name in files:
             path = os.path.join(top, name)
-            out[os.path.relpath(path, folder)] = os.path.getsize(path)
+            out[posix_relpath(path, folder)] = os.path.getsize(path)
     return out
 
 

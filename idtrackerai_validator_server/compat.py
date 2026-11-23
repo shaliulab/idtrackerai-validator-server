@@ -75,9 +75,9 @@ else:
         """FlyHostel1_6X_<date>_<time> -> FlyHostel1/6X/<date>_<time> (arenas: .../arenas/<n>)"""
         experiment, arena = split_arena(experiment)
         tokens = experiment.split("_")
-        relpath = os.path.join(tokens[0], tokens[1], "_".join(tokens[2:4]))
+        relpath = "/".join([tokens[0], tokens[1], "_".join(tokens[2:4])])
         if arena is not None:
-            relpath = os.path.join(relpath, ARENAS_FOLDER, str(arena))
+            relpath = "/".join([relpath, ARENAS_FOLDER, str(arena)])
         return relpath
 
     def get_experiment_identifier(basedir):

@@ -62,6 +62,7 @@ from flask import jsonify, request, session
 from idtrackerai_validator_server import continuity, links
 from idtrackerai_validator_server.compat import get_number_of_animals
 from idtrackerai_validator_server.experiments import is_validated, to_flat
+from idtrackerai_validator_server.oscompat import SIGKILL, env_executable, env_path, kill_tree, new_session, posix_relpath
 from idtrackerai_validator_server.jobs import _jobs, start_job
 from idtrackerai_validator_server.exchange_bundle import bundle_info, read_bundle_scenes
 
@@ -786,7 +787,7 @@ def validation_queue(root, me):
             n_animals = get_number_of_animals(experiment)
         except Exception:     # unreadable conf: still listed
             n_animals = None
-        item = {"experiment": experiment, "relpath": os.path.relpath(basedir, root), "n_animals": n_animals,
+        item = {"experiment": experiment, "relpath": posix_relpath(basedir, root), "n_animals": n_animals,
                 "date": (m.group(1) if (m := re.search(r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})", experiment)) else None),
                 "db_mtime": stat.st_mtime, "hidden": experiment in hidden, "unreadable": validated is None}
         # Drive exchange of this copy (flyhostel/validation/exchange.json): published from here, or downloaded
@@ -1475,7 +1476,7 @@ def register_box_annotations(app, get_state):
         running = _jobs.get(str(_preparing.get(experiment)))
         if running is not None and running.status == "running":
             return jsonify({"error": "the scenes of this experiment are being prepared", "job": running.to_dict()}), 409
-        executables = [os.path.join(VALIDATION_ENV, "bin", name) for name in ("make-identogram", "auto-annotate-qc")]
+        executables = [env_executable(VALIDATION_ENV, name) for name in ("make-identogram", "auto-annotate-qc")]
         missing = [e for e in executables if not os.path.exists(e)]
         if missing:
             return jsonify({"error": f"{missing[0]} not found (FLYHOSTEL_VALIDATION_ENV)"}), 500
@@ -1494,7 +1495,7 @@ def register_box_annotations(app, get_state):
             os.makedirs(os.path.join(folder, "logs"), exist_ok=True)
             with open(os.path.join(folder, "validation_version.txt"), "w") as handle:
                 handle.write(PREPARE_VERSION + "\n")
-            env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""))
+            env = dict(os.environ, PATH=env_path(VALIDATION_ENV))
             tails = []
             # make-identogram --cache reads <flat>_tracking_data.feather whenever it exists, whatever the database: an
             # export older than the database (tracked again since) would give the scenes of the old tracking
@@ -1548,7 +1549,7 @@ def register_box_annotations(app, get_state):
         running = _jobs.get(str(_integrating.get(experiment)))
         if running is not None and running.status == "running":
             return jsonify({"error": "an integration of this experiment is running", "job": running.to_dict()}), 409
-        executable = os.path.join(VALIDATION_ENV, "bin", "integrate-human-annotations" if mode == "integrate" else "save-human-annotations")
+        executable = env_executable(VALIDATION_ENV, "integrate-human-annotations" if mode == "integrate" else "save-human-annotations")
         if not os.path.exists(executable):
             return jsonify({"error": f"{executable} not found (FLYHOSTEL_VALIDATION_ENV)"}), 500
         folder = _validation_folder(state["basedir"])
@@ -1579,12 +1580,12 @@ def register_box_annotations(app, get_state):
 
         def work(job):
             job.update(0, status="running")
-            env = dict(os.environ, PATH=os.path.join(VALIDATION_ENV, "bin") + os.pathsep + os.environ.get("PATH", ""),
+            env = dict(os.environ, PATH=env_path(VALIDATION_ENV),
                        VALIDATOR_PUBLIC_URL=public_url)
             lines = []
             # own session: Stop kills its worker processes too
             process = subprocess.Popen(command, cwd=folder, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       text=True, bufsize=1, start_new_session=True)
+                                       text=True, bufsize=1, **new_session())
             _integration_procs[experiment] = process
             for line in process.stdout:
                 lines.append(line.rstrip("\n"))
@@ -1623,16 +1624,16 @@ def register_box_annotations(app, get_state):
             return jsonify({"error": "no integration of this experiment is running"}), 409
         _stopped.add(job.id)
         try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+            kill_tree(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
             pass
 
         def kill_later():      # workers that ignore SIGTERM
             time.sleep(10)
             if process.poll() is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
+                    kill_tree(process.pid, SIGKILL)
+                except (ProcessLookupError, PermissionError):
                     pass
         threading.Thread(target=kill_later, daemon=True).start()
         logger.info("Integration job %s of %s stopped by %s", job.id, experiment, _author())

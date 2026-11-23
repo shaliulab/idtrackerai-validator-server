@@ -34,6 +34,8 @@ import threading
 import time
 import urllib.request
 
+from idtrackerai_validator_server.oscompat import IS_WINDOWS, new_session
+
 logger = logging.getLogger(__name__)
 
 CHROME = os.environ.get("PE_RECORD_CHROME", "google-chrome")
@@ -73,7 +75,7 @@ def private_server(experiment, workdir):
     log_path = os.path.join(workdir, "server.log")
     with open(log_path, "wb") as log:
         proc = subprocess.Popen([sys.executable, "-c", code], cwd=workdir, env=env,
-                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                                stdout=log, stderr=subprocess.STDOUT, **new_session())
     base = f"http://127.0.0.1:{port}"
     try:
         deadline = time.time() + SERVER_START_TIMEOUT
@@ -116,6 +118,8 @@ def _tail(path, n=1500):
 class Chrome:
 
     def __init__(self, workdir, viewport=VIEWPORT):
+        if IS_WINDOWS:     # --remote-debugging-pipe on fds 3 / 4 needs preexec_fn
+            raise RuntimeError("the browser engine of the burst video runs on Linux / macOS only: use engine=draw")
         to_chrome_r, to_chrome_w = os.pipe()
         from_chrome_r, from_chrome_w = os.pipe()
 
