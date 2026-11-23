@@ -23,7 +23,7 @@ GITHUB = "https://github.com/shaliulab"
 PINS = {
     # React client, built with npm into idtrackerai_validator_server/frontend (BuildWithFrontend)
     "idtrackerai-validator-client": "32b094ada6b488509285c829a57bb36a43a120ba",
-    "flyhostel": "19916a9f0d7d619b8bcc03ffc57da52f50389d1b",
+    "flyhostel": "bf2f068b7fa944f1f5ebd55f4985bbb6ddccac6c",
     # flyhostel/libraries/imgstore: flyhostel needs >= 0.4.23, PyPI has 0.4.19
     "flyhostel/libraries/imgstore": "95b65562b3aa9c2da37ad81db7e41477717febf9",
 }
@@ -68,7 +68,7 @@ def dependency(dist_name, path, url, extras=None):
 
 # The default install (`pip install .`): the Group viewer, the Annotate tab and the Drive exchange tab, and
 # with flyhostel / idtrackerai / imgstore also the analysis tabs that need nothing else (Ethograms, PE, Pose, QC,
-# Overview, ...). flyhostel is fetched from the lab's GitHub (see below): the install needs access to it.
+# Overview, ...). flyhostel is fetched from the lab's GitHub as an archive (public, no ssh key needed).
 # The Group viewer needs flyhostel for sleep bouts / interactions (utils.py) and the incubator readings
 # (environment.py), idtrackerai for the contours; the Annotate tab idtrackerai for the boxes proposed from
 # the segmented blobs (box_annotations / app._default_contours), flyhostel's pyarrow for the scenes'
@@ -111,16 +111,13 @@ install_requires = [
     "astropy",
     "PyWavelets",
     # flyhostel's setup.py installs ethoscopy and idtrackerai (the [idtrackerai] extra; idtrackerai requires
-    # torch and torchvision) from its own libraries/ submodules, so it is fetched with git (pip clones the
-    # submodules recursively; they are ssh URLs and some are private lab repositories: this needs an ssh
-    # key with access to shaliulab). An archive (.tar.gz, no submodules) does not build: its setup.py then
-    # gives extras_require {"idtrackerai": [None]}.
-    # The commit is abbreviated on purpose: pip caches the wheel it builds from a git URL pinned to a full
-    # commit hash, and flyhostel's wheel holds `ethoscopy @ file:///tmp/pip-install-…/libraries/ethoscopy`
-    # (its submodules in pip's temporary clone), so every later install from the cache failed with "No such
-    # file or directory". With a short hash pip clones and builds it again each time.
+    # torch and torchvision). From a GitHub archive (no .git, no submodules) it requires them as archives of
+    # their pinned commits (flyhostel >= bf2f068), all public repositories: no git, ssh key or access to the
+    # lab's private repositories is needed. (Before, it was a git+ URL cloning every submodule recursively,
+    # private ones included, with an abbreviated commit so pip would not cache a wheel holding
+    # `file:///tmp/pip-install-…` URLs of its submodules.)
     dependency("flyhostel", HERE / "flyhostel",
-               "git+{}/flyhostel.git@{}".format(GITHUB, pinned("flyhostel")[:12]), extras=["idtrackerai"]),
+               "{}/flyhostel/archive/{}.tar.gz".format(GITHUB, pinned("flyhostel")), extras=["idtrackerai"]),
     # flyhostel requires a version newer than the latest on PyPI (0.4.19). An archive: imgstore's own
     # submodule (tests/data) is private and not needed to install it.
     dependency("imgstore-shaliulab", HERE / "flyhostel" / "libraries" / "imgstore",
@@ -194,7 +191,7 @@ class BuildWithFrontend(build_py):
 
 setup(
     name='idtrackerai_validator_server',
-    version='1.2.4',
+    version='1.3.0',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',

@@ -18,7 +18,7 @@ foreach ($name in "VALIDATOR_USERNAME", "VALIDATOR_PASSWORD", "VALIDATOR_EXPERIM
     if ($value) { Set-Item -Path "env:$name" -Value $value }
 }
 
-# The commit shown in the app bar (no .git here): "idtrackerai-validator 1.2.4 (060e449), built ..."
+# The commit shown in the app bar (no .git here): "idtrackerai-validator 1.3.0 (abc1234), built ..."
 $VersionFile = Join-Path $InstallDir "VERSION.txt"
 if (Test-Path $VersionFile) {
     if ((Get-Content $VersionFile -Raw) -match "\(([^)]+)\)") { $env:VALIDATOR_COMMIT = $Matches[1] }

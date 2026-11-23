@@ -34,7 +34,7 @@ box, and on any failure collect the logs of section 7.
        ```
        ok, OpenCV 3.4.18
        rclone v1.7x.x
-       ==> Done: idtrackerai validator 1.2.4
+       ==> Done: idtrackerai validator 1.3.0
        Experiments folder: C:\Users\<you>\flyhostel_videos
        ```
        and no yellow "ffmpeg has no libx264" warning. A "FlyHostel validator" shortcut is on the

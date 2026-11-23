@@ -42,8 +42,6 @@ conda activate validator
 
 ## Install
 
-You need an ssh key on GitHub with access to the shaliulab repositories (see below).
-
 ```
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install .
@@ -68,13 +66,10 @@ What `pip install` does on its own:
   submodule is not checked out, from a clone of its pinned commit (kept in `build/`).
   With one already there it installs that one as it is, unless pip built it from an
   older pinned commit (then it is rebuilt).
-- flyhostel (with ethoscopy and idtrackerai from its own submodules) and imgstore, at
-  the commits the submodules point at, fetched from GitHub. When the `flyhostel`
-  submodule is checked out, they are installed from it instead, local changes included.
-
-flyhostel is fetched with git together with its submodules, which use ssh URLs
-(`git@github.com:…`) and include private lab repositories: hence the ssh key. It is
-cloned again on every install (a few minutes).
+- flyhostel (with ethoscopy and idtrackerai) and imgstore, at the commits the
+  submodules point at, downloaded from GitHub as archives of public repositories: no
+  GitHub account or ssh key is needed. When the `flyhostel` submodule is checked out,
+  they are installed from it instead, local changes included.
 
 idtrackerai needs torch and torchvision. The first `pip install` gets the CPU builds,
 which are enough to serve the app; without it pip installs the default (CUDA) builds,
@@ -152,7 +147,7 @@ Releases are tagged (see https://github.com/shaliulab/idtrackerai-validator-serv
 To install one, check out its tag and install as above:
 
 ```
-git checkout v1.2.4
+git checkout v1.3.0
 pip install .
 ```
 
@@ -171,7 +166,7 @@ submodule rather than the pinned commit, and keeps an interface built by
 `build_frontend.sh` as it is.
 
 To go to a specific version instead of the latest, replace `git pull` with
-`git fetch --tags` followed by `git checkout v1.2.4` (the version you want).
+`git fetch --tags` followed by `git checkout v1.3.0` (the version you want).
 
 Then restart the server so it runs the new version (see "Stop and restart" under
 "Run" below), and reload the page in the browser.
