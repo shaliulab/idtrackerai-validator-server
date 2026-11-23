@@ -38,6 +38,7 @@ import pandas as pd
 from flask import Response, jsonify, request, session
 
 from idtrackerai_validator_server.ethogram import FLY_PATTERN, _fly_dir
+from idtrackerai_validator_server.oscompat import username
 from idtrackerai_validator_server.pe_validation import PE_DB
 
 LEG_MOVEMENTS_DIR = os.environ.get("LEG_MOVEMENTS_DIR", "/flyhostel_data/sync_paper_data/modelling/leg_movements")
@@ -236,7 +237,7 @@ def _records(df):
 
 
 def _reviewer():
-    return session.get("user") or os.environ.get("USER") or "anonymous"
+    return session.get("user") or username() or "anonymous"
 
 
 def register_leg_validation(app):

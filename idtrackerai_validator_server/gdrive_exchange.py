@@ -57,11 +57,11 @@ from idtrackerai_validator_server import box_annotations as boxes_mod
 from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.jobs import start_job, _jobs
 from idtrackerai_validator_server.restore import _rclone_copy, _add_to_index
-from idtrackerai_validator_server.oscompat import posix_relpath
+from idtrackerai_validator_server.oscompat import find_tool, posix_relpath, username
 
 logger = logging.getLogger(__name__)
 
-RCLONE = os.environ.get("RCLONE", "rclone")
+RCLONE = find_tool("rclone", "RCLONE")
 DEFAULT_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive:FlyHostelExchange")
 CONFIG_FILE = os.path.expanduser(os.environ.get("EXCHANGE_CONFIG", "~/.config/idtrackerai-validator/exchange.json"))
 CACHE_DIR = os.path.expanduser(os.environ.get("EXCHANGE_CACHE", "~/.cache/idtrackerai-validator/exchange"))
@@ -116,7 +116,7 @@ def write_config(values):
 
 
 def annotator_name():
-    name = read_config()["annotator"] or session.get("user") or os.environ.get("USER") or ""
+    name = read_config()["annotator"] or session.get("user") or username() or ""
     return name if NAME_RE.match(name) else ""
 
 

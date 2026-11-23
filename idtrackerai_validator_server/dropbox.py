@@ -28,10 +28,10 @@ import hashlib
 import argparse
 import subprocess
 from collections import defaultdict
-from idtrackerai_validator_server.oscompat import posix_relpath
+from idtrackerai_validator_server.oscompat import find_tool, posix_relpath
 
 REMOTE = os.environ.get("DROPBOX_REMOTE", "dropbox:/Data/flyhostel_data/videos").rstrip("/")
-RCLONE = os.environ.get("RCLONE", "rclone")
+RCLONE = find_tool("rclone", "RCLONE")
 BLOCK_SIZE = 4 * 1024 * 1024
 
 MISSING = "missing"

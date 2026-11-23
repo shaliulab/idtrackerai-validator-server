@@ -7,11 +7,22 @@ $InstallDir = $PSScriptRoot
 $Settings = Get-Content (Join-Path $InstallDir "settings.json") -Raw | ConvertFrom-Json
 $Env = Join-Path $InstallDir "env"
 
-# rclone, ffmpeg and the environment's DLLs first in PATH, as `conda activate` would
-$env:PATH = @($Env, (Join-Path $Env "Library\bin"), (Join-Path $Env "Scripts"), $env:PATH) -join ";"
+# rclone, ffmpeg and the environment's DLLs first in PATH, as `conda activate` would (the server also
+# finds them without it, oscompat.add_env_to_path)
+$env:PATH = @($Env, (Join-Path $Env "Library\mingw-w64\bin"), (Join-Path $Env "Library\usr\bin"),
+              (Join-Path $Env "Library\bin"), (Join-Path $Env "Scripts"), (Join-Path $Env "bin"), $env:PATH) -join ";"
+foreach ($tool in "rclone", "ffmpeg") {
+    $toolPath = Join-Path $Env "Library\bin\$tool.exe"
+    if ((Test-Path $toolPath) -and -not (Test-Path "env:$($tool.ToUpper())")) { Set-Item -Path "env:$($tool.ToUpper())" -Value $toolPath }
+}
 $env:FLYHOSTEL_VIDEOS = $Settings.data_dir
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+# Windows has no HOME / USER: code written for Linux reads them (os.environ["HOME"]). Set them for
+# the processes started from here only, when unset (never machine-wide).
+if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
+if (-not $env:USER) { $env:USER = $env:USERNAME }
 foreach ($name in "VALIDATOR_USERNAME", "VALIDATOR_PASSWORD", "VALIDATOR_EXPERIMENT", "CVAT_HOST",
                   "CVAT_USERNAME", "CVAT_PASSWORD") {
     $value = $Settings.$name

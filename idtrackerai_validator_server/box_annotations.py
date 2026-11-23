@@ -62,7 +62,7 @@ from flask import jsonify, request, session
 from idtrackerai_validator_server import continuity, links
 from idtrackerai_validator_server.compat import get_number_of_animals
 from idtrackerai_validator_server.experiments import is_validated, to_flat
-from idtrackerai_validator_server.oscompat import SIGKILL, env_executable, env_path, kill_tree, new_session, posix_relpath
+from idtrackerai_validator_server.oscompat import SIGKILL, env_executable, env_path, kill_tree, new_session, posix_relpath, username
 from idtrackerai_validator_server.jobs import _jobs, start_job
 from idtrackerai_validator_server.exchange_bundle import bundle_info, read_bundle_scenes
 
@@ -1126,7 +1126,7 @@ def _author():
     if session.get("user"):
         return session["user"]
     from idtrackerai_validator_server.gdrive_exchange import read_config
-    return read_config()["annotator"] or os.environ.get("USER") or "anonymous"
+    return read_config()["annotator"] or username() or "anonymous"
 
 
 MAX_SAVE_FRAMES = 1000   # frames of one POST /api/annotate/frames

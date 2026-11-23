@@ -52,10 +52,9 @@ RUN npm run build && test -f build/index.html
 # (`flyhostel @ git+…`, `ethoscopy @ file:///…`) are rewritten to `name==version`
 # (scripts/wheelhouse.py), so `pip install --find-links wheels idtrackerai_validator_server` needs
 # neither git, ssh nor GitHub access: the Docker image below and the Windows install use them.
-FROM python:${PYTHON_VERSION}-slim-bookworm AS wheels
+FROM python:${PYTHON_VERSION}-slim-bookworm AS flyhostel-clone
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN --mount=type=cache,target=/root/.cache/pip pip install --upgrade pip setuptools wheel
 COPY setup.py /tmp/setup.py
 ARG FLYHOSTEL_COMMIT=""
 WORKDIR /lab/flyhostel
@@ -69,6 +68,20 @@ RUN commit="${FLYHOSTEL_COMMIT:-$(sed -n 's/^ *"flyhostel": "\([0-9a-f]\{40\}\)"
     && git submodule update --init --depth 1 libraries/ethoscopy libraries/idtrackerai libraries/imgstore \
     && test "$(git -C libraries/imgstore rev-parse HEAD)" = "$imgstore" \
     || { echo "flyhostel's libraries/imgstore differs from setup.py's pin" >&2; exit 1; }
+
+# The flyhostel source the wheels are built from (with libraries/ethoscopy, idtrackerai, imgstore
+# checked out). Replaced by a local checkout with
+#   docker build --build-context flyhostel-src=/path/to/flyhostel ...
+# (scripts/make_windows_bundle.sh FLYHOSTEL_SRC=...: commits not pushed yet; the script checks them
+# against setup.py's pins).
+FROM scratch AS flyhostel-src
+COPY --from=flyhostel-clone /lab/flyhostel /
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS wheels
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/root/.cache/pip pip install --upgrade pip setuptools wheel
+COPY --from=flyhostel-src / /lab/flyhostel
 WORKDIR /wheels
 # msgpack-python 0.5.6 (idtrackerai) is an sdist with a C extension: built pure Python (its own
 # fallback), so Windows needs no compiler.

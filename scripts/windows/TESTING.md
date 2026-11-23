@@ -33,8 +33,10 @@ box, and on any failure collect the logs of section 7.
 4. [ ] Wait (10–20 min, mostly downloads). Success looks like:
        ```
        ok, OpenCV 3.4.18
+       ok without HOME / USER
        rclone v1.7x.x
-       ==> Done: idtrackerai validator 1.3.0
+       ffmpeg version 7.x ...
+       ==> Done: idtrackerai validator 1.3.1
        Experiments folder: C:\Users\<you>\flyhostel_videos
        ```
        and no yellow "ffmpeg has no libx264" warning. A "FlyHostel validator" shortcut is on the

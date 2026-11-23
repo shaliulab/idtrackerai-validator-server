@@ -26,6 +26,13 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is ~10x slower with the progress bar
 $Bundle = $PSScriptRoot
+# Windows has no HOME / USER: code written for Linux reads them (os.environ["HOME"]). Set them for
+# the processes started from here only, when unset (never machine-wide).
+if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
+if (-not $env:USER) { $env:USER = $env:USERNAME }
+# Python's console output in UTF-8 whatever the Windows locale (e.g. Spanish: cp850 / cp1252)
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 $Wheels = Join-Path $Bundle "wheels"
 
 New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "logs") | Out-Null
@@ -34,10 +41,38 @@ Start-Transcript -Path $Log | Out-Null
 
 function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Cyan }
 
+# Runs a program, its output (stdout and stderr) shown and kept in the install log; throws when it
+# fails. stderr is merged as text: with "Stop", Windows PowerShell 5.1 would end at the first line a
+# program writes to stderr (pip's warnings), and Start-Transcript only logs what goes through Out-Host.
 function Run($exe, [string[]]$arguments) {
     Write-Host "$exe $($arguments -join ' ')"
-    & $exe @arguments
-    if ($LASTEXITCODE -ne 0) { throw "failed (exit code $LASTEXITCODE): $exe $($arguments -join ' ')" }
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $exe @arguments 2>&1 | ForEach-Object { "$_" } | Out-Host
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+    if ($code -ne 0) { throw "failed (exit code $code): $exe $($arguments -join ' ')" }
+}
+
+# What `conda activate` puts first in PATH: conda-forge's rclone.exe / ffmpeg.exe and the DLLs of the
+# environment are in Library\bin, which is not on PATH otherwise.
+function EnvPath($envDir) {
+    return @($envDir, (Join-Path $envDir "Library\mingw-w64\bin"), (Join-Path $envDir "Library\usr\bin"),
+             (Join-Path $envDir "Library\bin"), (Join-Path $envDir "Scripts"), (Join-Path $envDir "bin")) -join ";"
+}
+
+# Full path of <name>.exe in the environment (Library\bin for conda-forge), else on PATH
+function FindTool($envDir, $name) {
+    foreach ($dir in (EnvPath $envDir).Split(";")) {
+        $path = Join-Path $dir "$name.exe"
+        if (Test-Path $path) { return $path }
+    }
+    $cmd = Get-Command "$name.exe" -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    throw "$name.exe not found in $envDir (Library\bin) nor on PATH: the conda environment is incomplete, run install.bat again"
 }
 
 try {
@@ -78,6 +113,8 @@ try {
                      "rclone", "ffmpeg=*=gpl*")
     }
 
+    $env:PATH = (EnvPath $Env) + ";" + $env:PATH
+
     # 3. Python packages
     Step "Installing torch / torchvision ($TorchIndex)"
     Run $Python @("-m", "pip", "install", "--disable-pip-version-check", "--index-url", $TorchIndex,
@@ -99,11 +136,23 @@ try {
 
     Step "Checking the installation"
     Run $Python @("-c", "import cv2, flyhostel, idtrackerai, imgstore, idtrackerai_validator_server; print('ok, OpenCV', cv2.__version__)")
-    $env:PATH = @($Env, (Join-Path $Env "Library\bin"), (Join-Path $Env "Scripts"), $env:PATH) -join ";"
-    Run "rclone" @("version")
+    # The same check without HOME / USER (Windows has none; set above only for this window)
+    $home_, $user_ = $env:HOME, $env:USER
+    Remove-Item Env:HOME, Env:USER -ErrorAction SilentlyContinue
+    try {
+        Run $Python @("-c", "import imgstore, flyhostel.data.df, idtrackerai, idtrackerai_validator_server.box_annotations, idtrackerai_validator_server.gdrive_exchange; print('ok without HOME / USER')")
+    } finally {
+        $env:HOME, $env:USER = $home_, $user_
+    }
+    # rclone and ffmpeg by full path (conda-forge: Library\bin), as the server finds them
+    $Rclone = FindTool $Env "rclone"
+    $Ffmpeg = FindTool $Env "ffmpeg"
+    Run $Rclone @("version")
+    Run $Ffmpeg @("-hide_banner", "-version")
+    $saved = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    $encoders = & ffmpeg -hide_banner -encoders 2>&1 | ForEach-Object { "$_" }
-    $ErrorActionPreference = "Stop"
+    $encoders = & $Ffmpeg -hide_banner -encoders 2>&1 | ForEach-Object { "$_" }
+    $ErrorActionPreference = $saved
     if (-not ($encoders -match "libx264")) { Write-Warning "ffmpeg has no libx264: publishing minimal bundles will fail" }
 
     # 4. Settings, start script, shortcut

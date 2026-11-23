@@ -22,6 +22,12 @@ from pathlib import Path
 
 import importlib
 
+from idtrackerai_validator_server.oscompat import add_env_to_path
+
+# Windows: the env's Library\bin (rclone, ffmpeg, DLLs) first in PATH, also for child processes,
+# when the server was started without `conda activate`
+add_env_to_path()
+
 from idtrackerai_validator_server.compat import (
     check_if_validated,
     get_identities,
