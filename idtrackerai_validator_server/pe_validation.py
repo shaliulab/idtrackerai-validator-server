@@ -29,29 +29,19 @@ from flyhostel.utils import (
     get_framerate
 )
 from flyhostel.data.pose.proboscis_extension.label_overrides import read_pe_bouts
+from idtrackerai_validator_server import lab_paths
                 
 logger=logging.getLogger(__name__)
 
 # --- where your pipeline wrote things (edit or set via env) ---------------------
 # PE media lives UNDER EACH EXPERIMENT'S TREE, so the media dir is DERIVED from the
 # experiment per request (see _media_dir), not a fixed constant.
-def annotations_db_path():
-    videos = os.environ.get("FLYHOSTEL_VIDEOS")
-    if videos:
-        return os.path.join(videos, "pe_annotations.db")
-    # Fall back to the XDG data directory when FLYHOSTEL_VIDEOS is unset.
-    base = os.environ.get(
-        "XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share")
-    )
-    path = os.path.join(base, "flyhostel")
-    os.makedirs(path, exist_ok=True)
-    return os.path.join(path, "pe_annotations.db")
+annotations_db_path = lab_paths.pe_annotations_db_path
 
-PE_DB = os.environ.get("PE_ANNOTATIONS_DB") or annotations_db_path()
+PE_DB = lab_paths.pe_annotations_db_path()
 RESEG_DB = PE_DB
 
-AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/calib.csv")
-AUDIT_CSV = os.environ.get("PE_AUDIT_CSV", "/home/vibflysleep/FlySleepLab_Dropbox/Antonio/FSLLab/Projects/FlyHostel4/code/scripts/proboscis_extension/v3/pnf_audit.csv")
+AUDIT_CSV = lab_paths.PE_AUDIT_CSV
 
 print(f"Audit csv: {AUDIT_CSV}")
 import os

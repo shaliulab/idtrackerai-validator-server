@@ -29,10 +29,11 @@ from flask import jsonify, request
 
 from idtrackerai_validator_server import gpu_queue
 from idtrackerai_validator_server.sleap_labels import LABELS_DIR, file_path, get_file
+from idtrackerai_validator_server import lab_paths
 
-SLEAP_TRAIN = os.environ.get("SLEAP_TRAIN", os.path.expanduser("~/mambaforge/envs/sleap/bin/sleap-train"))
-MODELS_DIR = os.environ.get("SLEAP_MODELS_DIR", os.path.join(LABELS_DIR, "models"))
-TRAIN_DIR = os.environ.get("SLEAP_TRAIN_DIR", os.path.expanduser("~/.cache/idtrackerai-validator/sleap_train"))
+SLEAP_TRAIN = lab_paths.SLEAP_TRAIN
+MODELS_DIR = lab_paths.SLEAP_MODELS_DIR
+TRAIN_DIR = lab_paths.SLEAP_TRAIN_DIR
 # GPU queue estimate until a run has been measured (sleap-train lets TensorFlow grow its memory)
 SLEAP_TRAIN_MB = float(os.environ.get("SLEAP_TRAIN_MB", 12000))
 RUN_PATH_RE = re.compile(r"Created run path: (.+)$", re.M)

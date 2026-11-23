@@ -15,10 +15,11 @@ import socket
 from urllib.parse import urlencode
 
 from idtrackerai_validator_server.experiments import to_flat
+from idtrackerai_validator_server import lab_paths
 
 TABS = ("annotate", "group_viewer")
 DEFAULT_PORT = 5000
-DEFAULT_CERTFILE = os.path.expanduser("~/.config/idtrackerai-validator/tls/cert.pem")
+DEFAULT_CERTFILE = lab_paths.DEFAULT_TLS_CERTFILE
 
 
 def public_base():

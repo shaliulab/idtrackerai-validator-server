@@ -49,11 +49,12 @@ from flask import jsonify, request
 
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.oscompat import HAS_PROC, IS_WINDOWS, lock, unlock
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-PIPELINES_DIR = os.environ.get("NEXTFLOW_PIPELINES", "/home/vibflysleep/opt/vsc-scripts/nextflow/pipelines")
-FLYHOSTEL_VIDEOS = os.environ.get("FLYHOSTEL_VIDEOS", "/flyhostel_data/videos")
+PIPELINES_DIR = lab_paths.NEXTFLOW_PIPELINES
+FLYHOSTEL_VIDEOS = lab_paths.MONITOR_FLYHOSTEL_VIDEOS
 
 PIPELINES = [
     {"id": "idtrackerai", "label": "idtrackerai", "folder": "idtrackerai_v3", "csv": "idtrackerai.csv",

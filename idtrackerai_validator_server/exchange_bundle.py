@@ -42,7 +42,7 @@ import yaml
 
 from idtrackerai_validator_server.compat import HAS_IDTRACKERAI, get_number_of_animals
 from idtrackerai_validator_server.experiments import to_flat
-from idtrackerai_validator_server.oscompat import find_tool
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ SKIP_TABLES = {"IMG_SNAPSHOTS"}
 CRF = int(os.environ.get("EXCHANGE_CLIP_CRF", "18"))
 GOP = 24
 SEEK_GAP = 300             # a gap of more frames is a seek, else frames are read forward
-FFMPEG = find_tool("ffmpeg", "FFMPEG")
+FFMPEG = lab_paths.FFMPEG
 
 
 def bundle_info(basedir):

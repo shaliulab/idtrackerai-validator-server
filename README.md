@@ -485,6 +485,14 @@ the Group viewer or the Annotate tab. Nothing is changed in the database: such j
 be real. Thresholds are in fly body lengths (*Thresholds*), and *CSV* exports the list.
 How the check works and how it was measured: `idtrackerai_validator_server/swaps.py`.
 
+# Lab-specific paths
+
+The defaults point to the lab server's layout (`/flyhostel_data/...`, conda envs in
+`~/mambaforge/envs`, the cv1 / cv2 hosts, ...). They are all in one file,
+`idtrackerai_validator_server/lab_paths.py`, grouped by kind. Each one shows its default and the
+environment variable that overrides it. To run the validator on another computer, set those
+variables. You don't need to edit the code.
+
 # Development
 
 Working on the client with hot reload, instead of rebuilding each time:

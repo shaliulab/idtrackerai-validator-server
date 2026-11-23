@@ -57,14 +57,15 @@ from idtrackerai_validator_server import box_annotations as boxes_mod
 from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.jobs import start_job, _jobs
 from idtrackerai_validator_server.restore import _rclone_copy, _add_to_index
-from idtrackerai_validator_server.oscompat import find_tool, posix_relpath, username
+from idtrackerai_validator_server.oscompat import posix_relpath, username
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-RCLONE = find_tool("rclone", "RCLONE")
-DEFAULT_REMOTE = os.environ.get("GDRIVE_REMOTE", "gdrive:FlyHostelExchange")
-CONFIG_FILE = os.path.expanduser(os.environ.get("EXCHANGE_CONFIG", "~/.config/idtrackerai-validator/exchange.json"))
-CACHE_DIR = os.path.expanduser(os.environ.get("EXCHANGE_CACHE", "~/.cache/idtrackerai-validator/exchange"))
+RCLONE = lab_paths.RCLONE
+DEFAULT_REMOTE = lab_paths.GDRIVE_REMOTE
+CONFIG_FILE = lab_paths.EXCHANGE_CONFIG
+CACHE_DIR = lab_paths.EXCHANGE_CACHE
 # free space a download leaves on the drive
 DOWNLOAD_MARGIN = float(os.environ.get("EXCHANGE_DOWNLOAD_MARGIN_GB", "5")) * 1e9
 FORMAT = 1

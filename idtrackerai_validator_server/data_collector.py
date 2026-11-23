@@ -61,18 +61,18 @@ from idtrackerai_validator_server.oscompat import kill_tree, lock, new_session, 
 from idtrackerai_validator_server.experiments import is_validated
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.overview import sheet_files
+from idtrackerai_validator_server import lab_paths
 
 
 logger = logging.getLogger(__name__)
 
-REMOTE_HOST = os.environ.get("COLLECTOR_REMOTE_HOST", "cv2")
-REMOTE_ROOT = os.environ.get("COLLECTOR_REMOTE_ROOT", "/home/vibflysleep/flyhostel_data/videos")
-HTTP_URL = os.environ.get("COLLECTOR_HTTP", "http://10.43.205.5:8000")
-ENVS = os.path.expanduser("~/mambaforge/envs")
-ROI_PROPOSER = os.environ.get("ROI_PROPOSER", os.path.join(ENVS, "roi-proposer", "bin", "roi-proposer"))
-IDTRACKERAI_V4_BIN = os.environ.get("IDTRACKERAI_V4_BIN", os.path.join(ENVS, "idtrackeraiv4", "bin"))
+REMOTE_HOST = lab_paths.COLLECTOR_REMOTE_HOST
+REMOTE_ROOT = lab_paths.COLLECTOR_REMOTE_ROOT
+HTTP_URL = lab_paths.COLLECTOR_HTTP
+ROI_PROPOSER = lab_paths.ROI_PROPOSER
+IDTRACKERAI_V4_BIN = lab_paths.IDTRACKERAI_V4_BIN
 # splits a recording into its arenas once arenas.toml is saved (flyhostel-pipeline env: ffmpeg with NVENC)
-CROP_ARENAS = os.environ.get("CROP_ARENAS", os.path.join(ENVS, "flyhostel-pipeline", "bin", "imgstore-crop-arenas"))
+CROP_ARENAS = lab_paths.CROP_ARENAS
 CROP_ARGS = ["--jobs", "4", "--gpu", "--size", "1024"]
 # GPU memory of one NVENC encoder (ffmpeg h264_nvenc of a 1024 px arena: 1271 MiB measured);
 # a crop holds up to --jobs of them (GPU queue estimate)
@@ -425,8 +425,7 @@ def start_fetch(experiments, zt_limit, root, on_end=None):
 # entry starts when no fetch runs (else it waits for it, `waiting`); what it copies is planned
 # when it starts. Status: scheduled → running (job_id) → done / failed; or cancelled.
 
-SCHEDULE_FILE = os.environ.get("COLLECTOR_SCHEDULE_FILE",
-                               os.path.expanduser("~/.cache/idtrackerai-validator/fetch_schedule.json"))
+SCHEDULE_FILE = lab_paths.COLLECTOR_SCHEDULE_FILE
 SCHEDULE_TICK_S = 30
 SCHEDULE_KEEP_FINISHED = 20
 _schedule_wake = threading.Event()

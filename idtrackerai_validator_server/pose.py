@@ -48,10 +48,11 @@ from flyhostel.utils.pose_export import recreate_pose_file, get_pose_file_path
 
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.jobs import start_job, _jobs
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = os.path.join(os.environ.get("QC_CACHE_DIR", os.path.expanduser("~/.cache/idtrackerai-validator/qc")), "pose")
+CACHE_DIR = os.path.join(lab_paths.QC_CACHE_DIR, "pose")
 CACHE_VERSION = 1
 SCORED_NODES = ["proboscis", "thorax", "abdomen", "fLL", "mLL", "rLL", "fRL", "mRL", "rRL", "head", "lW", "rW"]
 BINS_PER_CHUNK = 30         # as the QC of the tracking: 10 s bins for 45000-frame chunks at 150 fps

@@ -59,12 +59,13 @@ from flyhostel.utils import get_basedir
 from idtrackerai_validator_server.deg_labels import _local_identities
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.pose import _flies, first_frame, get_h5_file, node_names, pose_path
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-LABELS_DIR = os.environ.get("SLEAP_LABELS_DIR", "/flyhostel_data/fiftyone/FlyBehaviors")
-BACKUP_DIR = os.environ.get("SLEAP_BACKUPS", os.path.expanduser("~/.cache/idtrackerai-validator/slp_backups"))
-LOG_PATH = os.environ.get("SLEAP_LABELS_LOG", os.path.expanduser("~/.cache/idtrackerai-validator/sleap_labels.jsonl"))
+LABELS_DIR = lab_paths.SLEAP_LABELS_DIR
+BACKUP_DIR = lab_paths.SLEAP_BACKUPS
+LOG_PATH = lab_paths.SLEAP_LABELS_LOG
 SAVE_DELAY = 2.0
 KEEP_BACKUPS = 20
 FILE_RE = re.compile(r"^labels_(train|test)[^/]*\.slp$")

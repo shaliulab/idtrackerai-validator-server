@@ -35,9 +35,9 @@ from concurrent.futures import ThreadPoolExecutor
 from idtrackerai_validator_server import dropbox
 from idtrackerai_validator_server.compress_slp import LOG_FILE as COMPRESS_LOG
 from idtrackerai_validator_server.experiments import to_relpath
+from idtrackerai_validator_server import lab_paths
 
-UPLOAD_LOG = os.path.expanduser(os.environ.get(
-    "UPLOAD_SLP_LOG", "~/.cache/idtrackerai-validator/uploaded_slp.jsonl"))
+UPLOAD_LOG = lab_paths.UPLOAD_SLP_LOG
 SA_DIR = "flyhostel/single_animal"
 
 NOT_ON_DROPBOX = "not on Dropbox"

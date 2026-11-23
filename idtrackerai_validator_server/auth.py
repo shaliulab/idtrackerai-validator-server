@@ -25,11 +25,12 @@ from datetime import timedelta
 from urllib.parse import urlencode
 
 from flask import jsonify, redirect, render_template, request, send_file, session
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-CONFIG_DIR = os.path.expanduser("~/.config/idtrackerai-validator")
-SECRET_KEY_FILE = os.environ.get("VALIDATOR_SECRET_KEY_FILE", os.path.join(CONFIG_DIR, "secret_key"))
+CONFIG_DIR = lab_paths.CONFIG_DIR
+SECRET_KEY_FILE = lab_paths.VALIDATOR_SECRET_KEY_FILE
 SESSION_DAYS = 30
 # Failed logins per client address before it has to wait
 MAX_FAILURES = 10

@@ -36,10 +36,11 @@ from flask import jsonify
 
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.jobs import start_job, _jobs
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = os.environ.get("QC_CACHE_DIR", os.path.expanduser("~/.cache/idtrackerai-validator/qc"))
+CACHE_DIR = lab_paths.QC_CACHE_DIR
 BINS_PER_CHUNK = 30         # timeline resolution (10 s bins for 45000-frame chunks at 150 fps)
 TOP_RUNS = 200              # longest runs of bad frames listed
 # Run lengths (frames) are counted in these bins: [lo, hi)

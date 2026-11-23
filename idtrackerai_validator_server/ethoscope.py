@@ -49,10 +49,11 @@ import numpy as np
 from flask import Response, jsonify, request
 
 from idtrackerai_validator_server.jobs import start_job
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-RESULTS_DIR = os.environ.get("ETHOSCOPE_RESULTS", "/ethoscope_data/results")
+RESULTS_DIR = lab_paths.ETHOSCOPE_RESULTS
 DEFAULTS = {"velocity_correction_coef": 0.0048, "min_time_immobile": 300.0,
             "time_window_length": 10.0, "masking_duration": 6.0}
 LIMITS = {"velocity_correction_coef": (1e-4, 0.05), "min_time_immobile": (10, 3600),
@@ -63,8 +64,8 @@ DATE_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[_ ](\d{2})[-:](\d{2})(?:[-:](\d{
 FLY_COLUMNS = ("genotype", "sex", "light_cycle", "age_min", "incubator")
 # runs missing here may be on the computer the ethoscopes save to (cv1): listed over ssh and
 # copied with rsync into RESULTS_DIR, at the same <machine_id>/<machine_name>/<run>/ path
-REMOTE_HOST = os.environ.get("ETHOSCOPE_REMOTE_HOST", "cv1")
-REMOTE_RESULTS = os.environ.get("ETHOSCOPE_REMOTE_RESULTS", "/ethoscope_data/results")
+REMOTE_HOST = lab_paths.ETHOSCOPE_REMOTE_HOST
+REMOTE_RESULTS = lab_paths.ETHOSCOPE_REMOTE_RESULTS
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 REMOTE_TTL = 300                  # s a remote listing is kept
 RECORDING_S = 600                 # a remote db modified this recently is still being written

@@ -48,14 +48,15 @@ from flyhostel.utils import get_basedir, get_local_identities_from_experiment
 
 from idtrackerai_validator_server.ethogram import FLY_PATTERN, _properties, track
 from idtrackerai_validator_server.jobs import start_job
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-DEG_ROOT = os.path.join(os.environ.get("DEG_PROJECTS", "/flyhostel_data/fiftyone/FlyBehaviors"), "DEG")
-DEG_PYTHON = os.environ.get("DEG_PYTHON", os.path.expanduser("~/mambaforge/envs/rapids-23.04/bin/python"))
+DEG_ROOT = os.path.join(lab_paths.DEG_PROJECTS, "DEG")
+DEG_PYTHON = lab_paths.DEG_PYTHON
 ADD_VIDEO_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deg_add_video.py")
 PROGRESS_MARKER = "@@PROGRESS "   # deg_add_video.MARKER (the script must not be imported here)
-LOG_PATH = os.environ.get("DEG_LABELS_LOG", os.path.expanduser("~/.cache/idtrackerai-validator/deg_labels.jsonl"))
+LOG_PATH = lab_paths.DEG_LABELS_LOG
 # Longest range labelled at once (s): every chunk it touches may need a new video folder (~5 s each)
 MAX_RANGE = 3600
 # Most chunks premade at once on each side of the cursor's chunk (~30 s each)

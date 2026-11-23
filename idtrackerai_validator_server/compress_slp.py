@@ -41,11 +41,11 @@ import numpy as np
 
 from idtrackerai_validator_server.data_management import list_experiments
 from idtrackerai_validator_server.experiments import to_relpath
+from idtrackerai_validator_server import lab_paths
 
-H5REPACK = os.environ.get("H5REPACK") or shutil.which("h5repack") or os.path.expanduser("~/mambaforge/bin/h5repack")
-SLEAP_PYTHON = os.environ.get("SLEAP_PYTHON", os.path.expanduser("~/mambaforge/envs/sleap/bin/python"))
-LOG_FILE = os.path.expanduser(os.environ.get(
-    "COMPRESS_SLP_LOG", "~/.cache/idtrackerai-validator/compressed_slp.jsonl"))
+H5REPACK = lab_paths.H5REPACK
+SLEAP_PYTHON = lab_paths.SLEAP_PYTHON
+LOG_FILE = lab_paths.COMPRESS_SLP_LOG
 FILTER = "GZIP=4"
 TMP_SUFFIX = ".repack-tmp.slp"   # SLEAP picks its reader by extension
 PATTERNS = ("flyhostel/single_animal/*/*.predictions.slp",

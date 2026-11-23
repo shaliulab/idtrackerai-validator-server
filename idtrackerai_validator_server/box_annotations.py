@@ -65,6 +65,7 @@ from idtrackerai_validator_server.experiments import is_validated, to_flat
 from idtrackerai_validator_server.oscompat import SIGKILL, env_executable, env_path, kill_tree, new_session, posix_relpath, username
 from idtrackerai_validator_server.jobs import _jobs, start_job
 from idtrackerai_validator_server.exchange_bundle import bundle_info, read_bundle_scenes
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +74,8 @@ TAGS = ["FMB", "NEW-FRAGMENT", "CROSSING"]
 MIN_BOX = 50               # px: a proposal covers at least the square flyhostel uses for YOLO rows
 PAD = 4                    # px around the segmented blob
 MAX_SCENE_LENGTH = 5000    # as flyhostel's export-images
-VALIDATION_ENV = os.path.expanduser(os.environ.get("FLYHOSTEL_VALIDATION_ENV", "~/mambaforge/envs/rapids-23.04"))
-YOLOV7_CVAT = os.path.expanduser(os.environ.get("YOLOV7_CVAT", "~/mambaforge/envs/yolov7/bin/yolov7-cvat"))
+VALIDATION_ENV = lab_paths.FLYHOSTEL_VALIDATION_ENV
+YOLOV7_CVAT = lab_paths.YOLOV7_CVAT
 
 _lock = threading.Lock()
 _integrating = {}          # experiment -> job id
@@ -670,8 +671,7 @@ def read_problems(basedir):
 
 
 # --- validation queue: analyzed experiments without the validated tables, with this person's progress ---
-QUEUE_FILE = os.environ.get("ANNOTATE_QUEUE_FILE",
-                            os.path.expanduser("~/.config/idtrackerai-validator/annotate_queue.json"))
+QUEUE_FILE = lab_paths.ANNOTATE_QUEUE_FILE
 QUEUE_ORDER = {"in_progress": 0, "to_do": 1, "no_scenes": 2, "annotated": 3}
 _progress_cache = {}          # dbfile -> (key, progress)
 _progress_lock = threading.Lock()
@@ -1055,7 +1055,7 @@ def continuity_proposal(state, con, frame_number, rows, contours, labels=None, s
     return boxes, result["flags"], anchor
 
 
-EASY_CACHE_DIR = os.environ.get("CONTINUITY_CACHE_DIR", os.path.expanduser("~/.cache/idtrackerai-validator/continuity"))
+EASY_CACHE_DIR = lab_paths.CONTINUITY_CACHE_DIR
 _easy_cache = {}     # dbfile -> (stamp, {scene start: why})
 _easy_running = {}   # dbfile -> (job id, stamp)
 

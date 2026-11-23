@@ -40,9 +40,10 @@ from flask import Response, jsonify, request, session
 from idtrackerai_validator_server.ethogram import FLY_PATTERN, _fly_dir
 from idtrackerai_validator_server.oscompat import username
 from idtrackerai_validator_server.pe_validation import PE_DB
+from idtrackerai_validator_server import lab_paths
 
-LEG_MOVEMENTS_DIR = os.environ.get("LEG_MOVEMENTS_DIR", "/flyhostel_data/sync_paper_data/modelling/leg_movements")
-LEG_DB = os.environ.get("LEG_ANNOTATIONS_DB") or os.path.join(os.path.dirname(os.path.abspath(PE_DB)), "leg_annotations.db")
+LEG_MOVEMENTS_DIR = lab_paths.LEG_MOVEMENTS_DIR
+LEG_DB = lab_paths.LEG_ANNOTATIONS_DB or os.path.join(os.path.dirname(os.path.abspath(PE_DB)), "leg_annotations.db")
 
 # what the reviewer sees in the clip (keys 1-7 in the tab)
 VERDICTS = ("middle", "groom", "walk", "posture", "pose_error", "other", "unsure")

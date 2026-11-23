@@ -60,6 +60,7 @@ from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.experiments import INDEX_COMMAND, VALIDATED_TABLES, index_lines
 from idtrackerai_validator_server.oscompat import IS_WINDOWS, posix_relpath
 from idtrackerai_validator_server.compat import normalize_arena
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
@@ -78,8 +79,8 @@ LIGHT_CYCLE_COLUMNS = ("light_cycle", "condition", "experiment", "vial")
 LIGHT_CYCLES = {"LD", "DD", "LL"}
 LIGHT_CYCLE_RE = re.compile(r"\b(LD|DD|LL)\b")
 
-GOOGLEAPI_CONFIG = os.path.expanduser(os.environ.get("GOOGLEAPI_CONFIG", "~/.config/googleapi/config.yaml"))
-METADATA_DIR = os.environ.get("FLYHOSTEL_METADATA", "/flyhostel_data/metadata")
+GOOGLEAPI_CONFIG = lab_paths.GOOGLEAPI_CONFIG
+METADATA_DIR = lab_paths.FLYHOSTEL_METADATA
 # CSV export of a sheet: "ethoscope&flyhostel_metadata<version> - <sheet>.csv", latest version wins
 SHEET_FILE_RE = re.compile(r"metadata(\d+) - (.+)\.csv$")
 

@@ -45,10 +45,11 @@ from idtrackerai_validator_server import dropbox
 from idtrackerai_validator_server import data_management as dm
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.oscompat import posix_relpath
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-DEG_PROJECTS = os.environ.get("DEG_PROJECTS", "/flyhostel_data/fiftyone/FlyBehaviors")
+DEG_PROJECTS = lab_paths.DEG_PROJECTS
 RESTORE_CACHE = os.path.join(os.path.dirname(dm.CACHE_FILE), "restore.json")
 RESTORE_LOG = os.path.join(os.path.dirname(dm.CACHE_FILE), "restored.jsonl")
 # free space a drive keeps after a restore

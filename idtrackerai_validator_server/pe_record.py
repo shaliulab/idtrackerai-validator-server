@@ -35,10 +35,11 @@ import time
 import urllib.request
 
 from idtrackerai_validator_server.oscompat import IS_WINDOWS, new_session
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-CHROME = os.environ.get("PE_RECORD_CHROME", "google-chrome")
+CHROME = lab_paths.PE_RECORD_CHROME
 VIEWPORT = (1920, 1080)        # the page's window: the trace SVGs are drawn at their on-screen size
 SERVER_START_TIMEOUT = 300     # s; the experiment is opened at import
 READY_TIMEOUT = 120            # s for the tab to show the burst

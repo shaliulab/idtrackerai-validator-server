@@ -57,12 +57,12 @@ from flask import jsonify, request
 from idtrackerai_validator_server import dropbox
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.experiments import experiment_folder
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-BACKUP_ROOT = os.environ.get("FLYHOSTEL_BACKUP", "/flyhostel_data/backup")
-CACHE_FILE = os.path.expanduser(os.environ.get(
-    "DATA_MANAGEMENT_CACHE", "~/.cache/idtrackerai-validator/data_management.json"))
+BACKUP_ROOT = lab_paths.FLYHOSTEL_BACKUP
+CACHE_FILE = lab_paths.DATA_MANAGEMENT_CACHE
 DROPBOX_CACHE = os.path.join(os.path.dirname(CACHE_FILE), "dropbox.json")
 # rclone calls to Dropbox at once
 DROPBOX_WORKERS = 8

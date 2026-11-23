@@ -46,10 +46,11 @@ from flask import jsonify, request
 
 from idtrackerai_validator_server.oscompat import kill_tree, lock, new_session, unlock, with_exit_code
 from idtrackerai_validator_server.resources import read_gpus
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-QUEUE_FILE = os.environ.get("GPU_QUEUE_FILE", os.path.expanduser("~/.cache/idtrackerai-validator/gpu_queue.json"))
+QUEUE_FILE = lab_paths.GPU_QUEUE_FILE
 MARGIN_MB = float(os.environ.get("GPU_QUEUE_MARGIN_MB", 4096))
 TICK_S = 10
 LEARN_RUNS = 5

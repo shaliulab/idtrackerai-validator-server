@@ -16,6 +16,7 @@ from collections import deque
 
 import psutil
 from flask import jsonify
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ SAMPLE_S = 5
 HISTORY_S = 3600
 # processes returned (the union of the busiest by CPU, by RAM and every GPU process)
 TOP_PROCESSES = 12
-NVIDIA_SMI = os.environ.get("NVIDIA_SMI", "nvidia-smi")
+NVIDIA_SMI = lab_paths.NVIDIA_SMI
 
 GPU_FIELDS = ["index", "uuid", "name", "utilization.gpu", "utilization.memory", "memory.used", "memory.total",
               "temperature.gpu", "power.draw", "power.limit"]

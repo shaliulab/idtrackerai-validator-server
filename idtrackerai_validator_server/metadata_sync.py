@@ -53,13 +53,11 @@ from flyhostel.utils import get_number_of_animals
 from idtrackerai_validator_server.jobs import start_job, _jobs
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.overview import PATH_RE, METADATA_DIR, _clean, _fly_rows, merge_light_cycle
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-DOWNLOADER = os.environ.get(
-    "DOWNLOAD_FLYHOSTEL_METADATA",
-    "/home/vibflysleep/mambaforge/envs/rapids-23.04/bin/download_flyhostel_metadata",
-)
+DOWNLOADER = lab_paths.DOWNLOAD_FLYHOSTEL_METADATA
 DOWNLOAD_TIMEOUT = 300          # s; an expired Google token would otherwise wait for a browser login
 # Batch download (download_metadata_batch.py) with the Python of the downloader's environment.
 BATCH_PYTHON = os.path.join(os.path.dirname(DOWNLOADER), "python")

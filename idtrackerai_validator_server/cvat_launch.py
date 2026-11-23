@@ -46,12 +46,13 @@ from idtrackerai_validator_server.experiments import to_flat, to_relpath
 from idtrackerai_validator_server.jobs import _jobs, start_job
 from idtrackerai_validator_server.oscompat import HAS_PROC, IS_WINDOWS, kill_tree, new_session
 from idtrackerai_validator_server.overview import ARENA_RE, PATH_RE
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-SCRIPTS = os.path.expanduser(os.environ.get("FLYHOSTEL_VALIDATION_SCRIPTS", "~/opt/vsc-scripts/manual/validation"))
+SCRIPTS = lab_paths.FLYHOSTEL_VALIDATION_SCRIPTS
 # conda env with make-identogram, auto-annotate-qc, export-images, cvat-cli and cvat_sdk
-VALIDATION_ENV = os.path.expanduser(os.environ.get("FLYHOSTEL_VALIDATION_ENV", "~/mambaforge/envs/rapids-23.04"))
+VALIDATION_ENV = lab_paths.FLYHOSTEL_VALIDATION_ENV
 
 # Lines main.sh prints after each step, in order.
 STAGES = [

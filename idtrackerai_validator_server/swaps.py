@@ -50,10 +50,11 @@ from flask import Response, jsonify, request
 
 from idtrackerai_validator_server.experiments import to_flat
 from idtrackerai_validator_server.jobs import start_job, _jobs
+from idtrackerai_validator_server import lab_paths
 
 logger = logging.getLogger(__name__)
 
-CACHE_DIR = os.path.join(os.environ.get("QC_CACHE_DIR", os.path.expanduser("~/.cache/idtrackerai-validator/qc")), "swaps")
+CACHE_DIR = os.path.join(lab_paths.QC_CACHE_DIR, "swaps")
 CACHE_VERSION = 1
 DEFAULT_PIXELS_PER_CM = 333
 
