@@ -615,6 +615,10 @@ def _git_version():
             "dirty": bool(git("status", "--porcelain", "--untracked-files=no")),
         }
     except Exception as error:
+        # An install without .git (the Docker image) gives it as VALIDATOR_COMMIT / _DATE
+        if os.environ.get("VALIDATOR_COMMIT"):
+            return {"commit": os.environ["VALIDATOR_COMMIT"],
+                    "date": os.environ.get("VALIDATOR_COMMIT_DATE") or None, "dirty": False}
         logging.warning("Could not read the git commit of %s: %s", root, error)
         return {"commit": None, "date": None, "dirty": False}
 

@@ -176,6 +176,101 @@ To go to a specific version instead of the latest, replace `git pull` with
 Then restart the server so it runs the new version (see "Stop and restart" under
 "Run" below), and reload the page in the browser.
 
+# Install with Docker
+
+An alternative to the conda install above: one image with the server, the web
+interface, rclone and ffmpeg (the default install: Group viewer, Annotate, Drive
+exchange and the analysis tabs that need nothing else). You need Docker with BuildKit
+(Docker 23 or newer; on Windows and macOS, Docker Desktop) and, to build the image, an
+ssh key on GitHub with access to the shaliulab repositories.
+
+## Build
+
+flyhostel's private submodules are cloned with your ssh agent, forwarded to that one
+build step (`--ssh default`): no key ends up in the image.
+
+```
+git clone https://github.com/shaliulab/idtrackerai-validator-server
+cd idtrackerai-validator-server
+eval $(ssh-agent) && ssh-add ~/.ssh/id_rsa     # skip if `ssh-add -l` lists your key
+docker build --ssh default \
+    --build-arg UID=$(id -u) --build-arg GID=$(id -g) \
+    --build-arg VALIDATOR_COMMIT=$(git rev-parse --short HEAD) \
+    -t idtrackerai-validator .
+```
+
+The first build takes about 10 minutes and the image is about 3 GB (torch's CPU
+build is most of it). The image builds the web interface from the client commit
+`setup.py` pins; local checkouts of the submodules are not used.
+
+`UID` / `GID` are the user the server runs as: files it writes into your data folder
+(annotations, caches) belong to that user. Build arguments:
+
+| argument | default | meaning |
+|---|---|---|
+| `TORCH_INDEX` | `https://download.pytorch.org/whl/cpu` | torch / torchvision index; `https://download.pytorch.org/whl/cu128` for a GPU image (several GB larger) |
+| `TORCH_VERSION`, `TORCHVISION_VERSION` | 2.13.0, 0.28.0 | |
+| `RCLONE_VERSION` | 1.71.2 | |
+| `UID`, `GID` | 1000 | |
+| `VALIDATOR_COMMIT`, `VALIDATOR_COMMIT_DATE` | empty | shown in the app bar (the image has no `.git`) |
+
+## Run
+
+```
+docker run -d --name validator -p 5000:5000 \
+    -v /path/to/flyhostel_videos:/data \
+    -v $HOME/.config/rclone:/home/validator/.config/rclone \
+    -v validator-config:/home/validator/.config \
+    -v validator-cache:/home/validator/.cache \
+    -e VALIDATOR_USERNAME=choose-a-user -e VALIDATOR_PASSWORD=choose-a-password \
+    --restart unless-stopped idtrackerai-validator
+```
+
+Open http://localhost:5000. Or, with `docker-compose.yml`:
+
+```
+export FLYHOSTEL_VIDEOS=/path/to/flyhostel_videos
+docker compose up -d --build
+```
+
+| mount | holds |
+|---|---|
+| `/data` | `$FLYHOSTEL_VIDEOS`: `index.txt` and the experiment folders (the Annotate tab writes `flyhostel/validation/validator_annotations.db` in them, the PE tab `pe_annotations.db` at the top). Must be writable for annotating; read-only works to browse |
+| `/home/validator/.config/rclone` | your `rclone.conf` (Drive exchange, Dropbox checks): set the remote up on the host with `rclone config`, or inside with `docker exec -it validator rclone config` |
+| `/home/validator/.config` | the login cookie's secret key, Drive exchange settings, validation queue |
+| `/home/validator/.cache` | QC and continuity caches |
+
+The container listens on all its interfaces, so set `VALIDATOR_USERNAME` and
+`VALIDATOR_PASSWORD` (or publish the port on loopback only: `-p 127.0.0.1:5000:5000`).
+Every environment variable of `CLAUDE.md` can be passed with `-e`, e.g.
+`VALIDATOR_EXPERIMENT`, `CVAT_HOST` / `CVAT_USERNAME` / `CVAT_PASSWORD`. For https
+mount the certificate of `scripts/make_tls_certificates.sh` and point at it:
+`-v ~/.config/idtrackerai-validator/tls:/tls:ro -e VALIDATOR_CERTFILE=/tls/cert.pem
+-e VALIDATOR_KEYFILE=/tls/key.pem`.
+
+Experiment folders that are symlinks (e.g. `FlyHostel1 -> /media/…/DATA1/FlyHostel1`)
+point outside `/data` inside the container: mount each target at the same path too
+(`-v /media/…/DATA1:/media/…/DATA1`).
+
+GPU: nothing in the default install needs one. To use it anyway (torch in
+idtrackerai's segmentation), build with a CUDA `TORCH_INDEX`, install the NVIDIA
+Container Toolkit and add `--gpus all` (compose: the commented `deploy` block).
+
+Update: `git pull`, build again, then `docker rm -f validator` and run it again (the
+volumes keep the settings).
+
+What does not work in the image: the features that run the lab tools from their own
+conda environments, which the image does not include: Prepare scenes, Integrate and
+Write validated tables in the Annotate tab (`FLYHOSTEL_VALIDATION_ENV`), Propose
+(YOLO + solver; `YOLOV7_CVAT`, needs a GPU), the Data collector's roi-proposer,
+preprocess-sample (idtrackerai v4), Crop arenas and its fetch from cv2 (ssh), the
+metadata downloads of the Overview (Google token), the SLEAP labels tab and training,
+the Monitor tab (nextflow processes of the host), the PE video's browser engine
+(Chrome), CVAT launch, the Ethoscope tab's download from cv1 and the Data management
+tab's backup drives unless mounted. These are tabs for the lab's server; annotators
+need none of them. Each could be added later as an image of its own (or a larger
+variant of this one) if needed.
+
 # Setup
 
 Point the application at your data directory:

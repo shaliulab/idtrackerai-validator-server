@@ -1,0 +1,51 @@
+# idtrackerai validator in Docker. See "Install with Docker" in the README.
+#
+#   export FLYHOSTEL_VIDEOS=/path/to/flyhostel_videos       # folder with index.txt and the experiments
+#   docker compose build                                    # needs an ssh agent holding your GitHub key
+#   docker compose up -d                                    # then open http://localhost:5000
+#
+# Settings go in a .env file next to this one (docker compose reads it) or in the shell:
+#   FLYHOSTEL_VIDEOS, VALIDATOR_PORT, VALIDATOR_EXPERIMENT, VALIDATOR_USERNAME / VALIDATOR_PASSWORD,
+#   CVAT_HOST / CVAT_USERNAME / CVAT_PASSWORD, RCLONE_CONFIG_DIR, UID / GID.
+services:
+  validator:
+    image: idtrackerai-validator:latest
+    build:
+      context: .
+      ssh: ["default"]                    # flyhostel's private submodules, cloned with your ssh agent
+      args:
+        UID: "${UID:-1000}"               # owner of what the server writes into the data folder
+        GID: "${GID:-1000}"
+        # TORCH_INDEX: https://download.pytorch.org/whl/cu128   # GPU build of torch (see gpus below)
+    ports:
+      - "${VALIDATOR_PORT:-5000}:5000"
+    environment:
+      VALIDATOR_EXPERIMENT: "${VALIDATOR_EXPERIMENT:-}"
+      VALIDATOR_USERNAME: "${VALIDATOR_USERNAME:-}"
+      VALIDATOR_PASSWORD: "${VALIDATOR_PASSWORD:-}"
+      CVAT_HOST: "${CVAT_HOST:-}"
+      CVAT_USERNAME: "${CVAT_USERNAME:-}"
+      CVAT_PASSWORD: "${CVAT_PASSWORD:-}"
+      # https: put cert.pem / key.pem (scripts/make_tls_certificates.sh) in ./tls and uncomment
+      # VALIDATOR_CERTFILE: /tls/cert.pem
+      # VALIDATOR_KEYFILE: /tls/key.pem
+      # VALIDATOR_CA_CERT: /tls/ca.pem
+    volumes:
+      - "${FLYHOSTEL_VIDEOS:?set FLYHOSTEL_VIDEOS to the folder holding index.txt}:/data"
+      - "${RCLONE_CONFIG_DIR:-~/.config/rclone}:/home/validator/.config/rclone"
+      - validator-config:/home/validator/.config
+      - validator-cache:/home/validator/.cache
+      # - ./tls:/tls:ro
+    restart: unless-stopped
+    # GPU (needs the NVIDIA Container Toolkit and an image built with a CUDA TORCH_INDEX):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  validator-config:
+  validator-cache:

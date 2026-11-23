@@ -1,0 +1,17 @@
+# The image builds the web interface from the pinned client commit and installs flyhostel /
+# imgstore from GitHub (setup.py's pins): local checkouts and builds stay out of the context.
+.git
+**/.git
+idtrackerai-validator-client
+flyhostel
+build
+dist
+*.egg-info
+idtrackerai_validator_server/frontend
+frames
+**/__pycache__
+**/*.py[cod]
+.env
+*.pem
+*.key
+docker-compose.override.yml
