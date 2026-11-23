@@ -42,19 +42,24 @@ conda activate validator
 
 ## Install
 
-**Annotating only** (the Group viewer, Annotate and Drive exchange tabs; see
-"Install for annotating only" below):
-
-```
-pip install .
-```
-
-**Everything the lab uses** (also flyhostel, idtrackerai and imgstore for the analysis tabs):
+You need an ssh key on GitHub with access to the shaliulab repositories (see below).
 
 ```
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install ".[full]"
+pip install .
 ```
+
+This gives the Group viewer (with sleep bouts, interactions, incubator readings and
+contours), the Annotate tab, the Drive exchange tab and the analysis tabs that need
+nothing else (Ethograms, PE, Pose, QC, Metadata overview, Data management, Monitor, ...).
+Optional extras:
+
+| Install | Adds |
+|---|---|
+| `pip install ".[sleap]"` | the SLEAP labels tab (sleap-io) |
+| `pip install ".[full]"` | every extra (today the same as `[sleap]`) |
+
+`pip install ".[annotator]"`, a former command, still works and installs the default.
 
 What `pip install` does on its own:
 
@@ -63,39 +68,38 @@ What `pip install` does on its own:
   submodule is not checked out, from a clone of its pinned commit (kept in `build/`).
   With one already there it installs that one as it is, unless pip built it from an
   older pinned commit (then it is rebuilt).
-- `[full]`: flyhostel (with ethoscopy and idtrackerai from its own submodules) and
-  imgstore at the commits the submodules point at, fetched from GitHub. When the
-  `flyhostel` submodule is checked out, these are installed from it instead, local
-  changes included.
+- flyhostel (with ethoscopy and idtrackerai from its own submodules) and imgstore, at
+  the commits the submodules point at, fetched from GitHub. When the `flyhostel`
+  submodule is checked out, they are installed from it instead, local changes included.
 
 flyhostel is fetched with git together with its submodules, which use ssh URLs
-(`git@github.com:…`) and include private lab repositories: `[full]` needs an ssh key on
-GitHub with access to the shaliulab repositories. Without it, use the annotator
-install.
+(`git@github.com:…`) and include private lab repositories: hence the ssh key. It is
+cloned again on every install (a few minutes).
 
-idtrackerai needs torch and torchvision at runtime. The first `pip install` gets
-the CPU builds, which are enough to serve the app. Skip it if your environment
-already has torch, for example a CUDA build.
+idtrackerai needs torch and torchvision. The first `pip install` gets the CPU builds,
+which are enough to serve the app; without it pip installs the default (CUDA) builds,
+several GB. Skip it if your environment already has torch, for example a CUDA build.
 
-Use `pip install -e ".[full]"` instead of `pip install ".[full]"` if you intend to
-edit the Python code. To work on the interface, check out its submodule
+Not Python packages, so not installed by pip:
+
+- `rclone` (https://rclone.org/install/) for the Drive exchange tab (and the Dropbox
+  checks of the Data management tab); see "Drive exchange" below.
+- `ffmpeg` (with libx264) to publish minimal bundles in the Drive exchange tab and for
+  the sleep bout / PE videos.
+- The lab tools run in their own conda environments (`FLYHOSTEL_VALIDATION_ENV` for
+  Prepare scenes / Integrate, `YOLOV7_CVAT` for Propose, roi-proposer, idtrackerai v4,
+  the metadata downloader, SLEAP): see the environment variables in `CLAUDE.md`.
+
+Use `pip install -e .` instead of `pip install .` if you intend to edit the Python code.
+To work on the interface, check out its submodule
 (`git submodule update --init idtrackerai-validator-client`) and rebuild it with
 `./build_frontend.sh` (which runs `git submodule update --init --recursive`
 first).
 
-## Install for annotating only
+## Drive exchange
 
-People who only annotate experiments shared through Google Drive (the **Drive exchange**
-tab) do not need flyhostel, idtrackerai or imgstore. Without them the server keeps the
-Group viewer, Annotate and Drive exchange tabs and grays out the others.
-
-```
-git clone https://github.com/shaliulab/idtrackerai-validator-server
-cd idtrackerai-validator-server
-pip install .
-```
-
-(`pip install ".[annotator]"`, the former command, still works and installs the same.)
+People who annotate experiments shared through Google Drive (the **Drive exchange**
+tab) install as above and set up rclone:
 
 The publisher shares the Google Drive exchange folder with your Google account as
 **Editor** and sends you its link, `https://drive.google.com/drive/folders/<FOLDER_ID>`.
@@ -149,7 +153,7 @@ To install one, check out its tag and install as above:
 
 ```
 git checkout v1.2.4
-pip install ".[full]"
+pip install .
 ```
 
 ## Update
@@ -158,7 +162,7 @@ pip install ".[full]"
 conda activate validator
 cd $HOME/opt/idtrackerai-validator-server
 git pull
-pip install ".[full]"      # or: pip install .  (annotating only)
+pip install .
 ```
 
 If you checked out the submodules, update them too (`git submodule update --init

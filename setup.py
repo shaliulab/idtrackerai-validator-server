@@ -66,9 +66,16 @@ def dependency(dist_name, path, url, extras=None):
     return "{} @ {}".format(name, path.as_uri() if _checked_out(path) else url)
 
 
-# The core: the Annotate tab, the Group viewer and the Drive exchange tab on an experiment downloaded from
-# Google Drive (compat.py). flyhostel, idtrackerai and imgstore are installed from source and only needed for
-# the analysis tabs: the [full] extra. An annotator installs `pip install .`, the lab `pip install ".[full]"`.
+# The default install (`pip install .`): the Group viewer, the Annotate tab and the Drive exchange tab, and
+# with flyhostel / idtrackerai / imgstore also the analysis tabs that need nothing else (Ethograms, PE, Pose, QC,
+# Overview, ...). flyhostel is fetched from the lab's GitHub (see below): the install needs access to it.
+# The Group viewer needs flyhostel for sleep bouts / interactions (utils.py) and the incubator readings
+# (environment.py), idtrackerai for the contours; the Annotate tab idtrackerai for the boxes proposed from
+# the segmented blobs (box_annotations / app._default_contours), flyhostel's pyarrow for the scenes'
+# coverage; the Drive exchange needs the rclone executable (not a Python package: https://rclone.org) and
+# idtrackerai to segment the contours of a minimal bundle (exchange_bundle.py).
+# compat.py still lets the server run without flyhostel / idtrackerai / imgstore (those tabs grayed out),
+# e.g. `pip install --no-deps .` over the requirements below minus those three.
 install_requires = [
     "flask>=2.2.5",
     "Flask-SQLAlchemy>=3.0.5",
@@ -77,7 +84,7 @@ install_requires = [
     "pandas>=1.3.5",
     "numpy>=1.21.6,<2",
     # frames are read with OpenCV (lite_store.py). The headless variant, as flyhostel declares it
-    # (opencv-python-headless<4): in [full] the resolver then picks one copy for both.
+    # (opencv-python-headless<4): the resolver picks one copy for both.
     "opencv-python-headless<5",
     # identity colours without idtrackerai (compat.get_spaced_colors)
     "matplotlib",
@@ -90,15 +97,10 @@ install_requires = [
     "requests",
     # continuity.py (the Annotate tab's continuity proposal)
     "scipy",
+    # box_annotations.scene_coverage (also required by flyhostel)
+    "pyarrow",
     # rois.py reads idtrackerai v5 .toml settings; tomllib is stdlib from 3.11 on.
     "tomli; python_version < '3.11'",
-]
-
-extras_require = {
-    # what an annotator needed before the core declared it: kept so `pip install ".[annotator]"` still works
-    "annotator": [],
-}
-extras_require["full"] = [
     # Imported at startup through flyhostel but declared by neither it
     # (plotly: flyhostel.data.pose.ethogram.plot) nor ethoscopy (tabulate and
     # hmmlearn: behavpy_HMM_class; astropy: behavpy_periodogram_class;
@@ -108,20 +110,31 @@ extras_require["full"] = [
     "hmmlearn",
     "astropy",
     "PyWavelets",
-    # sleap_labels.py; 0.9.5 checked: its .slp files load unchanged in SLEAP 1.3.3 (sleap-label)
-    "sleap-io==0.9.5",
-    # flyhostel's setup.py installs ethoscopy and idtrackerai (the [idtrackerai] extra) from its own
-    # libraries/ submodules, so it is fetched with git (pip clones the submodules recursively; they are
-    # ssh URLs and some are private lab repositories: this needs an ssh key with access to shaliulab).
-    # An archive (.tar.gz, no submodules) does not build: its setup.py then gives extras_require
-    # {"idtrackerai": [None]}.
+    # flyhostel's setup.py installs ethoscopy and idtrackerai (the [idtrackerai] extra; idtrackerai requires
+    # torch and torchvision) from its own libraries/ submodules, so it is fetched with git (pip clones the
+    # submodules recursively; they are ssh URLs and some are private lab repositories: this needs an ssh
+    # key with access to shaliulab). An archive (.tar.gz, no submodules) does not build: its setup.py then
+    # gives extras_require {"idtrackerai": [None]}.
+    # The commit is abbreviated on purpose: pip caches the wheel it builds from a git URL pinned to a full
+    # commit hash, and flyhostel's wheel holds `ethoscopy @ file:///tmp/pip-install-…/libraries/ethoscopy`
+    # (its submodules in pip's temporary clone), so every later install from the cache failed with "No such
+    # file or directory". With a short hash pip clones and builds it again each time.
     dependency("flyhostel", HERE / "flyhostel",
-               "git+{}/flyhostel.git@{}".format(GITHUB, pinned("flyhostel")), extras=["idtrackerai"]),
+               "git+{}/flyhostel.git@{}".format(GITHUB, pinned("flyhostel")[:12]), extras=["idtrackerai"]),
     # flyhostel requires a version newer than the latest on PyPI (0.4.19). An archive: imgstore's own
     # submodule (tests/data) is private and not needed to install it.
     dependency("imgstore-shaliulab", HERE / "flyhostel" / "libraries" / "imgstore",
                "{}/imgstore/archive/{}.tar.gz".format(GITHUB, pinned("flyhostel/libraries/imgstore"))),
 ]
+
+extras_require = {
+    # the SLEAP labels tab (sleap_labels.py, sleap_train.py); 0.9.5 checked: its .slp files load
+    # unchanged in SLEAP 1.3.3 (sleap-label)
+    "sleap": ["sleap-io==0.9.5"],
+    # kept so the former commands still work: [annotator] is now the default install
+    "annotator": [],
+}
+extras_require["full"] = extras_require["sleap"]
 
 
 def _client_source():
