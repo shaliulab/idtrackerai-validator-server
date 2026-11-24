@@ -23,9 +23,9 @@ GITHUB = "https://github.com/shaliulab"
 PINS = {
     # React client, built with npm into idtrackerai_validator_server/frontend (BuildWithFrontend)
     "idtrackerai-validator-client": "72f41dab81bb1db5d5f35acd834a2dde1d520c46",
-    "flyhostel": "14c8f431dd275487d74bcadd1c0ff00b929944dd",
+    "flyhostel": "849e0d247c778e228ddf1bdd7905d184216263e8",
     # flyhostel/libraries/imgstore: flyhostel needs >= 0.4.23, PyPI has 0.4.19
-    "flyhostel/libraries/imgstore": "47b833b167f699869bb41f5f72c64c2fa8658bac",
+    "flyhostel/libraries/imgstore": "25645ce11993be054e4f4e2d81b0fa25bef5432b",
 }
 
 
@@ -191,7 +191,7 @@ class BuildWithFrontend(build_py):
 
 setup(
     name='idtrackerai_validator_server',
-    version='1.4.0',
+    version='1.4.1',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',

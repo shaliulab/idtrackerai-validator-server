@@ -493,6 +493,14 @@ The defaults point to the lab server's layout (`/flyhostel_data/...`, conda envs
 environment variable that overrides it. To run the validator on another computer, set those
 variables. You don't need to edit the code.
 
+The two lab packages the validator installs do the same for their own paths:
+`flyhostel/lab_paths.py` (`from flyhostel import lab_paths`: `/flyhostel_data/cache`, the
+metadata and environment databases, `/ethoscope_data/sensors`, the pipeline CSVs, other lab
+checkouts, `~/.config/flyhostel`, ...) and `imgstore/lab_paths.py` (`from imgstore import
+lab_paths`: `~/.config/imgstore`, the paths of its examples). Variables with the same name
+(`FLYHOSTEL_METADATA`, `DEG_PROJECTS`, `NEXTFLOW_PIPELINES`) mean the same thing in all three
+packages.
+
 # Development
 
 Working on the client with hot reload, instead of rebuilding each time:

@@ -33,7 +33,7 @@ npm run build   # -> build/ (static/js/main.<hash>.js, as the server and CI expe
 
 ## Required Environment Variables
 
-Every default path, conda env, tool, remote host and config / cache file below is defined once in `idtrackerai_validator_server/lab_paths.py` (`from idtrackerai_validator_server import lab_paths`), next to the variable that overrides it; modules read `lab_paths.X` instead of their own literals. Add new lab-specific paths there.
+Every default path, conda env, tool, remote host and config / cache file below is defined once in `idtrackerai_validator_server/lab_paths.py` (`from idtrackerai_validator_server import lab_paths`), next to the variable that overrides it; modules read `lab_paths.X` instead of their own literals. Add new lab-specific paths there. The pinned lab packages have their own: `flyhostel.lab_paths` (`flyhostel/flyhostel/lab_paths.py`, flyhostel ≥ 849e0d2: data roots such as `/flyhostel_data/cache`, the environment database, `/ethoscope_data/sensors`, pipeline CSVs, other lab checkouts, `~/.config/flyhostel`) and `imgstore.lab_paths` (`flyhostel/libraries/imgstore/imgstore/lab_paths.py`, imgstore ≥ 25645ce: `~/.config/imgstore`, its examples' paths); variables of the same name (`FLYHOSTEL_METADATA`, `DEG_PROJECTS`, `NEXTFLOW_PIPELINES`) mean the same in the three.
 
 | Variable | Required | Description |
 |---|---|---|
