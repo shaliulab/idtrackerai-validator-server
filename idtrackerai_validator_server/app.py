@@ -72,6 +72,7 @@ from idtrackerai_validator_server.monitor import register_monitor
 from idtrackerai_validator_server.resources import register_resources
 from idtrackerai_validator_server.gpu_queue import register_gpu_queue
 from idtrackerai_validator_server.box_annotations import register_box_annotations
+from idtrackerai_validator_server.annotate_pack import cached_contours, register_annotate_pack
 from idtrackerai_validator_server.blobs_collection import (
     read_blobs, clear_cache as clear_blobs_cache, session_chunks, has_blobs_collections,
 )
@@ -275,15 +276,26 @@ def _frame_size():
     return int(values.get("frame_width", 1000)), int(values.get("frame_height", 1000))
 
 
+def _annotate_contours(frame_number):
+    """Contours the Annotate tab's proposals are made from: those of the pre-download when its chunk is built
+    (annotate_pack.py: segmented with the same config, no frame read), else segmented now"""
+    if BUNDLE is None:
+        found = cached_contours(SELECTED_EXPERIMENT, frame_number, int(CHUNKSIZE))
+        if found is not None:
+            return found
+    return _default_contours(frame_number)[0]
+
+
 def _annotate_state():
     if db_manager is None:
         return None
     return {"experiment": SELECTED_EXPERIMENT, "basedir": os.path.join(os.environ["FLYHOSTEL_VIDEOS"], SELECTED_EXPERIMENT),
             "dbfile": db_manager.dbfile, "chunksize": int(CHUNKSIZE), "n_animals": int(NUMBER_OF_ANIMALS),
-            "contours": lambda n: _default_contours(n)[0], "size": _frame_size}
+            "contours": _annotate_contours, "size": _frame_size, "config": IDTRACKERAI_CONFIG}
 
 
 register_box_annotations(app, get_state=_annotate_state)
+register_annotate_pack(app, get_state=_annotate_state)
 register_gdrive_exchange(app, get_loaded=lambda: SELECTED_EXPERIMENT, get_commit=lambda: GIT_VERSION)
 # after every module registering a kind of GPU job (data_collector, sleap_train)
 register_gpu_queue(app)

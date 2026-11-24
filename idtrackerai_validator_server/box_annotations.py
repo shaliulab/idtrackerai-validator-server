@@ -1150,6 +1150,84 @@ def write_frames(state, items):
              "updated": now} for fn, boxes in items]
 
 
+def frame_payload(state, frame_number, want=None):
+    """What /api/annotate/frame/<n> answers (want: its ?proposal=): the saved boxes, else the solver's /
+    continuity / idtrackerai's proposal, with the machine rows, fragment events and splits, clock, ...
+    Also the frames of the Annotate tab's pre-download (annotate_pack.chunk_data)."""
+    chunk = frame_number // state["chunksize"]
+    rows = _machine_rows(state["dbfile"], frame_number)
+    saved, meta, solver, flags = None, None, None, []
+    con = _connect(state["basedir"])
+    if con is not None:
+        with con:
+            meta = con.execute("SELECT author, updated FROM frames WHERE frame_number = ?", (frame_number,)).fetchone()
+            if meta:
+                saved = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab, **({"track": tr} if tr else {})}
+                         for a, b, c, d, lab, tr in con.execute(
+                             "SELECT x0, y0, x1, y1, label, track FROM boxes WHERE frame_number = ? ORDER BY rowid", (frame_number,))]
+            pf = con.execute("SELECT flags FROM proposal_frames WHERE frame_number = ?", (frame_number,)).fetchone()
+            if pf:
+                flags = json.loads(pf[0] or "[]")
+                solver = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab or "", "note": note or "", "confidence": conf}
+                          for a, b, c, d, lab, note, conf in con.execute(
+                              "SELECT x0, y0, x1, y1, label, note, confidence FROM proposals WHERE frame_number = ? ORDER BY rowid",
+                              (frame_number,))]
+        con.close()
+    proposal, source = None, None
+    labels, splits = {}, {}
+    con = _connect(state["basedir"])
+    if con is not None:
+        with con:
+            labels, splits = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
+        con.close()
+    anchor = None
+
+    def frame_contours():
+        try:
+            return state["contours"](frame_number)
+        except Exception as exc:
+            logger.warning("No contours for frame %s: %s", frame_number, exc)
+            return []
+
+    if solver is not None and (saved is None or want) and want not in ("tracking", "continuity"):
+        proposal, source = solver, "solver"
+    elif saved is None or want:
+        # continuity (identities followed by position) unless idtrackerai's boxes are asked for; idtrackerai's
+        # when it has no anchor in the chunk
+        if want != "tracking" and bundle_info(state["basedir"]) is None:
+            con = _connect(state["basedir"])
+            try:
+                found = continuity_proposal(state, con, frame_number, rows, frame_contours(), labels, splits)
+            except (sqlite3.Error, ValueError) as exc:
+                logger.warning("No continuity proposal for frame %s: %s", frame_number, exc)
+                found = None
+            finally:
+                if con is not None:
+                    con.close()
+            if found is not None:
+                proposal, flags, anchor = found
+                source = "continuity"
+        if proposal is None:
+            source = "tracking"
+            width, height = state["size"]()
+            proposal = propose(rows, frame_contours(), width, height)
+    # a person's labels of the fragments in the chunk go first, as for the solver and idtrackerai's; the continuity
+    # proposal has them already (its anchor: a saved frame, or idtrackerai's put in them by anchor_labels), and
+    # inheriting on top of it would undo what it followed through a crossing (new fragments keep no label)
+    if proposal is not None and source != "continuity":
+        proposal = inherit_labels(proposal, rows, labels, frame_number, splits)
+    return {
+        "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",
+        "flags": flags, "has_solver": solver is not None, "anchor": anchor,
+        "saved": saved is not None, "boxes": proposal if proposal is not None else saved,
+        "author": meta[0] if meta else None, "updated": meta[1] if meta else None,
+        "machine": rows, "concatenation": _concatenation(state["dbfile"], chunk),
+        "clock": _clock(state["dbfile"], frame_number),
+        "fragment_events": fragment_events(state["dbfile"], frame_number, state["chunksize"]),
+        "fragment_splits": {str(f): fs for f, fs in splits.items()},
+    }
+
+
 def register_box_annotations(app, get_state):
     """get_state() -> None (no database) or a dict with experiment, basedir, dbfile, chunksize,
     n_animals, contours(frame_number) -> list, size() -> (width, height)."""
@@ -1258,79 +1336,7 @@ def register_box_annotations(app, get_state):
         state, error = state_or_error()
         if error:
             return error
-        chunk = frame_number // state["chunksize"]
-        rows = _machine_rows(state["dbfile"], frame_number)
-        saved, meta, solver, flags = None, None, None, []
-        want = request.args.get("proposal")
-        con = _connect(state["basedir"])
-        if con is not None:
-            with con:
-                meta = con.execute("SELECT author, updated FROM frames WHERE frame_number = ?", (frame_number,)).fetchone()
-                if meta:
-                    saved = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab, **({"track": tr} if tr else {})}
-                             for a, b, c, d, lab, tr in con.execute(
-                                 "SELECT x0, y0, x1, y1, label, track FROM boxes WHERE frame_number = ? ORDER BY rowid", (frame_number,))]
-                pf = con.execute("SELECT flags FROM proposal_frames WHERE frame_number = ?", (frame_number,)).fetchone()
-                if pf:
-                    flags = json.loads(pf[0] or "[]")
-                    solver = [{"x0": a, "y0": b, "x1": c, "y1": d, "label": lab or "", "note": note or "", "confidence": conf}
-                              for a, b, c, d, lab, note, conf in con.execute(
-                                  "SELECT x0, y0, x1, y1, label, note, confidence FROM proposals WHERE frame_number = ? ORDER BY rowid",
-                                  (frame_number,))]
-            con.close()
-        proposal, source = None, None
-        labels, splits = {}, {}
-        con = _connect(state["basedir"])
-        if con is not None:
-            with con:
-                labels, splits = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
-            con.close()
-        anchor = None
-
-        def frame_contours():
-            try:
-                return state["contours"](frame_number)
-            except Exception as exc:
-                logger.warning("No contours for frame %s: %s", frame_number, exc)
-                return []
-
-        if solver is not None and (saved is None or want) and want not in ("tracking", "continuity"):
-            proposal, source = solver, "solver"
-        elif saved is None or want:
-            # continuity (identities followed by position) unless idtrackerai's boxes are asked for; idtrackerai's
-            # when it has no anchor in the chunk
-            if want != "tracking" and bundle_info(state["basedir"]) is None:
-                con = _connect(state["basedir"])
-                try:
-                    found = continuity_proposal(state, con, frame_number, rows, frame_contours(), labels, splits)
-                except (sqlite3.Error, ValueError) as exc:
-                    logger.warning("No continuity proposal for frame %s: %s", frame_number, exc)
-                    found = None
-                finally:
-                    if con is not None:
-                        con.close()
-                if found is not None:
-                    proposal, flags, anchor = found
-                    source = "continuity"
-            if proposal is None:
-                source = "tracking"
-                width, height = state["size"]()
-                proposal = propose(rows, frame_contours(), width, height)
-        # a person's labels of the fragments in the chunk go first, as for the solver and idtrackerai's; the continuity
-        # proposal has them already (its anchor: a saved frame, or idtrackerai's put in them by anchor_labels), and
-        # inheriting on top of it would undo what it followed through a crossing (new fragments keep no label)
-        if proposal is not None and source != "continuity":
-            proposal = inherit_labels(proposal, rows, labels, frame_number, splits)
-        return jsonify({
-            "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",
-            "flags": flags, "has_solver": solver is not None, "anchor": anchor,
-            "saved": saved is not None, "boxes": proposal if proposal is not None else saved,
-            "author": meta[0] if meta else None, "updated": meta[1] if meta else None,
-            "machine": rows, "concatenation": _concatenation(state["dbfile"], chunk),
-            "clock": _clock(state["dbfile"], frame_number),
-            "fragment_events": fragment_events(state["dbfile"], frame_number, state["chunksize"]),
-            "fragment_splits": {str(f): fs for f, fs in splits.items()},
-        })
+        return jsonify(frame_payload(state, frame_number, request.args.get("proposal")))
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["POST"])
     def annotate_save(frame_number):

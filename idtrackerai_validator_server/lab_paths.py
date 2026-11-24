@@ -143,6 +143,8 @@ CACHE_DIR = os.path.join(HOME, ".cache", "idtrackerai-validator")
 QC_CACHE_DIR = _env("QC_CACHE_DIR", os.path.join(CACHE_DIR, "qc"))
 # Annotate tab's easy scenes
 CONTINUITY_CACHE_DIR = _env("CONTINUITY_CACHE_DIR", os.path.join(CACHE_DIR, "continuity"))
+# Annotate tab's pre-download (annotate_pack.py): per experiment the scene frames as H.264, contours, frame data
+ANNOTATE_PACK_CACHE = _env("ANNOTATE_PACK_CACHE", os.path.join(CACHE_DIR, "annotate_pack"))
 # last Data management scan (dropbox.json, dropbox_hashes.json, restore.json, ... next to it)
 DATA_MANAGEMENT_CACHE = _user_env("DATA_MANAGEMENT_CACHE", "~/.cache/idtrackerai-validator/data_management.json")
 # Drive exchange downloads and minimal bundles

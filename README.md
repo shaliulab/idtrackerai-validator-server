@@ -232,7 +232,7 @@ The image's stages also make the Windows install bundle (see "Install on Windows
 | `/data` | `$FLYHOSTEL_VIDEOS`: `index.txt` and the experiment folders (the Annotate tab writes `flyhostel/validation/validator_annotations.db` in them, the PE tab `pe_annotations.db` at the top). Must be writable for annotating; read-only works to browse |
 | `/home/validator/.config/rclone` | your `rclone.conf` (Drive exchange, Dropbox checks): set the remote up on the host with `rclone config`, or inside with `docker exec -it validator rclone config` |
 | `/home/validator/.config` | the login cookie's secret key, Drive exchange settings, validation queue |
-| `/home/validator/.cache` | QC and continuity caches |
+| `/home/validator/.cache` | QC and continuity caches, the Annotate tab's pre-download (`annotate_pack`, a few GB per experiment) |
 
 The container listens on all its interfaces, so set `VALIDATOR_USERNAME` and
 `VALIDATOR_PASSWORD` (or publish the port on loopback only: `-p 127.0.0.1:5000:5000`).
