@@ -426,9 +426,13 @@ def lab_deps():
         if name not in LAB_DEPS or name in found:
             continue
         direct = _direct_url(dist) or {}
-        found[name] = {"name": name, "version": dist.version, "url": direct.get("url"),
-                       "editable": bool(direct.get("dir_info", {}).get("editable")),
-                       "path": _url_path(direct.get("url"))}
+        entry = {"name": name, "version": dist.version, "url": direct.get("url"),
+                 "editable": bool(direct.get("dir_info", {}).get("editable")), "path": _url_path(direct.get("url"))}
+        meta = str(getattr(dist, "_path", "") or "")
+        if not direct and meta.endswith(".egg-info") and "-packages" not in meta:
+            # `setup.py develop` (older pip, an .egg-link): the metadata lives in the source folder
+            entry.update(editable=True, path=os.path.dirname(meta))
+        found[name] = entry
     return found
 
 
