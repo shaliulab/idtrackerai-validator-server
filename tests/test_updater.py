@@ -171,6 +171,7 @@ RELEASE = {"tag": "v9.0.0", "version": "9.0.0", "name": "v9.0.0", "notes": "## N
 class Endpoints(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
         make_repo(self.root)
         self.app = Flask(__name__)
@@ -186,12 +187,8 @@ class Endpoints(unittest.TestCase):
                         mock.patch.object(updater, "cgroup_processes", return_value=[])]
         for p in self.patches:
             p.start()
+            self.addCleanup(p.stop)     # also when setUp fails below: a patch left running broke later tests
         self.client = self.app.test_client()
-
-    def tearDown(self):
-        for p in self.patches:
-            p.stop()
-        self.tmp.cleanup()
 
     def remote(self):
         return {"REMOTE_ADDR": "10.1.2.3"}
@@ -309,6 +306,42 @@ class Cgroup(unittest.TestCase):
                              "/user.slice/user-1000.slice/user@1000.service/app.slice/idtrackerai-viewer.service")
         finally:
             os.unlink(f.name)
+
+
+class UserSite(unittest.TestCase):
+    def test_werkzeug_version(self):
+        # Flask 2.2's test_client() reads werkzeug.__version__, which Werkzeug 3 (e.g. from ~/.local) lacks
+        import werkzeug
+        self.assertTrue(werkzeug.__version__)
+        Flask(__name__).test_client()
+
+    def test_first_copy_wins(self):
+        rows = [["Werkzeug", "3.1.3", "/home/u/.local/lib/python3.10/site-packages", True],
+                ["werkzeug", "2.2.3", "/env/lib/python3.10/site-packages", False],
+                ["flask", "2.2.5", "/env/lib/python3.10/site-packages", False]]
+        with mock.patch.object(updater.subprocess, "run", return_value=mock.Mock(stdout=json.dumps(rows))):
+            found = updater.installed_distributions("python")
+        self.assertEqual(found["werkzeug"]["version"], "3.1.3")
+        self.assertTrue(found["werkzeug"]["user_site"])
+
+    def test_shadowed_requirement_refused(self):
+        installed = {"werkzeug": {"version": "2.0.0", "location": "/home/u/.local", "user_site": True},
+                     "flask": {"version": "2.2.5", "location": "/env", "user_site": False}}
+        run = mock.Mock(stdout=json.dumps(["werkzeug>=3", "flask>=2"]))
+        with mock.patch.object(updater.subprocess, "run", return_value=run), \
+                mock.patch.object(updater, "installed_distributions", return_value=installed):
+            with self.assertRaisesRegex(updater.UpdateError, "user site"):
+                updater.plain_requirements("python", ["x"])
+            installed["werkzeug"]["user_site"] = False
+            self.assertEqual(updater.plain_requirements("python", ["x"]), ["werkzeug>=3"])
+
+    def test_requirement_name(self):
+        self.assertEqual(updater._requirement_name("Flask_SQLAlchemy>=3.0.5"), "flask-sqlalchemy")
+        self.assertEqual(updater._requirement_name("tomli; python_version < '3.11'"), "tomli")
+
+    def test_detect_install_reports_it(self):
+        info = updater.detect_install()
+        self.assertIn("user_site", info)
 
 
 class WebFallback(unittest.TestCase):

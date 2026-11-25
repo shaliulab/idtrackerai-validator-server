@@ -323,7 +323,7 @@ def detect_install():
     direct = _direct_url(dist) if dist else None
     editable = bool(direct and direct.get("dir_info", {}).get("editable"))
     info = {"root": root, "python": sys.executable, "prefix": sys.prefix, "editable": editable,
-            "platform": sys.platform, "service": systemd_unit(), "reason": None}
+            "platform": sys.platform, "service": systemd_unit(), "reason": None, "user_site": user_site()}
     forced = os.environ.get("VALIDATOR_INSTALL")
     if forced in ("git", "windows", "docker", "pip"):
         info.update(kind=forced, reason="VALIDATOR_INSTALL={}".format(forced))
@@ -342,6 +342,30 @@ def detect_install():
     if info["kind"] == "windows":
         info.setdefault("install_dir", lab_paths.WINDOWS_INSTALL_DIR)
     return info
+
+
+def user_site():
+    """The user site (~/.local/lib/pythonX.Y/site-packages) when this python reads it, and the distributions
+    it holds that the env also has in another version (`shadows`: name, user / env version): the user site
+    comes first in sys.path, so its copy is the one imported, whatever pip installs into the env."""
+    import site
+    if not site.ENABLE_USER_SITE:
+        return None
+    path = site.getusersitepackages()
+    if not os.path.isdir(path):
+        return None
+    first, shadows = {}, []
+    for dist in importlib.metadata.distributions():
+        name = dist.metadata["Name"]
+        if not name:
+            continue
+        here = _same_path(str(dist.locate_file("")), path)
+        key = _canon(name)
+        if key not in first:
+            first[key] = (here, dist.version)
+        elif first[key][0] and not here and first[key][1] != dist.version:
+            shadows.append({"name": name, "user": first[key][1], "env": dist.version})
+    return {"path": path, "shadows": sorted(shadows, key=lambda s: s["name"].lower())}
 
 
 # ---- git ------------------------------------------------------------------------------------------
@@ -1139,10 +1163,49 @@ def plain_requirements(python, dists):
     the metadata just written by pip)."""
     out = subprocess.run([python, "-c", _REQUIRES, *dists], capture_output=True, text=True, timeout=120, check=True)
     requirements = json.loads(out.stdout)
-    script = "import importlib.metadata as m, json; print(json.dumps({d.metadata['Name']: d.version for d in m.distributions() if d.metadata['Name']}))"
-    installed = json.loads(subprocess.run([python, "-c", script], capture_output=True, text=True, timeout=120,
-                                          check=True).stdout)
-    return filter_requirements(requirements, {_canon(k): v for k, v in installed.items()})
+    installed = installed_distributions(python)
+    missing = filter_requirements(requirements, {k: v["version"] for k, v in installed.items()})
+    shadowed = [text for text in missing if (installed.get(_requirement_name(text)) or {}).get("user_site")]
+    if shadowed:
+        # pip would install them into the env, where the user site's copy still hides them
+        raise UpdateError("the user site ({}) holds a version of {} that does not satisfy {}: pip would install "
+                          "another into {}, which the user site's copy would still hide. Update or remove it there "
+                          "first (python -m pip install --user ..., or delete it)".format(
+                              installed[_requirement_name(shadowed[0])]["location"],
+                              ", ".join(_requirement_name(t) for t in shadowed), ", ".join(shadowed),
+                              sys.prefix))
+    return missing
+
+
+_DISTRIBUTIONS = (
+    "import importlib.metadata as m, json, os, site\n"
+    "user = site.getusersitepackages() if site.ENABLE_USER_SITE else None\n"
+    "out = []\n"
+    "for d in m.distributions():\n"
+    "    name = d.metadata['Name']\n"
+    "    if not name:\n"
+    "        continue\n"
+    "    location = str(d.locate_file(''))\n"
+    "    out.append([name, d.version, location, bool(user) and os.path.realpath(location) == os.path.realpath(user)])\n"
+    "print(json.dumps(out))\n"
+)
+
+
+def installed_distributions(python):
+    """canonical name -> {version, location, user_site} of the distributions `python` imports. Order matters:
+    importlib.metadata lists them in sys.path order, and the first one is the one imported, so the user site's
+    copy (~/.local/lib/pythonX.Y/site-packages, before the env's site-packages) wins over the env's. Keeping the
+    last one (as a dict comprehension did) judged requirements on a copy the server never imports."""
+    rows = json.loads(subprocess.run([python, "-c", _DISTRIBUTIONS], capture_output=True, text=True, timeout=120,
+                                     check=True).stdout)
+    out = {}
+    for name, version, location, user_site in rows:
+        out.setdefault(_canon(name), {"version": version, "location": location, "user_site": user_site})
+    return out
+
+
+def _requirement_name(text):
+    return _canon(re.split(r"[\s<>=!~;\[(@]", text.strip(), maxsplit=1)[0])
 
 
 class WindowsUpdate(_Update):
