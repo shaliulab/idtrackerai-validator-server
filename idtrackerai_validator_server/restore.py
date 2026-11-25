@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import jsonify, request
 
 from idtrackerai_validator_server import dropbox
+from idtrackerai_validator_server import rclone_errors
 from idtrackerai_validator_server import data_management as dm
 from idtrackerai_validator_server.jobs import start_job
 from idtrackerai_validator_server.oscompat import posix_relpath
@@ -92,8 +93,7 @@ def list_remote_experiments(timeout=600):
     proc = subprocess.run([dropbox.RCLONE, "lsf", "-R", "--dirs-only", "--max-depth", "3", dropbox.REMOTE],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if proc.returncode != 0:
-        lines = proc.stderr.strip().splitlines()
-        raise RuntimeError(f"rclone lsf {dropbox.REMOTE} failed: {lines[-1] if lines else proc.returncode}")
+        raise rclone_errors.error_from(proc.stderr, command="lsf", remote=dropbox.REMOTE, returncode=proc.returncode)
     return sorted("/".join(m.groups()) for m in map(EXPERIMENT_RE.fullmatch, proc.stdout.splitlines()) if m)
 
 
@@ -154,18 +154,30 @@ def _rclone_copy(source, target, on_bytes, extra=(), command="copy"):
     cmd = [dropbox.RCLONE, command, source, target, "--transfers", "4", "--checkers", "8",
            "--use-json-log", "--stats", "5s", "--stats-log-level", "NOTICE", *extra]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    errors = []
+    errors, text = [], []      # text: stderr as rclone writes it without --use-json-log, for rclone_errors
     for line in proc.stderr:
         try:
             entry = json.loads(line)
         except ValueError:
+            text.append(line.rstrip("\n"))        # fatal errors and their JSON bodies are not JSON log lines
+            continue
+        if not isinstance(entry, dict):
+            text.append(line.rstrip("\n"))
             continue
         if "stats" in entry:
             on_bytes(entry["stats"].get("bytes", 0))
-        elif entry.get("level") == "error":
+        elif entry.get("level") in ("error", "critical"):
             errors.append(f"{entry.get('object', '')}: {entry.get('msg', '')}".strip(": "))
-    if proc.wait() != 0:
-        raise RuntimeError(f"rclone {command} failed ({len(errors)} error(s)){': ' + errors[-1] if errors else ''}")
+            text.append(f"{entry['level'].upper()} : {errors[-1]}")
+    code = proc.wait()
+    if code != 0:
+        remote = next((p for p in (source, target) if re.match(r"^[\w.-]{2,}:", p)), None)
+        error = rclone_errors.error_from("\n".join(text[-200:]), command=command, remote=remote, returncode=code)
+        n_errors = sum(not re.match(r"Attempt \d+/\d+ failed", e) for e in errors)
+        if n_errors > 1:
+            error.args = (f"{error.message} ({n_errors} errors)",)
+            error.message = error.args[0]
+        raise error
 
 
 def restore_experiment(root, experiment, on_progress):

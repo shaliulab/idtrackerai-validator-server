@@ -1,0 +1,2 @@
+2026/11/25 18:41:57 ERROR : : error listing: directory not found
+2026/11/25 18:41:57 Failed to lsjson with 2 errors: last error was: error in ListJSON: directory not found

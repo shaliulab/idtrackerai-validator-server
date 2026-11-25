@@ -37,6 +37,7 @@ import subprocess
 from flask import jsonify, request
 
 from idtrackerai_validator_server import dropbox
+from idtrackerai_validator_server import rclone_errors
 from idtrackerai_validator_server import data_management as dm
 from idtrackerai_validator_server.jobs import start_job
 
@@ -127,9 +128,9 @@ def rclone_delete(folder, paths):
     finally:
         os.unlink(listing)
     if proc.returncode != 0:
-        lines = proc.stderr.strip().splitlines()
-        logger.warning("rclone delete in %s: %s", folder, proc.stderr)
-        return lines[-1] if lines else f"rclone exited with {proc.returncode}"
+        logger.warning("rclone delete in %s failed", folder)
+        return rclone_errors.error_from(proc.stderr, command="delete", remote=dropbox.REMOTE,
+                                        returncode=proc.returncode).message
     return None
 
 

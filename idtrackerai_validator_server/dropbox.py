@@ -30,6 +30,7 @@ import subprocess
 from collections import defaultdict
 from idtrackerai_validator_server.oscompat import posix_relpath
 from idtrackerai_validator_server import lab_paths
+from idtrackerai_validator_server import rclone_errors
 
 REMOTE = lab_paths.DROPBOX_REMOTE
 RCLONE = lab_paths.RCLONE
@@ -64,8 +65,7 @@ def list_remote(relpath, recursive=False, timeout=900):
     if proc.returncode != 0:
         if "directory not found" in proc.stderr:
             return None
-        lines = proc.stderr.strip().splitlines()
-        raise RuntimeError(f"rclone lsjson {relpath} failed: {lines[-1] if lines else proc.returncode}")
+        raise rclone_errors.error_from(proc.stderr, command="lsjson", remote=REMOTE, returncode=proc.returncode)
     return {entry["Path"]: (entry["Size"], (entry.get("Hashes") or {}).get("DropboxHash"))
             for entry in json.loads(proc.stdout)}
 

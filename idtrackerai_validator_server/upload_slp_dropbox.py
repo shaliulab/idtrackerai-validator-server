@@ -36,6 +36,7 @@ from idtrackerai_validator_server import dropbox
 from idtrackerai_validator_server.compress_slp import LOG_FILE as COMPRESS_LOG
 from idtrackerai_validator_server.experiments import to_relpath
 from idtrackerai_validator_server import lab_paths
+from idtrackerai_validator_server import rclone_errors
 
 UPLOAD_LOG = lab_paths.UPLOAD_SLP_LOG
 SA_DIR = "flyhostel/single_animal"
@@ -96,8 +97,8 @@ def upload(root, folder, names, transfers):
         os.remove(files_from)
     error = None
     if proc.returncode != 0:
-        lines = proc.stderr.strip().splitlines()
-        error = f"rclone copy failed: {lines[-1] if lines else proc.returncode}"
+        error = rclone_errors.error_from(proc.stderr, command="copy", remote=dropbox.REMOTE,
+                                         returncode=proc.returncode).message
     remote = dropbox.list_remote(folder, recursive=True) or {}
     verified = [name for name in names
                 if dropbox.compare(os.path.join(root, folder, name), remote.get(name), verify=True)

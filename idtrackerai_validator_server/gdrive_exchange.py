@@ -59,6 +59,7 @@ from idtrackerai_validator_server.jobs import start_job, _jobs
 from idtrackerai_validator_server.restore import _rclone_copy, _add_to_index
 from idtrackerai_validator_server.oscompat import posix_relpath, username
 from idtrackerai_validator_server import lab_paths
+from idtrackerai_validator_server import rclone_errors
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +127,8 @@ def annotator_name():
 def _rclone(*args, input=None, timeout=120):
     proc = subprocess.run([RCLONE, *args], input=input, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
-        lines = [line for line in proc.stderr.strip().splitlines() if line.strip()]
-        raise RuntimeError(f"rclone {args[0]} failed: {lines[-1] if lines else proc.returncode}")
+        raise rclone_errors.error_from(proc.stderr, command=args[0], remote=read_config()["remote"],
+                                       returncode=proc.returncode)
     return proc.stdout
 
 
@@ -151,7 +152,8 @@ def _lsjson(path, *args, timeout=300):
     try:
         return json.loads(_rclone("lsjson", *args, path, timeout=timeout))
     except RuntimeError as error:
-        if "directory not found" in str(error).lower() or "not found" in str(error).lower():
+        if getattr(error, "kind", None) == rclone_errors.NOT_FOUND or (
+                not isinstance(error, rclone_errors.RcloneError) and "not found" in str(error).lower()):
             return None
         raise
 
@@ -160,30 +162,38 @@ def remote_status():
     """rclone installed, the remote configured and reachable"""
     config = read_config()
     out = {"remote": config["remote"], "annotator": config["annotator"], "rclone": shutil.which(RCLONE) is not None,
-           "configured": False, "reachable": False, "error": None, "config_file": CONFIG_FILE}
+           "configured": False, "reachable": False, "error": None, "error_kind": None, "error_hint": None,
+           "error_command": None, "error_detail": None, "config_file": CONFIG_FILE}
     if not out["rclone"]:
         out["error"] = f"{RCLONE} not found: install rclone (https://rclone.org/install/)"
         return out
     try:
         remotes = _rclone("listremotes", timeout=20).split()
-    except (RuntimeError, subprocess.TimeoutExpired) as error:
-        out["error"] = str(error)
+    except subprocess.TimeoutExpired:
+        out["error"] = "rclone listremotes did not answer in 20 s"
+        return out
+    except RuntimeError as error:
+        out.update(rclone_errors.error_info(error))
         return out
     name = config["remote"].split(":")[0] + ":"
     out["configured"] = name in remotes
     if not out["configured"]:
-        out["error"] = f"no rclone remote {name} (run `rclone config` and add a Google Drive remote named {name[:-1]})"
+        out.update(error=f"no rclone remote {name} on the server (run `rclone config` there and add a Google Drive "
+                         f"remote named {name[:-1]})", error_kind=rclone_errors.NOT_CONFIGURED,
+                   error_command="rclone config")
         return out
     try:
         _rclone("lsf", "--max-depth", "1", "--dirs-only", config["remote"], timeout=60)
         out["reachable"] = True
-    except (RuntimeError, subprocess.TimeoutExpired) as error:
-        msg = str(error)
-        if "directory not found" in msg.lower():
-            out["reachable"], out["error"] = True, None     # made on first publish
+    except subprocess.TimeoutExpired:
+        out.update(error=f"rclone lsf {config['remote']} did not answer in 60 s (network?)",
+                   error_kind=rclone_errors.NETWORK)
+    except RuntimeError as error:
+        if getattr(error, "kind", None) == rclone_errors.NOT_FOUND:
+            out["reachable"] = True     # made on first publish
             out["empty"] = True
         else:
-            out["error"] = msg
+            out.update(rclone_errors.error_info(error))
     return out
 
 
@@ -663,8 +673,9 @@ def register_gdrive_exchange(app, get_loaded=lambda: None, get_commit=lambda: No
             try:
                 list_drive()
             except (RuntimeError, subprocess.TimeoutExpired) as error:
-                _listing.update(error=str(error))
-                return jsonify({"error": str(error), "experiments": _listing["experiments"], "at": _listing["at"]}), 502
+                info = rclone_errors.error_info(error)
+                _listing.update(error=info["error"])
+                return jsonify(dict(info, experiments=_listing["experiments"], at=_listing["at"])), 502
         # local state may have changed since the listing
         experiments = [dict(e, local={"exists": os.path.isdir(basedir_of(e["experiment"])),
                                       "exchange": read_local(basedir_of(e["experiment"]))})

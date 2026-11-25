@@ -1,0 +1,2 @@
+2026/11/25 18:41:56 ERROR : : error listing: couldn't list files: Propfind "https://no-such-host.invalid/dav/": dial tcp: lookup no-such-host.invalid: no such host
+2026/11/25 18:41:56 Failed to lsf with 2 errors: last error was: error in ListJSON: couldn't list files: Propfind "https://no-such-host.invalid/dav/": dial tcp: lookup no-such-host.invalid: no such host

@@ -1,0 +1,7 @@
+{"level":"error","msg":"error reading source directory: directory not found","object":"","objectType":"string","source":"march/march.go:400","time":"2026-11-25T18:43:03.531704+00:00"}
+{"level":"error","msg":"Attempt 1/3 failed with 1 errors and: directory not found","source":"cmd/cmd.go:274","time":"2026-11-25T18:43:03.532201+00:00"}
+{"level":"error","msg":"error reading source directory: directory not found","object":"","objectType":"string","source":"march/march.go:400","time":"2026-11-25T18:43:03.532435+00:00"}
+{"level":"error","msg":"Attempt 2/3 failed with 1 errors and: directory not found","source":"cmd/cmd.go:274","time":"2026-11-25T18:43:03.532502+00:00"}
+{"level":"error","msg":"error reading source directory: directory not found","object":"","objectType":"string","source":"march/march.go:400","time":"2026-11-25T18:43:03.53262+00:00"}
+{"level":"error","msg":"Attempt 3/3 failed with 1 errors and: directory not found","source":"cmd/cmd.go:274","time":"2026-11-25T18:43:03.532668+00:00"}
+2026/11/25 18:43:03 Failed to copy: directory not found
