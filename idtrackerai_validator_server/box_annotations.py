@@ -42,6 +42,7 @@ Routes
                                              frames with "range": "annotated"; save writes what was integrated
     POST   /api/annotate/integrate/stop      kills the running integration / write of the loaded experiment
 """
+import bisect
 import csv
 import glob
 import json
@@ -59,7 +60,7 @@ import cv2
 import numpy as np
 from flask import jsonify, request, session
 
-from idtrackerai_validator_server import continuity, links
+from idtrackerai_validator_server import continuity, links, scene_scorer
 from idtrackerai_validator_server.compat import get_number_of_animals
 from idtrackerai_validator_server.experiments import is_validated, to_flat
 from idtrackerai_validator_server.oscompat import SIGKILL, env_executable, env_path, kill_tree, new_session, posix_relpath, username
@@ -75,6 +76,7 @@ MIN_BOX = 50               # px: a proposal covers at least the square flyhostel
 PAD = 4                    # px around the segmented blob
 MAX_SCENE_LENGTH = 5000    # as flyhostel's export-images
 VALIDATION_ENV = lab_paths.FLYHOSTEL_VALIDATION_ENV
+CONTINUITY_VERSION = 2 if lab_paths.ANNOTATE_CONTINUITY_VERSION == "2" else 1   # continuity proposal by default
 YOLOV7_CVAT = lab_paths.YOLOV7_CVAT
 
 _lock = threading.Lock()
@@ -1017,10 +1019,11 @@ def anchor_labels(dbfile, frame_number, n_animals, labels, splits):
     return out
 
 
-def continuity_proposal(state, con, frame_number, rows, contours, labels=None, splits=None):
+def continuity_proposal(state, con, frame_number, rows, contours, labels=None, splits=None, version=1):
     """Boxes of the continuity proposal (continuity.py) of a frame, its flags and anchor, or None (no anchor in the
     chunk). rows: _machine_rows of the frame; con: the sidecar (None when it does not exist); labels, splits:
-    chunk_fragment_labels, which put an idtrackerai anchor in the person's labels (anchor_labels)."""
+    chunk_fragment_labels, which put an idtrackerai anchor in the person's labels (anchor_labels). version 2:
+    continuity.RunV2 (`?proposal=continuity2`)."""
     chunk_start = frame_number // state["chunksize"] * state["chunksize"]
     saved_before = None
     if con is not None:
@@ -1034,7 +1037,7 @@ def continuity_proposal(state, con, frame_number, rows, contours, labels=None, s
     translate = (lambda fn, _rows: anchor_labels(state["dbfile"], fn, state["n_animals"], labels, splits or {})) \
         if labels else None
     result = continuity.track(state["dbfile"], frame_number, state["chunksize"], state["n_animals"], scenes,
-                              saved_before, translate)
+                              saved_before, translate, version=version)
     if result is None or len(result["rows"]) != len(rows):
         return None
     width, height = state["size"]()
@@ -1046,10 +1049,12 @@ def continuity_proposal(state, con, frame_number, rows, contours, labels=None, s
     sizes = [(b["x1"] - b["x0"], b["y1"] - b["y0"]) for b in boxes if b["label"]]
     fly_w, fly_h = (float(np.median([w for w, _ in sizes])), float(np.median([h for _, h in sizes]))) if sizes \
         else (float(MIN_BOX), float(MIN_BOX))
+    notches = continuity.notch_centres(state["dbfile"])
     for label, x, y, seen in result["ghosts"]:
+        where = "at the notch" if continuity._near_notch(notches, x, y) else "where it was last seen"
         boxes.append({"x0": max(0.0, x - fly_w / 2), "y0": max(0.0, y - fly_h / 2),
                       "x1": min(float(width), x + fly_w / 2), "y1": min(float(height), y + fly_h / 2),
-                      "label": str(label), "note": f"kept at the notch: not detected since frame {seen}",
+                      "label": str(label), "note": f"kept {where}: not detected since frame {seen}",
                       "confidence": "medium"})
     anchor = {"frame_number": result["anchor"], "kind": result["anchor_kind"]}
     return boxes, result["flags"], anchor
@@ -1060,10 +1065,57 @@ _easy_cache = {}     # dbfile -> (stamp, {scene start: why})
 _easy_running = {}   # dbfile -> (job id, stamp)
 
 
+EASY_METHOD = lab_paths.ANNOTATE_EASY_METHOD   # "rules" (continuity.classify_scenes) or "learned" (scene_scorer)
+
+
 def _easy_stamp(state):
     path = os.path.join(_validation_folder(state["basedir"]), "scene_qc.csv")
-    return [continuity.CLASSIFY_VERSION, *_mtime_size(state["dbfile"]), *_mtime_size(path), state["n_animals"],
-            state["chunksize"]]
+    stamp = [continuity.CLASSIFY_VERSION, *_mtime_size(state["dbfile"]), *_mtime_size(path), state["n_animals"],
+             state["chunksize"]]
+    if EASY_METHOD == "learned":
+        # the score depends on the person's frames saved before each stretch and on the model
+        stamp += ["learned", *_mtime_size(scene_scorer.MODEL_PATH), *_mtime_size(sidecar_path(state["basedir"]))]
+    return stamp
+
+
+def _learned_easy(state, scenes, progress):
+    """scene_scorer.score_scenes of the loaded experiment, anchors as the continuity2 proposal of each stretch's first
+    frame would have them now: {scene start: {"easy", "why", "p"}}"""
+    sidecar = sidecar_path(state["basedir"])
+    saved, order = {}, []
+    if os.path.exists(sidecar):
+        with sqlite3.connect(f"file:{sidecar}?mode=ro", uri=True) as con:
+            updated = dict(con.execute("SELECT frame_number, updated FROM frames"))
+            for fn, x0, y0, x1, y1, lab in con.execute(
+                    "SELECT b.frame_number, x0, y0, x1, y1, label FROM boxes b JOIN frames f USING (frame_number)"):
+                saved.setdefault(fn, []).append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "label": lab or ""})
+        for fn in updated:
+            saved.setdefault(fn, [])
+        order = sorted(saved)
+    else:
+        updated = {}
+    chunksize = state["chunksize"]
+
+    def saved_before(first):
+        i = bisect.bisect_left(order, first) - 1
+        if i >= 0 and order[i] >= first // chunksize * chunksize:
+            return order[i], saved[order[i]], updated.get(order[i])
+        return None
+
+    def translate(first):
+        lo = first // chunksize * chunksize
+        labels = {}
+        for fn in order[bisect.bisect_left(order, lo):bisect.bisect_left(order, first)]:
+            rows = _machine_rows(state["dbfile"], fn)
+            for b, frag in zip(saved[fn], box_fragments(saved[fn], rows)):
+                if frag is not None and str(b["label"]).isdigit():
+                    labels.setdefault(str(frag), []).append((fn, b["label"]))
+        if not labels:
+            return None
+        return lambda fn, _rows: anchor_labels(state["dbfile"], fn, state["n_animals"], labels, {})
+
+    return scene_scorer.score_scenes(state["dbfile"], scenes, chunksize, state["n_animals"], saved_before, translate,
+                                     progress=progress)
 
 
 def easy_scenes_async(state):
@@ -1096,8 +1148,11 @@ def easy_scenes_async(state):
 
         def work(job):
             job.update(0, status="running")
-            result = continuity.classify_scenes(dbfile, scenes, state["chunksize"], state["n_animals"],
-                                                progress=lambda f: job.update(0, progress=min(0.99, f)))
+            if EASY_METHOD == "learned":
+                result = _learned_easy(state, scenes, lambda f: job.update(0, progress=min(0.99, f)))
+            else:
+                result = continuity.classify_scenes(dbfile, scenes, state["chunksize"], state["n_animals"],
+                                                    progress=lambda f: job.update(0, progress=min(0.99, f)))
             easy = {str(start): r["why"] for start, r in result.items() if r["easy"]}
             _easy_cache[dbfile] = (stamp, easy)
             try:
@@ -1111,7 +1166,7 @@ def easy_scenes_async(state):
             job.result = {"easy": len(easy), "scenes": len(scenes)}
             job.update(0, status="done", progress=1.0)
 
-        job = start_job(f"Easy scenes (continuity) of {to_flat(state['experiment'])}", [to_flat(state["experiment"])], work)
+        job = start_job(f"Easy scenes ({'learned' if EASY_METHOD == 'learned' else 'continuity'}) of {to_flat(state['experiment'])}", [to_flat(state["experiment"])], work)
         _easy_running[dbfile] = (job.id, stamp)
         return {"pending": job.to_dict()}
 
@@ -1189,7 +1244,7 @@ def frame_payload(state, frame_number, want=None):
             logger.warning("No contours for frame %s: %s", frame_number, exc)
             return []
 
-    if solver is not None and (saved is None or want) and want not in ("tracking", "continuity"):
+    if solver is not None and (saved is None or want) and want not in ("tracking", "continuity", "continuity2"):
         proposal, source = solver, "solver"
     elif saved is None or want:
         # continuity (identities followed by position) unless idtrackerai's boxes are asked for; idtrackerai's
@@ -1197,7 +1252,8 @@ def frame_payload(state, frame_number, want=None):
         if want != "tracking" and bundle_info(state["basedir"]) is None:
             con = _connect(state["basedir"])
             try:
-                found = continuity_proposal(state, con, frame_number, rows, frame_contours(), labels, splits)
+                found = continuity_proposal(state, con, frame_number, rows, frame_contours(), labels, splits,
+                                            version=2 if want == "continuity2" else CONTINUITY_VERSION)
             except (sqlite3.Error, ValueError) as exc:
                 logger.warning("No continuity proposal for frame %s: %s", frame_number, exc)
                 found = None
@@ -1206,7 +1262,7 @@ def frame_payload(state, frame_number, want=None):
                     con.close()
             if found is not None:
                 proposal, flags, anchor = found
-                source = "continuity"
+                source = "continuity2" if want == "continuity2" else "continuity"
         if proposal is None:
             source = "tracking"
             width, height = state["size"]()
@@ -1214,7 +1270,7 @@ def frame_payload(state, frame_number, want=None):
     # a person's labels of the fragments in the chunk go first, as for the solver and idtrackerai's; the continuity
     # proposal has them already (its anchor: a saved frame, or idtrackerai's put in them by anchor_labels), and
     # inheriting on top of it would undo what it followed through a crossing (new fragments keep no label)
-    if proposal is not None and source != "continuity":
+    if proposal is not None and source not in ("continuity", "continuity2"):
         proposal = inherit_labels(proposal, rows, labels, frame_number, splits)
     return {
         "frame_number": frame_number, "chunk": chunk, "source": source if proposal is not None else "saved",

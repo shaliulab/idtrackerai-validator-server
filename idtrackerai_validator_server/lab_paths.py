@@ -167,6 +167,13 @@ QC_CACHE_DIR = _env("QC_CACHE_DIR", os.path.join(CACHE_DIR, "qc"))
 UPDATE_DIR = _env("VALIDATOR_UPDATE_DIR", os.path.join(CACHE_DIR, "update"))
 # Annotate tab's easy scenes
 CONTINUITY_CACHE_DIR = _env("CONTINUITY_CACHE_DIR", os.path.join(CACHE_DIR, "continuity"))
+# learned scorer of the Annotate tab's scenes (scene_scorer.py: model.pkl, made by scripts/train_scene_scorer.py)
+SCENE_SCORER_DIR = _env("SCENE_SCORER_DIR", os.path.join(CACHE_DIR, "scene_scorer"))
+# easy scenes of the Annotate tab: "rules" (continuity.classify_scenes, default) or "learned" (scene_scorer.py)
+ANNOTATE_EASY_METHOD = _env("ANNOTATE_EASY_METHOD", "rules")
+# tracker of the Annotate tab's continuity proposal: "1" (continuity.Run, default) or "2" (continuity.RunV2, also
+# asked with ?proposal=continuity2 whatever this says)
+ANNOTATE_CONTINUITY_VERSION = _env("ANNOTATE_CONTINUITY_VERSION", "1")
 # Annotate tab's pre-download (annotate_pack.py): per experiment the scene frames as H.264, contours, frame data
 ANNOTATE_PACK_CACHE = _env("ANNOTATE_PACK_CACHE", os.path.join(CACHE_DIR, "annotate_pack"))
 # last Data management scan (dropbox.json, dropbox_hashes.json, restore.json, ... next to it)

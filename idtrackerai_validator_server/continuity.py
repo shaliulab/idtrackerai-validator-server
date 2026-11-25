@@ -68,15 +68,20 @@ def _near_notch(notches, x, y):
     return any((x - cx) ** 2 + (y - cy) ** 2 <= NOTCH_PX ** 2 for cx, cy in notches)
 
 
-def read_rows(dbfile, first, last):
-    """{frame: [(x, y, local identity or 0)]} of ROI_0 + IDENTITY, in in_frame_index order (as _machine_rows)."""
+def read_rows(dbfile, first, last, fragments=False):
+    """{frame: [(x, y, local identity or 0)]} of ROI_0 + IDENTITY, in in_frame_index order (as _machine_rows);
+    fragments: (x, y, local identity or 0, fragment or -1, area) instead."""
     out = {}
     with sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True) as con:
-        for fn, x, y, lid in con.execute(
-                "SELECT r.frame_number, r.x, r.y, i.local_identity FROM ROI_0 r LEFT JOIN IDENTITY i "
+        for fn, x, y, lid, frag, area in con.execute(
+                "SELECT r.frame_number, r.x, r.y, i.local_identity, r.fragment, r.area FROM ROI_0 r LEFT JOIN IDENTITY i "
                 "ON i.frame_number = r.frame_number AND i.in_frame_index = r.in_frame_index "
                 "WHERE r.frame_number BETWEEN ? AND ? ORDER BY r.frame_number, r.in_frame_index", (first, last)):
-            out.setdefault(fn, []).append((float(x), float(y), int(lid or 0)))
+            if fragments:
+                out.setdefault(fn, []).append((float(x), float(y), int(lid or 0), -1 if frag is None else int(frag),
+                                               float(area or 0)))
+            else:
+                out.setdefault(fn, []).append((float(x), float(y), int(lid or 0)))
     return out
 
 
@@ -151,7 +156,8 @@ def _box_positions(boxes, rows):
         if not str(b["label"]).isdigit():
             continue
         cx, cy = (b["x0"] + b["x1"]) / 2, (b["y0"] + b["y1"]) / 2
-        for j, (x, y, _) in enumerate(rows):
+        for j, r in enumerate(rows):
+            x, y = r[0], r[1]
             if b["x0"] <= x <= b["x1"] and b["y0"] <= y <= b["y1"]:
                 pairs.append(((x - cx) ** 2 + (y - cy) ** 2, i, j))
     pairs.sort()
@@ -164,10 +170,30 @@ def _box_positions(boxes, rows):
         if not str(b["label"]).isdigit():
             continue
         if i in row_of:
-            x, y, _ = rows[row_of[i]]
+            x, y = rows[row_of[i]][:2]
             out[int(b["label"])] = (x, y, True)
         else:
             out[int(b["label"])] = ((b["x0"] + b["x1"]) / 2, (b["y0"] + b["y1"]) / 2, False)
+    return out
+
+
+def _box_fragments(boxes, rows):
+    """{label: fragment} of a saved frame's labelled boxes holding a row (rows with fragments, read_rows)"""
+    out, used, pairs = {}, set(), []
+    for i, b in enumerate(boxes):
+        if not str(b["label"]).isdigit():
+            continue
+        cx, cy = (b["x0"] + b["x1"]) / 2, (b["y0"] + b["y1"]) / 2
+        for j, r in enumerate(rows):
+            if b["x0"] <= r[0] <= b["x1"] and b["y0"] <= r[1] <= b["y1"]:
+                pairs.append(((r[0] - cx) ** 2 + (r[1] - cy) ** 2, i, j))
+    pairs.sort()
+    done = set()
+    for _, i, j in pairs:
+        if i not in done and j not in used:
+            done.add(i)
+            used.add(j)
+            out[int(boxes[i]["label"])] = rows[j][3]
     return out
 
 
@@ -262,6 +288,135 @@ class Run:
         return {"rows": out_rows, "ghosts": ghosts, "flags": lost}
 
 
+class RunV2(Run):
+    """Version 2 of the tracker (`?proposal=continuity2`), chosen on the frames saved in 11 validated experiments (5
+    of 12 flies; idtrackerai_validator_server/scene_scorer.py has the evaluation): in the step a person takes
+    (proposal from the frame saved before) it needs 40 % fewer edits on 12X than Run (frames entirely right 92.5 →
+    96.2 %), and a scene proposed from the frame before it is entirely right in 76 % of them instead of 61 %.
+    Changes, each measured on its own:
+    - every fly not detected is kept at its last position, not only at a notch (on 12X a third of the flies people
+      drew where nothing was detected were away from the notches, all of them in FlyHostel1_12X_2026-11-11:
+      touching flies left unsegmented; 12X edits −31 %);
+    - gate `GATE` 100 px instead of 60 (fast flies);
+    - after the gated match, the detections and flies left are paired without gate up to `LEFTOVER_PX` +
+      `LEFTOVER_PER_FRAME` px per frame the fly was not seen (a fly reappearing away from where it was lost; note
+      "reappeared", medium), before idtrackerai's local identity is used;
+    - a detection continuing the idtrackerai fragment the fly had when last detected costs `FRAG_BONUS` px less (at
+      crossings without identity the nearest fly is wrong; when the person's fragment continues and disagrees with
+      the nearest fly, the fragment was right 129 times out of 138).
+    Rows need fragments (read_rows(..., fragments=True)); 3-tuples work without the fragment bonus."""
+    GATE = 100
+    LEFTOVER_PX = 200.0
+    LEFTOVER_PER_FRAME = 10.0
+    FRAG_BONUS = 30.0
+
+    def __init__(self, dbfile, anchor, kind, start_positions, notches, n_animals, start_frags=None):
+        super().__init__(dbfile, anchor, kind, start_positions, notches, n_animals)
+        self.frag = dict(start_frags or {})
+
+    def extend(self, frame_number, rows=None):
+        if frame_number <= self.upto:
+            return
+        if rows is None:
+            rows = read_rows(self.dbfile, self.upto + 1, frame_number, fragments=True)
+        for fn in range(self.upto + 1, frame_number + 1):
+            r = rows.get(fn)
+            if r is not None:
+                self.results[fn] = self.step(fn, r)
+        self.upto = frame_number
+
+    def step(self, fn, rows):
+        P = np.array([(r[0], r[1]) for r in rows], dtype=float).reshape(-1, 2)
+        frags = [r[3] if len(r) > 3 else None for r in rows]
+        L = [lab for lab in self.labels if lab in self.last]
+        assigned, info = {}, {}
+        if len(P) and L:
+            Q = np.array([self.last[lab][:2] for lab in L], dtype=float)
+            D = np.hypot(P[:, None, 0] - Q[None, :, 0], P[:, None, 1] - Q[None, :, 1])
+            cost = D.copy()
+            if self.FRAG_BONUS:
+                had = [self.frag.get(lab) if self.last[lab][3] else None for lab in L]
+                for i, f in enumerate(frags):
+                    if f is None or f < 0:
+                        continue
+                    for j, g in enumerate(had):
+                        if g == f:
+                            cost[i, j] -= self.FRAG_BONUS
+            ri, ci = linear_sum_assignment(cost)
+            others = D.copy()
+            others[ri, ci] = np.inf
+            second = others.min(axis=1)
+            for i, j in zip(ri.tolist(), ci.tolist()):
+                if D[i, j] < self.GATE:
+                    assigned[i] = L[j]
+                    info[i] = "ambiguous" if second[i] - D[i, j] < AMBIGUOUS_PX else None
+        taken = set(assigned.values())
+        for i, r in enumerate(rows):
+            if i in assigned or not _near_notch(self.notches, r[0], r[1]):
+                continue
+            lost = [(np.hypot(r[0] - self.last[lab][0], r[1] - self.last[lab][1]), lab) for lab in L
+                    if lab not in taken and _near_notch(self.notches, *self.last[lab][:2])]
+            lost = [t for t in lost if t[0] < NOTCH_PX]
+            if lost:
+                lab = min(lost)[1]
+                assigned[i] = lab
+                taken.add(lab)
+                info[i] = "notch"
+        left_rows = [i for i in range(len(rows)) if i not in assigned]
+        left_flies = [lab for lab in L if lab not in taken]
+        if left_rows and left_flies:
+            Q = np.array([self.last[lab][:2] for lab in left_flies], dtype=float)
+            Pl = P[left_rows]
+            D = np.hypot(Pl[:, None, 0] - Q[None, :, 0], Pl[:, None, 1] - Q[None, :, 1])
+            limit = [self.LEFTOVER_PX + self.LEFTOVER_PER_FRAME * (fn - (self.last[lab][2] or fn)) for lab in left_flies]
+            ri, ci = linear_sum_assignment(D)
+            for a, b in zip(ri.tolist(), ci.tolist()):
+                if D[a, b] <= limit[b]:
+                    assigned[left_rows[a]] = left_flies[b]
+                    taken.add(left_flies[b])
+                    info[left_rows[a]] = "leftover"
+        for i, r in enumerate(rows):
+            lid = r[2]
+            if i not in assigned and lid and lid not in taken:
+                assigned[i] = lid
+                taken.add(lid)
+                info[i] = "new"
+        out_rows = []
+        for i, r in enumerate(rows):
+            x, y, lid = r[0], r[1], r[2]
+            lab = assigned.get(i)
+            if lab is None:
+                out_rows.append((None, "no fly of the anchor nearby: not labelled", "low"))
+                continue
+            self.last[lab] = [x, y, fn, True]
+            if frags[i] is not None:
+                self.frag[lab] = frags[i]
+            kind = info.get(i)
+            if kind == "notch":
+                out_rows.append((lab, f"at a notch: fly {lab}, lost there", "medium"))
+            elif kind == "leftover":
+                out_rows.append((lab, f"fly {lab} reappeared away from where it was lost", "medium"))
+            elif kind == "new":
+                out_rows.append((lab, f"no fly of the anchor nearby: idtrackerai's {lid}", "medium"))
+            elif lid != lab:
+                out_rows.append((lab, f"continuity: idtrackerai says {lid or 'no identity'}", "medium"))
+            elif kind == "ambiguous":
+                out_rows.append((lab, "another fly was almost as close", "medium"))
+            else:
+                out_rows.append((lab, "", None))
+        ghosts, lost = [], []
+        for lab in self.labels:
+            if lab in taken:
+                continue
+            if lab not in self.last:
+                lost.append(f"fly {lab} not placed: not in the anchor frame")
+                continue
+            x, y, seen, _ = self.last[lab]
+            self.last[lab][3] = False
+            ghosts.append((lab, x, y, seen))
+        return {"rows": out_rows, "ghosts": ghosts, "flags": lost}
+
+
 def _get_run(key, make):
     with _lock:
         run = _runs.get(key)
@@ -277,7 +432,42 @@ def _get_run(key, make):
         return run
 
 
-def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, translate=None):
+def anchor_run(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, translate=None, version=1):
+    """(cache key, make) of the Run the proposal of frame_number starts from (see track), or (None, None)."""
+    frame_number, chunksize = int(frame_number), int(chunksize)
+    chunk_start = frame_number // chunksize * chunksize
+    notches = notch_centres(dbfile)
+    start = stretch_start(scenes, frame_number)
+    m_fn, m_rows = machine_anchor(dbfile, min(start, frame_number), chunk_start, chunksize, n_animals)
+    v2 = version == 2
+    if saved_before is not None and (m_fn is None or saved_before[0] >= m_fn):
+        s_fn, boxes, updated = saved_before
+        key = (dbfile, version, "saved", s_fn, updated)
+
+        def make():
+            if v2:
+                rows = read_rows(dbfile, s_fn, s_fn, fragments=True).get(s_fn, [])
+                return RunV2(dbfile, s_fn, "saved", _box_positions(boxes, rows), notches, n_animals,
+                             _box_fragments(boxes, rows))
+            rows = read_rows(dbfile, s_fn, s_fn).get(s_fn, [])
+            return Run(dbfile, s_fn, "saved", _box_positions(boxes, rows), notches, n_animals)
+    elif m_fn is not None:
+        labels = list(translate(m_fn, m_rows)) if translate is not None else [lid for _, _, lid in m_rows]
+        key = (dbfile, version, "tracking", m_fn, tuple(labels))
+
+        def make():
+            start_positions = {lab: (x, y, True) for (x, y, _), lab in zip(m_rows, labels)}
+            if v2:
+                rows = read_rows(dbfile, m_fn, m_fn, fragments=True).get(m_fn, [])
+                frags = {lab: r[3] for r, lab in zip(rows, labels)} if len(rows) == len(labels) else {}
+                return RunV2(dbfile, m_fn, "tracking", start_positions, notches, n_animals, frags)
+            return Run(dbfile, m_fn, "tracking", start_positions, notches, n_animals)
+    else:
+        return None, None
+    return key, make
+
+
+def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, translate=None, version=1):
     """{"rows": [(label or None, note, confidence)] in the frame's row order, "ghosts": [(label, x, y, frame last
     seen)], "flags": [text], "anchor": frame, "anchor_kind": "saved" | "tracking"} or None (no anchor in the chunk).
 
@@ -285,32 +475,15 @@ def track(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, tran
     translate(frame, rows) -> [label per row]: the person's labels of an idtrackerai anchor's flies (its local
     identities are not the person's when they relabelled the chunk: the run would carry idtrackerai's into the new
     fragments after a crossing, which look like swaps), or None (idtrackerai's local identities).
+    version: 1 = Run (the default proposal), 2 = RunV2 (`?proposal=continuity2`).
     """
-    frame_number, chunksize = int(frame_number), int(chunksize)
-    chunk_start = frame_number // chunksize * chunksize
-    notches = notch_centres(dbfile)
-    start = stretch_start(scenes, frame_number)
-    m_fn, m_rows = machine_anchor(dbfile, min(start, frame_number), chunk_start, chunksize, n_animals)
-    if saved_before is not None and (m_fn is None or saved_before[0] >= m_fn):
-        s_fn, boxes, updated = saved_before
-        key = (dbfile, "saved", s_fn, updated)
-
-        def make():
-            rows = read_rows(dbfile, s_fn, s_fn).get(s_fn, [])
-            return Run(dbfile, s_fn, "saved", _box_positions(boxes, rows), notches, n_animals)
-    elif m_fn is not None:
-        labels = list(translate(m_fn, m_rows)) if translate is not None else [lid for _, _, lid in m_rows]
-        key = (dbfile, "tracking", m_fn, tuple(labels))
-
-        def make():
-            return Run(dbfile, m_fn, "tracking", {lab: (x, y, True) for (x, y, _), lab in zip(m_rows, labels)},
-                       notches, n_animals)
-    else:
+    key, make = anchor_run(dbfile, frame_number, chunksize, n_animals, scenes, saved_before, translate, version)
+    if key is None:
         return None
     run = _get_run(key, make)
     with _lock:
-        run.extend(frame_number)
-        result = run.results.get(frame_number)
+        run.extend(int(frame_number))
+        result = run.results.get(int(frame_number))
     if result is None:
         return None
     return {**result, "anchor": run.anchor, "anchor_kind": run.kind}
