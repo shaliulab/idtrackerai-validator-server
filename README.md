@@ -153,6 +153,34 @@ pip install .
 
 ## Update
 
+**From the app:** How to use tab → Updates → **Check for updates** (or click the version in the
+app bar's top right corner). GitHub is asked only when you press it. When a newer release
+exists, an admin gets **Update to <version> and restart**; everyone else sees "ask your
+admin", since updating restarts the server for everyone using it. An admin is someone using
+a browser on the server computer itself, or who typed the password set in
+`VALIDATOR_ADMIN_PASSWORD` (set it next to `VALIDATOR_USERNAME` in the service's `auth.conf`;
+`VALIDATOR_ADMIN_LOCALHOST=0` stops trusting the server's own browser). Running jobs (pre-download
+builds, Prepare scenes, swap checks, integrations, ...) would be stopped by the restart: the
+app lists them and asks again before stopping them.
+
+- A git checkout installed with `pip install -e .` (the lab server) is updated in place: it
+  must be on `master` with no uncommitted changes. The app fast-forwards it to the release tag,
+  updates the checked-out submodules, moves the lab's packages installed in editable mode
+  (flyhostel, imgstore, idtrackerai) to the commits the release pins when they are behind
+  (left alone when at or ahead of them; refused when they have uncommitted changes or other
+  commits), installs with `pip install --no-deps -e` (pip never replaces those checkouts) plus
+  any new plain requirement, rebuilds the web interface when it changed (the release's
+  `idtrackerai-validator-frontend-<version>-<commit>.tar.gz` asset when attached, made by
+  `scripts/make_frontend_asset.sh`, else npm), restarts the server (`systemctl --user restart`
+  when it runs as a user unit) and reloads the page once the new version answers. If any step
+  or the new server fails, it goes back to the recorded commits and restarts the old version.
+  Log: `~/.cache/idtrackerai-validator/update/update.log` (`VALIDATOR_UPDATE_DIR`).
+- A Windows install (below) downloads the release's Windows zip, checks it, installs it and
+  starts the server again; it goes back to the running version's zip if the new one does not start.
+- Docker and other pip installs are not updated from the app: it shows the commands.
+
+By hand:
+
 ```
 conda activate validator
 cd $HOME/opt/idtrackerai-validator-server
@@ -284,7 +312,8 @@ mostly downloads), and puts a "FlyHostel validator" shortcut on the desktop, whi
 starts the server and opens http://localhost:5000. `rclone-config.bat` there sets up the
 Drive exchange remote (see "Drive exchange" above). Running a newer bundle's
 `install.bat` updates it and keeps the settings (`settings.json`: experiments folder,
-port, optionally `VALIDATOR_USERNAME` / `VALIDATOR_PASSWORD`). Logs are in its `logs\`.
+port, optionally `VALIDATOR_USERNAME` / `VALIDATOR_PASSWORD`); so does the app's
+**Check for updates** (How to use tab), from the zip attached to the release. Logs are in its `logs\`.
 `scripts/windows/TESTING.md` is the step-by-step test.
 
 Docker Desktop (WSL2) runs the image of "Install with Docker" on Windows too.
