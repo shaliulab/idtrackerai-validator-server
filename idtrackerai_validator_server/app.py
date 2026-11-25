@@ -78,6 +78,7 @@ from idtrackerai_validator_server.blobs_collection import (
 )
 from idtrackerai_validator_server import rois as roi_sources
 from idtrackerai_validator_server.gdrive_exchange import register_gdrive_exchange
+from idtrackerai_validator_server.updater import register_updater, installed_version, detect_install, source_version
 
 
 def _optional(module, *names):
@@ -661,9 +662,23 @@ def get_features():
     return jsonify(install_features())
 
 
+def _package_version():
+    """Version of the running server: setup.py's in a git checkout (an editable install's metadata can lag
+    behind), else the installed package's."""
+    install = detect_install()
+    return (source_version(install["root"]) if install["kind"] == "git" else None) or installed_version()
+
+
+PACKAGE_VERSION = _package_version()
+
+
 @app.route("/api/version", methods=['GET'])
 def get_version():
-    return jsonify(GIT_VERSION)
+    return jsonify(dict(GIT_VERSION, version=PACKAGE_VERSION))
+
+
+# "Check for updates" (How to use tab): /api/health, /api/update/*
+register_updater(app, get_commit=lambda: GIT_VERSION, get_version=lambda: PACKAGE_VERSION)
 
 
 def _extra_metadata(rows):

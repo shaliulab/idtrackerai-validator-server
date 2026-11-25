@@ -169,7 +169,8 @@ ENV PATH=/opt/venv/bin:$PATH \
     BACKEND_HOST=0.0.0.0 \
     BACKEND_PORT=5000 \
     VALIDATOR_COMMIT=${VALIDATOR_COMMIT} \
-    VALIDATOR_COMMIT_DATE=${VALIDATOR_COMMIT_DATE}
+    VALIDATOR_COMMIT_DATE=${VALIDATOR_COMMIT_DATE} \
+    VALIDATOR_INSTALL=docker
 
 USER validator
 # The app's working directory: it wipes and recreates ./frames at start

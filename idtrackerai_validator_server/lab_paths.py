@@ -104,6 +104,23 @@ RCLONE = find_tool("rclone", "RCLONE")
 FFMPEG = find_tool("ffmpeg", "FFMPEG")
 NVIDIA_SMI = _env("NVIDIA_SMI", "nvidia-smi")
 PE_RECORD_CHROME = _env("PE_RECORD_CHROME", "google-chrome")
+# npm building the web interface when an update changes it (updater.py): $NPM, else the lab's Node.js
+# install, else npm on PATH
+_LAB_NPM = os.path.join(HOME, "opt", "node-v18.16.0-linux-x64", "bin", "npm")
+NPM = os.environ.get("NPM") or (_LAB_NPM if os.path.isfile(_LAB_NPM) else find_tool("npm"))
+# systemd tools restarting a server run as a user unit (updater.py)
+SYSTEMCTL = _env("SYSTEMCTL", "systemctl")
+SYSTEMD_RUN = _env("SYSTEMD_RUN", "systemd-run")
+
+
+# --- Releases ("Check for updates", updater.py) -------------------------------------------------------
+# GitHub repository whose latest release is offered, and the API / web base URLs (tests point them at a
+# local copy); $GITHUB_TOKEN, when set, is sent to the API (60 requests an hour per address without)
+UPDATE_REPO = _env("VALIDATOR_UPDATE_REPO", "shaliulab/idtrackerai-validator-server")
+UPDATE_API = _env("VALIDATOR_UPDATE_API", "https://api.github.com").rstrip("/")
+UPDATE_WEB = _env("VALIDATOR_UPDATE_WEB", "https://github.com").rstrip("/")
+# where the lab's packages are fetched from when an update moves a non-editable install of them
+LAB_GITHUB = _env("VALIDATOR_LAB_GITHUB", "https://github.com/shaliulab")
 
 
 # --- Remote hosts and remotes (ssh aliases of ~/.ssh/config, rclone remotes, URLs) ----------------
@@ -133,6 +150,10 @@ DEFAULT_TLS_CERTFILE = os.path.join(CONFIG_DIR, "tls", "cert.pem")
 EXCHANGE_CONFIG = _user_env("EXCHANGE_CONFIG", "~/.config/idtrackerai-validator/exchange.json")
 # experiments each person hid from the Annotate tab's validation queue
 ANNOTATE_QUEUE_FILE = _env("ANNOTATE_QUEUE_FILE", os.path.join(CONFIG_DIR, "annotate_queue.json"))
+# Windows bundle installs (scripts/windows/install.ps1): the install folder the updater recognizes
+WINDOWS_INSTALL_DIR = _env("VALIDATOR_WINDOWS_INSTALL_DIR",
+                           os.path.join(os.environ.get("LOCALAPPDATA", os.path.join(HOME, "AppData", "Local")),
+                                        "idtrackerai-validator"))
 # googleapi's list of metadata sheets (SHEETS); its token lives next to it
 GOOGLEAPI_CONFIG = _user_env("GOOGLEAPI_CONFIG", "~/.config/googleapi/config.yaml")
 
@@ -141,6 +162,9 @@ GOOGLEAPI_CONFIG = _user_env("GOOGLEAPI_CONFIG", "~/.config/googleapi/config.yam
 CACHE_DIR = os.path.join(HOME, ".cache", "idtrackerai-validator")
 # QC tab (qc.py; swap check in swaps/, pose QC in pose/)
 QC_CACHE_DIR = _env("QC_CACHE_DIR", os.path.join(CACHE_DIR, "qc"))
+# "Check for updates" (updater.py): status.json of the last update, update.log of every one, downloads,
+# copies of the web interface kept for a rollback
+UPDATE_DIR = _env("VALIDATOR_UPDATE_DIR", os.path.join(CACHE_DIR, "update"))
 # Annotate tab's easy scenes
 CONTINUITY_CACHE_DIR = _env("CONTINUITY_CACHE_DIR", os.path.join(CACHE_DIR, "continuity"))
 # Annotate tab's pre-download (annotate_pack.py): per experiment the scene frames as H.264, contours, frame data

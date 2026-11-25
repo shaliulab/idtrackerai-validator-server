@@ -99,10 +99,38 @@ Installed in `%LOCALAPPDATA%\idtrackerai-validator\` (`miniforge3\`, `env\`, `lo
       --build` (~5–10 min), open http://localhost:5000, rclone via
       `docker compose exec validator rclone config`. Same checks as 4–5.
 
-## 7. If something fails, send
+## 7. Check for updates (the app updating itself)
+
+Written on Linux and not run on Windows yet (`updater.py`, class `WindowsUpdate`). It needs an installed
+bundle whose version has the button (1.6.0 or later) and a newer release on GitHub with its windows zip
+attached. Before a real release, a test repository can stand in: add `"VALIDATOR_UPDATE_REPO":
+"<owner>/<repo>"` to the environment of `start-validator.ps1` (e.g. `$env:VALIDATOR_UPDATE_REPO = …` at
+its top) and publish there a release `v<newer>` with a bundle zip named
+`idtrackerai-validator-windows-<newer>-<commit>.zip`.
+
+1. [ ] How to use tab → Updates → **Check for updates**. Expected: "Running <version> … Windows install",
+       the latest release with its notes, and (the page is on this computer, so you are the admin) the
+       button **Update to <newer> and restart**. Offline: a red "Could not reach GitHub …" message.
+2. [ ] Press it, confirm. The steps appear: Download (the zip is checked against GitHub's sha256),
+       Keep the running version for a rollback (downloads the zip of the running version), Stop the
+       server (its console window closes), Install (no question is asked; `logs\install-*.log` is
+       written as for a normal install), Start (a new console window opens; no new browser tab), Health
+       check. The page shows "The server is restarting…" and then reloads by itself on the new version
+       (app bar: `<newer> · <commit>`).
+3. [ ] `%USERPROFILE%\.cache\idtrackerai-validator\update\update.log` holds every step and command
+       output; `…\update\freeze-*.txt` the packages before the update; `…\update\downloads\` the zips.
+4. [ ] Rollback: set `VALIDATOR_UPDATE_TEST_FAIL_HEALTH=1` for the server (start-validator.ps1), check and
+       update again to a newer release: after the new server answers, the check fails on purpose, the
+       previous bundle is installed again and started; the page ends on "Rolled back: …" and the app bar
+       shows the old version.
+5. [ ] A second browser on another computer (only with the server bound to the network) sees "Ask your
+       admin to update the server" and no Update button.
+
+## 8. If something fails, send
 
 - `%LOCALAPPDATA%\idtrackerai-validator\logs\install-*.log` (install) and
-  `logs\server-*.log` (server; the newest one)
+  `logs\server-*.log` (server; the newest one); after an update from the app also
+  `%USERPROFILE%\.cache\idtrackerai-validator\update\update.log` and `status.json`
 - what was on screen (a screenshot of the console window / the page), and the browser's
   console (F12 → Console) if the page misbehaves
 - `"%LOCALAPPDATA%\idtrackerai-validator\env\python.exe" -m pip list > pip-list.txt`

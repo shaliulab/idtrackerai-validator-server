@@ -110,8 +110,12 @@ def main():
 
     app.config["SESSION_COOKIE_NAME"] = "validator_session_{}".format(args.port)
     app.config["SESSION_COOKIE_SECURE"] = tls
+    # where the update helper (updater.py) checks /api/health after a restart
+    app.config["VALIDATOR_PORT"] = args.port
+    app.config["VALIDATOR_HOST"] = args.host
 
-    if not args.no_browser:
+    # VALIDATOR_NO_BROWSER=1: the updater restarting a Windows install (the page is open already)
+    if not args.no_browser and os.environ.get("VALIDATOR_NO_BROWSER") != "1":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
 
     print("idtrackerai validator serving at {}".format(url))

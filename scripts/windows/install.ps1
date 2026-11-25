@@ -11,6 +11,8 @@
 #   3. torch / torchvision CPU builds, then the validator and its dependencies from PyPI + wheels\
 #   4. start-validator.ps1 + settings.json, and a "FlyHostel validator" shortcut on the desktop
 # Running it again (e.g. from a newer bundle) updates the installation and keeps the settings.
+# -Update: run by the app's "Check for updates" (updater.py, server stopped first): asks nothing (the
+# experiments folder comes from settings.json) and leaves the desktop shortcut as it is.
 # Logs: logs\install-<time>.log.
 
 param(
@@ -20,8 +22,10 @@ param(
     [string]$TorchIndex = "https://download.pytorch.org/whl/cpu",
     [string]$TorchVersion = "2.13.0",
     [string]$TorchvisionVersion = "0.28.0",
-    [switch]$NoShortcut
+    [switch]$NoShortcut,
+    [switch]$Update
 )
+if ($Update) { $NoShortcut = $true }
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is ~10x slower with the progress bar
@@ -121,8 +125,10 @@ try {
                   "torch==$TorchVersion", "torchvision==$TorchvisionVersion")
 
     Step "Installing the validator and its dependencies (PyPI + the bundle's wheels)"
-    Run $Python @("-m", "pip", "install", "--disable-pip-version-check", "--find-links", $Wheels,
-                  "idtrackerai_validator_server")
+    # the bundle's wheel by path: by name, pip keeps an older version already installed ("Requirement
+    # already satisfied") and would not install the new version's new requirements
+    $Viewer = @(Get-ChildItem -Path $Wheels -Filter "idtrackerai_validator_server-*.whl")[0].FullName
+    Run $Python @("-m", "pip", "install", "--disable-pip-version-check", "--find-links", $Wheels, $Viewer)
     # The lab's packages keep their version numbers between commits: install the bundle's copies even
     # when pip thinks the same version is already there.
     $LabWheels = @(Get-ChildItem -Path $Wheels -Filter "*.whl" | ForEach-Object { $_.FullName })
@@ -165,6 +171,7 @@ try {
         if (-not $DataDir) { $DataDir = $current.data_dir }
         if (-not $PSBoundParameters.ContainsKey("Port") -and $current.port) { $Port = [int]$current.port }
     }
+    if (-not $DataDir -and $Update) { throw "settings.json has no data_dir: run install.bat by hand once" }
     if (-not $DataDir) {
         $default = Join-Path $env:USERPROFILE "flyhostel_videos"
         Write-Host ""

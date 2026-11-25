@@ -94,6 +94,12 @@ def start_job(title, items, work):
     return job
 
 
+def running_jobs():
+    """Jobs still running ({id, title}): a server restart would stop them (updater.py)."""
+    with _jobs_lock:
+        return [{"id": j.id, "title": j.title} for j in _jobs.values() if j.status == "running"]
+
+
 def register_jobs(app):
 
     @app.route("/api/jobs", methods=["GET"])
