@@ -5,6 +5,10 @@
 #
 #   scripts/make_windows_bundle.sh
 #   FLYHOSTEL_SRC=/path/to/flyhostel scripts/make_windows_bundle.sh
+#   CLIENT_SRC=idtrackerai-validator-client scripts/make_windows_bundle.sh
+#
+# CLIENT_SRC: build the web interface from the commit setup.py pins in a local client checkout (its
+# `git archive`) instead of GitHub, e.g. a client commit not pushed yet.
 #
 # FLYHOSTEL_SRC: build the lab's wheels from a local flyhostel checkout (libraries/ethoscopy,
 # idtrackerai and imgstore checked out) instead of GitHub, e.g. to test commits not pushed yet. Its
@@ -28,6 +32,14 @@ if [ -n "${FLYHOSTEL_SRC:-}" ]; then
         git -C "$path" diff --quiet HEAD -- || { echo "$path has uncommitted changes" >&2; exit 1; }
     done
     context=(--build-context "flyhostel-src=$FLYHOSTEL_SRC")
+fi
+if [ -n "${CLIENT_SRC:-}" ]; then
+    want=$(sed -n 's/^ *"idtrackerai-validator-client": "\([0-9a-f]\{40\}\)".*/\1/p' setup.py)
+    export_dir=$(mktemp -d)
+    trap 'rm -rf "$export_dir"' EXIT
+    git -C "$CLIENT_SRC" archive "$want" | tar -x -C "$export_dir"
+    echo "$want" > "$export_dir/CLIENT_COMMIT"
+    context+=(--build-context "client-src=$export_dir")
 fi
 DOCKER_BUILDKIT=1 docker build "${context[@]}" --target windows-bundle --output "$out" .
 

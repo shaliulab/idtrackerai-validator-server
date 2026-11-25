@@ -27,7 +27,7 @@ ARG PYTHON_VERSION=3.10
 # ---------------------------------------------------------------------------------------------
 # 1. The web interface, built with node from the client commit setup.py pins
 # ---------------------------------------------------------------------------------------------
-FROM node:20-bookworm-slim AS frontend
+FROM node:20-bookworm-slim AS client-clone
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
@@ -39,7 +39,20 @@ RUN commit="${CLIENT_COMMIT:-$(sed -n 's/^ *"idtrackerai-validator-client": "\([
     && git init -q . \
     && git fetch -q --depth 1 https://github.com/shaliulab/idtrackerai-validator-client.git "$commit" \
     && git checkout -q FETCH_HEAD \
-    && echo "$commit" > /CLIENT_COMMIT
+    && rm -rf .git \
+    && echo "$commit" > CLIENT_COMMIT
+
+# The client source (CLIENT_COMMIT: its commit). Replaced by a local copy with
+#   docker build --build-context client-src=/path/to/client-export ...
+# (scripts/make_windows_bundle.sh CLIENT_SRC=...: a `git archive` of the pinned commit of a local checkout,
+# for commits not pushed yet).
+FROM scratch AS client-src
+COPY --from=client-clone /src /
+
+FROM node:20-bookworm-slim AS frontend
+WORKDIR /src
+COPY --from=client-src / /src
+RUN mv /src/CLIENT_COMMIT /CLIENT_COMMIT
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 RUN npm run build && test -f build/index.html
 
