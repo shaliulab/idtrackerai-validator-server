@@ -156,12 +156,14 @@ pip install .
 **From the app:** How to use tab → Updates → **Check for updates** (or click the version in the
 app bar's top right corner). GitHub is asked only when you press it. When a newer release
 exists, an admin gets **Update to <version> and restart**; everyone else sees "ask your
-admin", since updating restarts the server for everyone using it. An admin is someone using
-a browser on the server computer itself, or who typed the password set in
-`VALIDATOR_ADMIN_PASSWORD` (set it next to `VALIDATOR_USERNAME` in the service's `auth.conf`;
-`VALIDATOR_ADMIN_LOCALHOST=0` stops trusting the server's own browser). Running jobs (pre-download
-builds, Prepare scenes, swap checks, integrations, ...) would be stopped by the restart: the
-app lists them and asks again before stopping them.
+admin", since updating restarts the server for everyone using it. Updates are applied only
+from a browser on the server computer itself (`http://localhost:5000` there, or through an ssh
+tunnel: `ssh -L 5000:localhost:5000 <server>`); `VALIDATOR_ADMIN_LOCALHOST=0` turns that off too.
+Work the restart would stop blocks it: the server's running jobs (pre-download builds, Prepare
+scenes, swap checks, integrations, ...) and, under the systemd service, every other program it
+started that still runs (preprocess-sample, crops of arenas, the GPU queue's jobs, ...:
+`systemctl restart` stops the whole service). The app lists them and asks again before stopping
+them.
 
 - A git checkout installed with `pip install -e .` (the lab server) is updated in place: it
   must be on `master` with no uncommitted changes. The app fast-forwards it to the release tag,

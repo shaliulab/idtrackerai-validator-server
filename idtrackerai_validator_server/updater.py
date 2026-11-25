@@ -9,10 +9,13 @@ Check: the latest release of $VALIDATOR_UPDATE_REPO (GitHub's API; when it answe
 (the package's, and in a git checkout its setup.py's) and commit.
 
 Who: applying restarts the server for everyone using it, so only an admin may (`is_admin`): a request
-from this computer (loopback address; VALIDATOR_ADMIN_LOCALHOST=0 turns it off), or a browser session
-unlocked with $VALIDATOR_ADMIN_PASSWORD (POST /api/update/admin). Others see "ask your admin". Jobs of
-jobs.py still running (pre-download builds, Prepare scenes, swap checks, integrations, ...) refuse the update
-(409) unless `force`: they die with the server.
+from a browser on the server itself (loopback address; VALIDATOR_ADMIN_LOCALHOST=0 turns that off too, and
+then nobody can apply from the app). Others see "ask your admin". Work a restart would kill refuses the
+update (409) unless `force` (`busy`): jobs of jobs.py still running (pre-download builds, Prepare scenes,
+swap checks, integrations, ...) and, under a systemd unit (KillMode=control-group: `systemctl restart` kills
+every process of the unit's cgroup), every other process of the server's cgroup (`cgroup_processes`:
+preprocess-sample, imgstore-crop-arenas, integrate-human-annotations, make-identogram, the GPU queue's jobs,
+...; multiprocessing's resource_tracker left out).
 
 Apply, by install kind (`detect_install`):
   git      the package is an editable install of a git checkout (the lab server): the checkout must be on
@@ -41,7 +44,6 @@ read by GET /api/update/status (also by the new server after the restart).
 
 CLI (the helper): python -m idtrackerai_validator_server.updater run PLAN.json
 """
-import hmac
 import html
 import importlib.metadata
 import ipaddress
@@ -491,18 +493,96 @@ def plan_dep(dep, pin, fetch=None):
 
 # ---- jobs that die with the server ---------------------------------------------------------------------
 
-def busy():
-    """Jobs of this server that a restart would kill, and work that survives it (informational)."""
-    from idtrackerai_validator_server.jobs import running_jobs
-    survives = []
+# helpers of the server itself, not jobs: a restart loses nothing
+CGROUP_IGNORED = ("multiprocessing.resource_tracker",)
+
+
+def own_cgroup(proc_cgroup="/proc/self/cgroup"):
+    """The cgroup (v2 path) this process is in, or None."""
     try:
-        from idtrackerai_validator_server.gpu_queue import read_state
-        for entry in read_state().get("entries", []):
-            if entry.get("status") == "running":
-                survives.append("GPU queue: {} ({})".format(entry.get("what") or entry.get("kind"), entry.get("kind")))
-    except Exception:   # noqa: BLE001 — the queue is optional here
+        with open(proc_cgroup) as f:
+            for line in f.read().splitlines():
+                if line.startswith("0::"):
+                    return line[3:].strip() or None
+    except OSError:
         pass
-    return {"jobs": running_jobs(), "survives": survives}
+    return None
+
+
+def _describe_process(pid):
+    """Short name + command line of a process ("" when it is gone)."""
+    try:
+        import psutil
+        process = psutil.Process(pid)
+        cmdline = process.cmdline()
+        name = process.name()
+    except Exception:   # noqa: BLE001 — gone, or not readable
+        try:
+            with open("/proc/{}/cmdline".format(pid), "rb") as f:
+                cmdline = [part.decode(errors="replace") for part in f.read().split(b"\0") if part]
+            name = os.path.basename(cmdline[0]) if cmdline else ""
+        except OSError:
+            return None
+    # the executable's name from the command line (comm is cut at 15 characters); for python, the script / module
+    shown = os.path.basename(cmdline[0]) if cmdline else name
+    if shown.startswith("python"):
+        for i, part in enumerate(cmdline[1:], 1):
+            if part == "-m" and i + 1 < len(cmdline):
+                shown = cmdline[i + 1]
+                break
+            if part == "-c":
+                break
+            if not part.startswith("-"):
+                shown = os.path.basename(part)
+                break
+    return {"name": shown, "command": " ".join(cmdline)[:300]}
+
+
+def cgroup_processes(cgroup=None, root="/sys/fs/cgroup", self_pid=None):
+    """Processes of the server's systemd cgroup other than the server itself: `systemctl restart` kills them
+    (KillMode=control-group). [] when the server is not a systemd unit / no cgroup v2."""
+    cgroup = cgroup if cgroup is not None else (own_cgroup() if systemd_unit() else None)
+    if not cgroup:
+        return []
+    self_pid = os.getpid() if self_pid is None else self_pid
+    out = []
+    base = os.path.join(root, cgroup.lstrip("/"))
+    for folder, _dirs, files in os.walk(base):      # the unit's cgroup and any below it
+        if "cgroup.procs" not in files:
+            continue
+        try:
+            with open(os.path.join(folder, "cgroup.procs")) as f:
+                pids = [int(x) for x in f.read().split()]
+        except (OSError, ValueError):
+            continue
+        for pid in pids:
+            if pid == self_pid:
+                continue
+            info = _describe_process(pid)
+            if info is None or any(mark in info["command"] for mark in CGROUP_IGNORED):
+                continue
+            out.append(dict(info, pid=pid))
+    return out
+
+
+def busy():
+    """Work a restart would kill: `jobs` [{id, title}], the server's jobs and, under systemd, the other processes
+    of its cgroup ("<name> (pid N)"); `survives`: work that goes on (the GPU queue's jobs outside systemd)."""
+    from idtrackerai_validator_server.jobs import running_jobs
+    jobs = running_jobs()
+    processes = cgroup_processes()
+    jobs += [{"id": "pid-{}".format(p["pid"]), "title": "{} (pid {})".format(p["name"], p["pid"]),
+              "command": p["command"]} for p in processes]
+    survives = []
+    if not systemd_unit():
+        try:
+            from idtrackerai_validator_server.gpu_queue import read_state
+            for entry in read_state().get("entries", []):
+                if entry.get("status") == "running":
+                    survives.append("GPU queue: {} ({})".format(entry.get("what") or entry.get("kind"), entry.get("kind")))
+        except Exception:   # noqa: BLE001 — the queue is optional here
+            pass
+    return {"jobs": jobs, "survives": survives}
 
 
 # ---- admin ---------------------------------------------------------------------------------------------
@@ -514,11 +594,10 @@ def _loopback(address):
         return False
 
 
-def is_admin(request, session):
-    """May this request apply an update? From this computer, or a session unlocked with the admin password."""
-    if os.environ.get("VALIDATOR_ADMIN_LOCALHOST", "1") != "0" and _loopback(request.remote_addr):
-        return True
-    return bool(os.environ.get("VALIDATOR_ADMIN_PASSWORD")) and session.get("update_admin") is True
+def is_admin(request, session=None):
+    """May this request apply an update? Only from a browser on the server itself (a loopback address), unless
+    VALIDATOR_ADMIN_LOCALHOST=0 (then nobody from the app)."""
+    return os.environ.get("VALIDATOR_ADMIN_LOCALHOST", "1") != "0" and _loopback(request.remote_addr)
 
 
 # ---- status of the update in progress / last update ----------------------------------------------------
@@ -1232,7 +1311,7 @@ def _asset(release, regex, version=None):
 
 
 def register_updater(app, get_commit, get_version):
-    """/api/health (public), /api/update/check, /api/update/admin, /api/update/apply, /api/update/status.
+    """/api/health (public), /api/update/check, /api/update/apply, /api/update/status.
     get_commit / get_version: what the server read when it started (the checkout may have moved since)."""
     from flask import jsonify, request, session
     from idtrackerai_validator_server import auth
@@ -1255,7 +1334,6 @@ def register_updater(app, get_commit, get_version):
         install, current = running()
         out = {"install": {k: install.get(k) for k in ("kind", "root", "python", "reason", "service", "install_dir")},
                "current": current, "admin": is_admin(request, session),
-               "admin_password": bool(os.environ.get("VALIDATOR_ADMIN_PASSWORD")),
                "checked_at": time.time(), "last_update": read_status()}
         if out["last_update"]:
             out["last_update"].pop("log", None)
@@ -1300,18 +1378,6 @@ def register_updater(app, get_commit, get_version):
                             "install": {k: install.get(k) for k in ("kind", "root", "reason")},
                             "admin": is_admin(request, session)}), 502
 
-    @app.route("/api/update/admin", methods=["POST"])
-    def update_admin():
-        password = os.environ.get("VALIDATOR_ADMIN_PASSWORD")
-        given = (request.get_json(silent=True) or {}).get("password") or ""
-        if not password:
-            return jsonify({"error": "no admin password is set on the server (VALIDATOR_ADMIN_PASSWORD)"}), 400
-        if not hmac.compare_digest(given.encode(), password.encode()):
-            time.sleep(1)
-            return jsonify({"error": "wrong admin password"}), 403
-        session["update_admin"] = True
-        return jsonify({"admin": True})
-
     @app.route("/api/update/status")
     def update_status():
         status = read_status()
@@ -1324,7 +1390,7 @@ def register_updater(app, get_commit, get_version):
     def update_apply():
         if not is_admin(request, session):
             return jsonify({"error": "Only an admin can update the server: it restarts it for everyone. "
-                                     "Ask your admin."}), 403
+                                     "Updates are applied from a browser on the server itself; ask your admin."}), 403
         body = request.get_json(silent=True) or {}
         if update_running():
             return jsonify({"error": "An update is running already."}), 409

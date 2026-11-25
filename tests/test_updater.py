@@ -182,7 +182,8 @@ class Endpoints(unittest.TestCase):
                         mock.patch.object(updater, "detect_install", return_value=install),
                         mock.patch.object(updater, "start_helper"),
                         mock.patch.object(updater, "STATUS_FILE", os.path.join(self.root, "status.json")),
-                        mock.patch("idtrackerai_validator_server.jobs.running_jobs", return_value=[])]
+                        mock.patch("idtrackerai_validator_server.jobs.running_jobs", return_value=[]),
+                        mock.patch.object(updater, "cgroup_processes", return_value=[])]
         for p in self.patches:
             p.start()
         self.client = self.app.test_client()
@@ -207,19 +208,30 @@ class Endpoints(unittest.TestCase):
     def test_not_admin(self):
         response = self.client.post("/api/update/apply", json={}, environ_base=self.remote())
         self.assertEqual(response.status_code, 403)
-        self.assertIn("Ask your admin", response.get_json()["error"])
+        self.assertIn("ask your admin", response.get_json()["error"])
         updater.start_helper.assert_not_called()
 
-    def test_admin_password(self):
-        with mock.patch.dict(os.environ, {"VALIDATOR_ADMIN_PASSWORD": "s3cret"}), mock.patch.object(updater.time, "sleep"):
-            self.assertEqual(self.client.post("/api/update/admin", json={"password": "no"}, environ_base=self.remote()).status_code, 403)
-            self.assertEqual(self.client.post("/api/update/admin", json={"password": "s3cret"}, environ_base=self.remote()).status_code, 200)
-            response = self.client.post("/api/update/apply", json={}, environ_base=self.remote())
-            self.assertEqual(response.status_code, 202, response.get_json())
+    def test_loopback_only(self):
+        # no password path: a remote browser can never apply, whatever the environment says
+        with mock.patch.dict(os.environ, {"VALIDATOR_ADMIN_PASSWORD": "s3cret"}):
+            self.assertEqual(self.client.post("/api/update/admin", json={"password": "s3cret"},
+                                              environ_base=self.remote()).status_code, 404)
+            self.assertEqual(self.client.post("/api/update/apply", json={}, environ_base=self.remote()).status_code, 403)
+            self.assertNotIn("admin_password", self.client.get("/api/update/check").get_json())
+        self.assertEqual(self.client.post("/api/update/apply", json={}, environ_base={"REMOTE_ADDR": "::1"}).status_code, 202)
         with mock.patch.dict(os.environ, {"VALIDATOR_ADMIN_LOCALHOST": "0"}):
-            os.environ.pop("VALIDATOR_ADMIN_PASSWORD", None)
-            self.client = self.app.test_client()
             self.assertEqual(self.client.post("/api/update/apply", json={}).status_code, 403)
+
+    def test_cgroup_process_blocks(self):
+        proc = {"pid": 4242, "name": "preprocess-sample", "command": "/env/bin/python3.7 /env/bin/preprocess-sample --store-path x"}
+        with mock.patch.object(updater, "cgroup_processes", return_value=[proc]):
+            check = self.client.get("/api/update/check").get_json()
+            self.assertEqual(check["busy"]["jobs"][0]["title"], "preprocess-sample (pid 4242)")
+            response = self.client.post("/api/update/apply", json={})
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("preprocess-sample (pid 4242)", response.get_json()["error"])
+            updater.start_helper.assert_not_called()
+            self.assertEqual(self.client.post("/api/update/apply", json={"force": True}).status_code, 202)
 
     def test_dirty(self):
         with open(os.path.join(self.root, "a.txt"), "w") as f:
@@ -260,6 +272,43 @@ class Endpoints(unittest.TestCase):
             response = self.client.get("/api/update/check")
             self.assertEqual(response.status_code, 502)
             self.assertIn("Could not reach GitHub", response.get_json()["error"])
+
+
+class Cgroup(unittest.TestCase):
+    def test_processes_of_the_unit(self):
+        """Every process of the unit's cgroup (and below) but the server and multiprocessing's resource_tracker."""
+        import sys
+        children = [subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "job"]),
+                    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)  # multiprocessing.resource_tracker"])]
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                unit = os.path.join(root, "user.slice", "app.slice", "viewer.service")
+                os.makedirs(os.path.join(unit, "sub"))
+                with open(os.path.join(unit, "cgroup.procs"), "w") as f:
+                    f.write("{}\n{}\n".format(os.getpid(), children[0].pid))
+                with open(os.path.join(unit, "sub", "cgroup.procs"), "w") as f:
+                    f.write("{}\n999999999\n".format(children[1].pid))     # a pid already gone is skipped
+                found = updater.cgroup_processes(cgroup="/user.slice/app.slice/viewer.service", root=root,
+                                                 self_pid=os.getpid())
+            self.assertEqual([p["pid"] for p in found], [children[0].pid])
+            self.assertIn("sleep(60)", found[0]["command"])
+        finally:
+            for child in children:
+                child.kill()
+                child.wait()
+
+    def test_not_under_systemd(self):
+        with mock.patch.object(updater, "systemd_unit", return_value=None):
+            self.assertEqual(updater.cgroup_processes(), [])
+
+    def test_own_cgroup(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("0::/user.slice/user-1000.slice/user@1000.service/app.slice/idtrackerai-viewer.service\n")
+        try:
+            self.assertEqual(updater.own_cgroup(f.name),
+                             "/user.slice/user-1000.slice/user@1000.service/app.slice/idtrackerai-viewer.service")
+        finally:
+            os.unlink(f.name)
 
 
 class WebFallback(unittest.TestCase):
