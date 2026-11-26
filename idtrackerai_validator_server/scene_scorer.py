@@ -170,6 +170,15 @@ ID_ERRORS = ("wrong_label", "unlabelled")
 
 # ---- model -----------------------------------------------------------------------------------------------------
 
+THREADS = 1    # OpenMP threads of the model's fits / predictions (64 by default here: they spin on a busy server; one is ~0.1 s)
+
+
+def limited():
+    """Context limiting the OpenMP threads of sklearn's gradient boosting to THREADS"""
+    from threadpoolctl import threadpool_limits
+    return threadpool_limits(limits=THREADS, user_api="openmp")
+
+
 def new_model():
     from sklearn.ensemble import HistGradientBoostingClassifier
     return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=20,
@@ -189,8 +198,9 @@ def precision_threshold(scores, y, precision, min_accepted=20):
 _model = {}   # path -> (mtime, model dict)
 
 
-def load_model(path=MODEL_PATH):
+def load_model(path=None):
     """{"model", "features", "threshold", "target", ...} of the trained scorer, or None (not trained yet)."""
+    path = path or MODEL_PATH
     try:
         mtime = os.path.getmtime(path)
     except OSError:
@@ -204,7 +214,8 @@ def load_model(path=MODEL_PATH):
     return model
 
 
-def save_model(model, path=MODEL_PATH):
+def save_model(model, path=None):
+    path = path or MODEL_PATH
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "wb") as handle:
@@ -227,7 +238,8 @@ def score_scenes(dbfile, scenes, chunksize, n_animals, saved_before, translate, 
         f = features(first, last, n_animals, members, run, results, rows)
         batch.append((members, [float(f[k]) for k in names]))
     if batch:
-        ps = model["model"].predict_proba(np.array([x for _, x in batch]))[:, 1]
+        with limited():
+            ps = model["model"].predict_proba(np.array([x for _, x in batch]))[:, 1]
         for (members, _), p in zip(batch, ps.tolist()):
             easy = p >= model["threshold"]
             why = f"learned score {p:.3f} {'≥' if easy else '<'} {model['threshold']:.3f}"

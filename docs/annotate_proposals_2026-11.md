@@ -134,6 +134,14 @@ Crossing without identity, fragment continuity (current swaps 11 and 12):
 
 ![](annotate_proposals_2026-11/FlyHostel4_12X_2026-11-15_17-00-00_2666100.jpg)
 
+## Shipped in 1.7.0
+
+Both are options in the Annotate tab, the defaults unchanged (continuity v1, rule-based easy scenes): the toolbar's
+**Proposal** (Continuity v1 / v2) and **Easy** (Rules / Learned) choices, kept per browser; the pre-download holds the
+frame data of the Proposal chosen. **Accept easy…** reviews the easy scenes (thumbnails, scores, a preview with the
+boxes to be saved), saves the ticked ones in one go as the person (log: "accepted easy scene, continuity2, learned
+0.97, batch N") and can undo a batch. Server-wide defaults: `ANNOTATE_CONTINUITY_VERSION`, `ANNOTATE_EASY_METHOD`.
+
 ## Recommendation and effort
 
 1. Try `ANNOTATE_CONTINUITY_VERSION=2` on the next 12X experiment (one service restart, no client change); if

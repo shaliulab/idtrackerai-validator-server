@@ -18,6 +18,10 @@ Per experiment, in $ANNOTATE_PACK_CACHE/<flat>/ (lab_paths, default ~/.cache/idt
     <chunk:06d>.data.gz      gzip of {sig, frames: {frame: /api/annotate/frame's answer}}: the saved boxes and the
                              proposals of every frame of the chunk, made again when `sig` (chunk_sigs: database,
                              scene_qc.csv, the last solver run, the frames of the chunk saved and when) changes.
+    <chunk:06d>.data.c2.gz   the same with continuity proposals of tracker v2 (continuity.RunV2): the data is made
+                             for the continuity version the browser asks for (?continuity= / "continuity", the
+                             Annotate tab's proposal choice; default the server's), each with its own sig, so a
+                             person on v1 and one on v2 share the streams and contours but not the frame data.
 
 Built by a job (POST /api/annotate/pack): chunks in the order asked, WORKERS spawned processes each reading its
 chunk's frames from the recording (forward, exchange_bundle._SourceReader), encoding them with ffmpeg, segmenting
@@ -149,12 +153,15 @@ def chunk_index(state, chunk, frames=None, stamp=None):
     return index
 
 
-def chunk_sigs(state, chunks):
-    """{chunk: sig} of the frame data: changes when the database, scene_qc.csv, the solver's proposals or a frame
-    of the chunk saved (any person, any computer: frames.updated) changes."""
+def chunk_sigs(state, chunks, version=1):
+    """{chunk: sig} of the frame data (continuity proposals of tracker `version`): changes when the database,
+    scene_qc.csv, the solver's proposals or a frame of the chunk saved (any person, any computer: frames.updated)
+    changes."""
     from idtrackerai_validator_server import box_annotations as ba
     base = [PACK_VERSION, *_mtime_size(state["dbfile"]),
             *_mtime_size(os.path.join(ba._validation_folder(state["basedir"]), "scene_qc.csv"))]
+    if version == 2:
+        base.append("continuity2")
     saved, run = {}, None
     con = ba._connect(state["basedir"])
     if con is not None:
@@ -330,13 +337,14 @@ def pack_chunk(task):
             state["contours"] = lambda fn: bundle_contours(task["basedir"], fn)
         else:
             state["contours"] = (lambda fn: contours.get(fn, [])) if contours is not None else (lambda fn: [])
-        sig = chunk_sigs(state, [task["chunk"]])[task["chunk"]]
-        summary["data_bytes"] = len(write_data(state, task["chunk"], task["frames"], sig))
+        version = task.get("continuity", 1)
+        sig = chunk_sigs(state, [task["chunk"]], version)[task["chunk"]]
+        summary["data_bytes"] = len(write_data(state, task["chunk"], task["frames"], sig, version))
         summary["data_seconds"] = round(time.time() - t0, 1)
     return summary
 
 
-def _task(state, chunk, frames, store, stamp, build, data, size):
+def _task(state, chunk, frames, store, stamp, build, data, size, version=1):
     idx = []
     if build:
         with sqlite3.connect(f"file:{os.path.join(state['basedir'], 'index.db')}?mode=ro", uri=True) as con:
@@ -349,7 +357,8 @@ def _task(state, chunk, frames, store, stamp, build, data, size):
     worker_state["bundle"] = bundle
     return {"basedir": state["basedir"], "out": pack_dir(state["experiment"]), "chunk": chunk, "frames": frames,
             "frame_idx": idx, "stamp": stamp, "config": None if bundle else state.get("config"), "ffmpeg": lab_paths.FFMPEG,
-            "build": build, "parent": os.getpid(), "data": {**worker_state, "frame_size": list(size)} if data else None, **store}
+            "build": build, "parent": os.getpid(), "data": {**worker_state, "frame_size": list(size)} if data else None,
+            "continuity": version, **store}
 
 
 # --- server side ----------------------------------------------------------------------------------------
@@ -381,27 +390,28 @@ def cached_contours(experiment, frame_number, chunksize):
     return hit.get(frame_number)
 
 
-def _data_path(experiment, chunk):
-    return os.path.join(pack_dir(experiment), f"{chunk:06d}.data.gz")
+def _data_path(experiment, chunk, version=1):
+    return os.path.join(pack_dir(experiment), f"{chunk:06d}.data.c2.gz" if version == 2 else f"{chunk:06d}.data.gz")
 
 
-def kept_sig(experiment, chunk):
+def kept_sig(experiment, chunk, version=1):
     try:
-        with open(_data_path(experiment, chunk) + ".sig") as handle:
+        with open(_data_path(experiment, chunk, version) + ".sig") as handle:
             return handle.read().strip()
     except OSError:
         return None
 
 
-def write_data(state, chunk, frames, sig):
-    """Make the chunk's frame data (gzip of {sig, chunk, frames: {frame: /api/annotate/frame's answer}}), keep it
-    in <chunk>.data.gz (+ .sig) and return it. sig: chunk_sigs, read before (a save meanwhile changes it)."""
+def write_data(state, chunk, frames, sig, version=1):
+    """Make the chunk's frame data (gzip of {sig, chunk, continuity, frames: {frame: /api/annotate/frame's answer}}
+    with continuity proposals of tracker `version`), keep it in <chunk>.data[.c2].gz (+ .sig) and return it. sig:
+    chunk_sigs, read before (a save meanwhile changes it)."""
     from idtrackerai_validator_server import box_annotations as ba
-    payload = {"sig": sig, "chunk": chunk, "frames": {}}
+    payload = {"sig": sig, "chunk": chunk, "continuity": version, "frames": {}}
     for fn in frames:
-        payload["frames"][str(fn)] = ba.frame_payload(state, fn)
+        payload["frames"][str(fn)] = ba.frame_payload(state, fn, None, version)
     raw = gzip.compress(json.dumps(payload, separators=(",", ":")).encode(), 6)
-    path = _data_path(state["experiment"], chunk)
+    path = _data_path(state["experiment"], chunk, version)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tag = f".{os.getpid()}.{threading.get_ident()}.part"
     with open(path + tag, "wb") as handle:
@@ -413,39 +423,39 @@ def write_data(state, chunk, frames, sig):
     return raw
 
 
-def chunk_data(state, chunk, frames, sig):
+def chunk_data(state, chunk, frames, sig, version=1):
     """gzip bytes of the chunk's frame data: the kept ones when made with this sig, else made now"""
     key = (to_flat(state["experiment"]), chunk)
     with _lock:
         lock = _chunk_locks.setdefault(key, threading.Lock())
     with lock:
-        if kept_sig(state["experiment"], chunk) == sig:
+        if kept_sig(state["experiment"], chunk, version) == sig:
             try:
-                with open(_data_path(state["experiment"], chunk), "rb") as handle:
+                with open(_data_path(state["experiment"], chunk, version), "rb") as handle:
                     return handle.read()
             except OSError:
                 pass
-        return write_data(state, chunk, frames, sig)
+        return write_data(state, chunk, frames, sig, version)
 
 
-def status(state):
+def status(state, version=1):
     flat = to_flat(state["experiment"])
     folder = pack_dir(state["experiment"])
     by_chunk = pack_frames(state)
     stamp = video_stamp(state)
-    sigs = chunk_sigs(state, by_chunk)
+    sigs = chunk_sigs(state, by_chunk, version)
     chunks = []
     for chunk, frames in by_chunk.items():
         index = chunk_index(state, chunk, frames, stamp)
-        data_sig = kept_sig(state["experiment"], chunk)
+        data_sig = kept_sig(state["experiment"], chunk, version)
         chunks.append({"chunk": chunk, "frames": len(frames), "first": frames[0], "last": frames[-1],
                        "built": index is not None, "vkey": vkey(stamp, frames), "bytes": index["bytes"] if index else None,
                        "sig": sigs[chunk], "data_ready": data_sig == sigs[chunk] and index is not None,
-                       "data_bytes": os.path.getsize(os.path.join(folder, f"{chunk:06d}.data.gz"))
+                       "data_bytes": os.path.getsize(_data_path(state["experiment"], chunk, version))
                        if data_sig == sigs[chunk] else None})
     built = [c for c in chunks if c["built"]]
     job = _jobs.get(_running.get(flat))
-    return {"experiment": flat, "folder": folder, "version": PACK_VERSION, "chunks": chunks,
+    return {"experiment": flat, "folder": folder, "version": PACK_VERSION, "continuity": version, "chunks": chunks,
             "frames": sum(c["frames"] for c in chunks), "built_frames": sum(c["frames"] for c in built),
             "bytes": sum(c["bytes"] for c in built),
             "data_bytes": sum(c["data_bytes"] or 0 for c in chunks),
@@ -471,7 +481,7 @@ def prune(keep):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def start(state, order=None, data=True):
+def start(state, order=None, data=True, version=1):
     """The job building the chunks not built yet (in `order` first) and their frame data. Returns (job, started)."""
     flat = to_flat(state["experiment"])
     with _lock:
@@ -494,8 +504,8 @@ def start(state, order=None, data=True):
     def work(job):
         size = state["size"]()
         built = {c for c in order if chunk_index(state, c, by_chunk[c], stamp) is not None}
-        sigs = chunk_sigs(state, order) if data else {}
-        tasks = [(c, c not in built, data and (c not in built or kept_sig(state["experiment"], c) != sigs[c]))
+        sigs = chunk_sigs(state, order, version) if data else {}
+        tasks = [(c, c not in built, data and (c not in built or kept_sig(state["experiment"], c, version) != sigs[c]))
                  for c in order]
         tasks = [t for t in tasks if t[1] or t[2]]
         done_frames = sum(len(by_chunk[c]) for c in built)
@@ -510,7 +520,7 @@ def start(state, order=None, data=True):
             while queue or pending:
                 while queue and len(pending) < WORKERS * 2 and not stop.is_set():
                     c, build, make = queue.pop(0)
-                    task = _task(state, c, by_chunk[c], store, stamp, build, make, size)
+                    task = _task(state, c, by_chunk[c], store, stamp, build, make, size, version)
                     pending[pool.submit(pack_chunk, task)] = (c, build, make)
                 if stop.is_set():
                     for future in pending:
@@ -548,6 +558,12 @@ def start(state, order=None, data=True):
     return job, True
 
 
+def _version(asked):
+    """continuity version of a request (box_annotations.continuity_version: 1 / 2, else the server's default)"""
+    from idtrackerai_validator_server import box_annotations as ba
+    return ba.continuity_version(asked)
+
+
 def register_annotate_pack(app, get_state):
     """get_state(): box_annotations' state (+ config: the idtrackerai config), or None"""
 
@@ -562,7 +578,7 @@ def register_annotate_pack(app, get_state):
         state, error = state_or_error()
         if error:
             return error
-        return jsonify(status(state))
+        return jsonify(status(state, _version(request.args.get("continuity"))))
 
     @app.route("/api/annotate/pack", methods=["POST"])
     def pack_start():
@@ -572,7 +588,8 @@ def register_annotate_pack(app, get_state):
             return error
         body = request.get_json(silent=True) or {}
         try:
-            job, started = start(state, [int(c) for c in body.get("chunks") or []], bool(body.get("data", True)))
+            job, started = start(state, [int(c) for c in body.get("chunks") or []], bool(body.get("data", True)),
+                                 _version(body.get("continuity")))
         except LookupError as exc:
             return jsonify({"error": str(exc)}), 400
         return jsonify({"job": job.to_dict(), "started": started}), 202 if started else 200
@@ -636,8 +653,9 @@ def register_annotate_pack(app, get_state):
         if error:
             return error
         frames = pack_frames(state)[chunk]
-        sig = chunk_sigs(state, [chunk])[chunk]
-        raw = chunk_data(state, chunk, frames, sig)
+        version = _version(request.args.get("continuity"))
+        sig = chunk_sigs(state, [chunk], version)[chunk]
+        raw = chunk_data(state, chunk, frames, sig, version)
         response = Response(raw, mimetype="application/gzip")
         response.headers["X-Data-Sig"] = sig
         response.headers["Cache-Control"] = "no-store"

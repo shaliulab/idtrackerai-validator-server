@@ -84,6 +84,11 @@ def oof_scores(X, y, groups):
 
 
 def main():
+    with scene_scorer.limited():
+        _main()
+
+
+def _main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("experiments", nargs="*")
     parser.add_argument("--target", default="id_ok", choices=["id_ok", "ok"])

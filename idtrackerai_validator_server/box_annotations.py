@@ -128,6 +128,11 @@ def connect_path(path):
                                               note TEXT, confidence TEXT);
         CREATE INDEX IF NOT EXISTS proposals_fn ON proposals (frame_number);
         CREATE TABLE IF NOT EXISTS proposal_runs (t REAL, model TEXT, scenes INTEGER, frames INTEGER, summary TEXT);
+        CREATE TABLE IF NOT EXISTS accept_batches (id INTEGER PRIMARY KEY, t REAL, author TEXT, note TEXT,
+                                                   continuity INTEGER, method TEXT, scenes TEXT, frames INTEGER,
+                                                   skipped TEXT, ended REAL, undone REAL);
+        CREATE TABLE IF NOT EXISTS accept_frames (batch INTEGER, frame_number INTEGER);
+        CREATE INDEX IF NOT EXISTS accept_frames_batch ON accept_frames (batch);
     """)
     # track: id of the track a box belongs to (drawn with "New track": carried to the next frame until hidden), or NULL
     if "track" not in [r[1] for r in con.execute("PRAGMA table_info(boxes)")]:
@@ -1061,20 +1066,27 @@ def continuity_proposal(state, con, frame_number, rows, contours, labels=None, s
 
 
 EASY_CACHE_DIR = lab_paths.CONTINUITY_CACHE_DIR
-_easy_cache = {}     # dbfile -> (stamp, {scene start: why})
-_easy_running = {}   # dbfile -> (job id, stamp)
+_easy_cache = {}     # (dbfile, method) -> (stamp, {"scenes": {scene start: why}[, "scores"]})
+_easy_running = {}   # (dbfile, method) -> (job id, stamp)
 
 
-EASY_METHOD = lab_paths.ANNOTATE_EASY_METHOD   # "rules" (continuity.classify_scenes) or "learned" (scene_scorer)
+EASY_METHOD = lab_paths.ANNOTATE_EASY_METHOD   # default: "rules" (continuity.classify_scenes) or "learned" (scene_scorer)
+EASY_METHODS = ("rules", "learned")
 
 
-def _easy_stamp(state):
+def easy_method(asked=None):
+    """The easy-scene method of a request (?easy=), else the server's default"""
+    return asked if asked in EASY_METHODS else (EASY_METHOD if EASY_METHOD in EASY_METHODS else "rules")
+
+
+def _easy_stamp(state, method="rules"):
     path = os.path.join(_validation_folder(state["basedir"]), "scene_qc.csv")
     stamp = [continuity.CLASSIFY_VERSION, *_mtime_size(state["dbfile"]), *_mtime_size(path), state["n_animals"],
              state["chunksize"]]
-    if EASY_METHOD == "learned":
-        # the score depends on the person's frames saved before each stretch and on the model
-        stamp += ["learned", *_mtime_size(scene_scorer.MODEL_PATH), *_mtime_size(sidecar_path(state["basedir"]))]
+    if method == "learned":
+        # the model; not the sidecar: scores are made with the person's frames saved when they were asked (saving a
+        # frame would otherwise start minutes of scoring again)
+        stamp += ["learned", *_mtime_size(scene_scorer.MODEL_PATH)]
     return stamp
 
 
@@ -1118,57 +1130,67 @@ def _learned_easy(state, scenes, progress):
                                      progress=progress)
 
 
-def easy_scenes_async(state):
-    """Scenes of scene_qc.csv the continuity proposal should resolve alone (continuity.classify_scenes):
-    {"scenes": {start: why}} when known (memory, else $CONTINUITY_CACHE_DIR/<flat>.json, while the database and
-    scene_qc.csv are unchanged), else {"pending": job} with a job classifying them started (minutes), or {"error"}
-    when that job failed (not started again until the database or scene_qc.csv change)."""
+def easy_scenes_async(state, method=None):
+    """Scenes of scene_qc.csv the continuity proposal should resolve alone, by `method` ("rules":
+    continuity.classify_scenes; "learned": scene_scorer.score_scenes; default easy_method()):
+    {"method", "scenes": {start: why}, "scores": {start: score} (learned)} when known (memory, else
+    $CONTINUITY_CACHE_DIR/<flat>[.learned].json, while the database, scene_qc.csv (and the model) are unchanged), else
+    {"method", "pending": job} with a job classifying them started (minutes), or {"method", "error"} when that job
+    failed (not started again until they change) or there is no trained model."""
+    method = easy_method(method)
+    if method == "learned" and scene_scorer.load_model() is None:
+        return {"method": method, "error": f"no scene scorer trained (scripts/train_scene_scorer.py writes {scene_scorer.MODEL_PATH})"}
     dbfile = state["dbfile"]
-    stamp = _easy_stamp(state)
-    hit = _easy_cache.get(dbfile)
+    key = (dbfile, method)
+    stamp = _easy_stamp(state, method)
+    hit = _easy_cache.get(key)
     if hit and hit[0] == stamp:
-        return {"scenes": hit[1]}
-    path = os.path.join(EASY_CACHE_DIR, f"{to_flat(state['experiment'])}.json")
+        return {"method": method, **hit[1]}
+    suffix = ".learned" if method == "learned" else ""
+    path = os.path.join(EASY_CACHE_DIR, f"{to_flat(state['experiment'])}{suffix}.json")
     try:
         with open(path) as handle:
             saved = json.load(handle)
         if saved.get("stamp") == stamp:
-            _easy_cache[dbfile] = (stamp, saved["scenes"])
-            return {"scenes": saved["scenes"]}
+            value = {"scenes": saved["scenes"], **({"scores": saved["scores"]} if "scores" in saved else {})}
+            _easy_cache[key] = (stamp, value)
+            return {"method": method, **value}
     except (OSError, ValueError):
         pass
     scenes, _ = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
     with _lock:
-        job_id, job_stamp = _easy_running.get(dbfile, (None, None))
+        job_id, job_stamp = _easy_running.get(key, (None, None))
         running = _jobs.get(str(job_id))
         if running is not None and running.status == "running":
-            return {"pending": running.to_dict()}
+            return {"method": method, "pending": running.to_dict()}
         if running is not None and running.status == "failed" and job_stamp == stamp:
-            return {"error": running.error or "the classification failed"}
+            return {"method": method, "error": running.error or "the classification failed"}
 
         def work(job):
             job.update(0, status="running")
-            if EASY_METHOD == "learned":
+            if method == "learned":
                 result = _learned_easy(state, scenes, lambda f: job.update(0, progress=min(0.99, f)))
             else:
                 result = continuity.classify_scenes(dbfile, scenes, state["chunksize"], state["n_animals"],
                                                     progress=lambda f: job.update(0, progress=min(0.99, f)))
-            easy = {str(start): r["why"] for start, r in result.items() if r["easy"]}
-            _easy_cache[dbfile] = (stamp, easy)
+            value = {"scenes": {str(start): r["why"] for start, r in result.items() if r["easy"]}}
+            if method == "learned":
+                value["scores"] = {str(start): round(r["p"], 4) for start, r in result.items() if r.get("p") is not None}
+            _easy_cache[key] = (stamp, value)
             try:
                 os.makedirs(EASY_CACHE_DIR, exist_ok=True)
                 tmp = f"{path}.tmp"
                 with open(tmp, "w") as handle:
-                    json.dump({"stamp": stamp, "scenes": easy}, handle)
+                    json.dump({"stamp": stamp, **value}, handle)
                 os.replace(tmp, path)
             except OSError as error:
                 logger.warning("Could not keep the easy scenes in %s: %s", path, error)
-            job.result = {"easy": len(easy), "scenes": len(scenes)}
+            job.result = {"easy": len(value["scenes"]), "scenes": len(scenes), "method": method}
             job.update(0, status="done", progress=1.0)
 
-        job = start_job(f"Easy scenes ({'learned' if EASY_METHOD == 'learned' else 'continuity'}) of {to_flat(state['experiment'])}", [to_flat(state["experiment"])], work)
-        _easy_running[dbfile] = (job.id, stamp)
-        return {"pending": job.to_dict()}
+        job = start_job(f"Easy scenes ({method}) of {to_flat(state['experiment'])}", [to_flat(state["experiment"])], work)
+        _easy_running[key] = (job.id, stamp)
+        return {"method": method, "pending": job.to_dict()}
 
 
 def _running_job(job_id):
@@ -1187,10 +1209,12 @@ def _author():
 MAX_SAVE_FRAMES = 1000   # frames of one POST /api/annotate/frames
 
 
-def write_frames(state, items):
+def write_frames(state, items, note=None, now=None, author=None):
     """[(frame, checked boxes)] written in one transaction (a frame twice: the last wins); the responses of
-    POST /api/annotate/frame/<n>, in order."""
-    author, now = _author(), time.time()
+    POST /api/annotate/frame/<n>, in order. note: kept in the log's author after the person's name
+    ("<me> (<note>)", e.g. an accepted easy scene), the frame's author stays the person."""
+    author, now = author or _author(), now or time.time()
+    log_author = f"{author} ({note})" if note else author
     with _lock:
         con = _connect(state["basedir"], create=True)
         with con:
@@ -1199,13 +1223,159 @@ def write_frames(state, items):
                 con.executemany("INSERT INTO boxes (frame_number, x0, y0, x1, y1, label, track) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                 [(frame_number, b["x0"], b["y0"], b["x1"], b["y1"], b["label"], b.get("track")) for b in boxes])
                 con.execute("INSERT OR REPLACE INTO frames VALUES (?, ?, ?, ?)", (frame_number, author, now, len(boxes)))
-                con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, json.dumps(boxes)))
+                con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, log_author, frame_number, json.dumps(boxes)))
         con.close()
     return [{"frame_number": fn, "chunk": fn // state["chunksize"], "saved": True, "boxes": boxes, "author": author,
              "updated": now} for fn, boxes in items]
 
 
-def frame_payload(state, frame_number, want=None):
+# ---- Accept all easy scenes: their proposals saved in one go, as one batch that can be undone ----------------------
+
+_accepting = {}   # experiment -> job id
+_accept_stop = {}  # experiment -> threading.Event
+
+
+def accept_batches(state, limit=10):
+    """The last accept batches of the loaded experiment: id, t, author, note, continuity, method, scenes (count),
+    frames (saved), skipped (count), ended, undone, kept (frames still as accepted)"""
+    con = _connect(state["basedir"])
+    if con is None:
+        return []
+    try:
+        with con:
+            rows = con.execute("SELECT id, t, author, note, continuity, method, scenes, frames, skipped, ended, undone "
+                               "FROM accept_batches ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            out = []
+            for bid, t, author, note, cont, method, scenes, frames, skipped, ended, undone in rows:
+                kept = con.execute("SELECT COUNT(*) FROM accept_frames a JOIN frames f USING (frame_number) "
+                                   "WHERE a.batch = ? AND f.updated = ?", (bid, t)).fetchone()[0]
+                out.append({"id": bid, "t": t, "author": author, "note": note, "continuity": cont, "method": method,
+                            "scenes": len(json.loads(scenes or "[]")), "frames": frames or 0,
+                            "skipped": len(json.loads(skipped or "{}")), "ended": ended, "undone": undone,
+                            "kept": kept})
+            return out
+    finally:
+        con.close()
+
+
+def accept_note(batch, continuity_version_, method, score=None):
+    """Marker of an accepted frame in the log (after the person's name): "accepted easy scene, continuity2,
+    learned 0.97, batch 3" """
+    parts = ["accepted easy scene", "continuity" if continuity_version_ == 1 else f"continuity{continuity_version_}",
+             method if score is None else f"{method} {score:.2f}", f"batch {batch}"]
+    return ", ".join(parts)
+
+
+def accept_scenes(state, scenes, version, method, author, get_state=None, stop=None, progress=None):
+    """Save the proposal (frame_payload with this continuity version) of every frame of `scenes` ([{start, length,
+    score?}], in frame order) that nobody saved, through write_frames (one transaction per scene, all with the
+    batch's time), as batch rows of accept_batches / accept_frames. get_state(): stops when another experiment gets
+    loaded (the proposals read the loaded recording's frames). Returns {"batch", "frames", "scenes", "skipped"
+    {frame: why}, "stopped"}."""
+    now = time.time()
+    scenes = sorted(scenes, key=lambda sc: int(sc["start"]))
+    with _lock:
+        con = _connect(state["basedir"], create=True)
+        with con:
+            cur = con.execute("INSERT INTO accept_batches (t, author, note, continuity, method, scenes, frames, skipped) "
+                              "VALUES (?, ?, ?, ?, ?, ?, 0, '{}')",
+                              (now, author, accept_note(0, version, method).replace(", batch 0", ""), version, method,
+                               json.dumps(scenes)))
+            batch = cur.lastrowid
+        con.close()
+    total = sum(int(sc["length"]) for sc in scenes) or 1
+    seen, saved_n, skipped, stopped = 0, 0, {}, False
+    for sc in scenes:
+        if (stop is not None and stop.is_set()) or \
+                (get_state is not None and (get_state() or {}).get("experiment") != state["experiment"]):
+            stopped = True
+            break
+        start, length = int(sc["start"]), int(sc["length"])
+        con = _connect(state["basedir"])
+        done = {fn for (fn,) in con.execute("SELECT frame_number FROM frames WHERE frame_number BETWEEN ? AND ?",
+                                            (start, start + length - 1))} if con is not None else set()
+        if con is not None:
+            con.close()
+        items = []
+        for fn in range(start, start + length):
+            seen += 1
+            if fn in done:
+                continue
+            try:
+                payload = frame_payload(state, fn, None, version)
+                if payload["saved"]:
+                    continue
+                items.append((fn, check_boxes([{k: b[k] for k in ("x0", "y0", "x1", "y1", "label", "track") if k in b}
+                                               for b in payload["boxes"]], state["n_animals"])))
+            except (ValueError, KeyError, sqlite3.Error) as exc:
+                skipped[str(fn)] = str(exc)
+        if get_state is not None and (get_state() or {}).get("experiment") != state["experiment"]:
+            stopped = True     # the proposals of this scene may have read another recording: not written
+            break
+        if items:
+            score = sc.get("score")
+            write_frames(state, items, note=accept_note(batch, version, method, score), now=now, author=author)
+            with _lock:
+                con = _connect(state["basedir"])
+                with con:
+                    con.executemany("INSERT INTO accept_frames (batch, frame_number) VALUES (?, ?)",
+                                    [(batch, fn) for fn, _ in items])
+                    con.execute("UPDATE accept_batches SET frames = frames + ? WHERE id = ?", (len(items), batch))
+                con.close()
+            saved_n += len(items)
+        if progress is not None:
+            progress(seen / total)
+    with _lock:
+        con = _connect(state["basedir"])
+        with con:
+            con.execute("UPDATE accept_batches SET skipped = ?, ended = ? WHERE id = ?",
+                        (json.dumps(skipped), time.time(), batch))
+        con.close()
+    return {"batch": batch, "frames": saved_n, "scenes": len(scenes), "skipped": skipped, "stopped": stopped}
+
+
+def undo_accept(state, batch):
+    """Unsave the frames of an accept batch still as it saved them (frames.updated = the batch's time); frames
+    saved again since are kept. Returns {"batch", "removed", "kept"}; LookupError when there is no such batch."""
+    author, now = _author(), time.time()
+    with _lock:
+        con = _connect(state["basedir"])
+        if con is None:
+            raise LookupError(f"no accept batch {batch}")
+        try:
+            with con:
+                row = con.execute("SELECT t, undone FROM accept_batches WHERE id = ?", (batch,)).fetchone()
+                if row is None:
+                    raise LookupError(f"no accept batch {batch}")
+                t = row[0]
+                frames = [fn for (fn,) in con.execute("SELECT frame_number FROM accept_frames WHERE batch = ?", (batch,))]
+                removed = [fn for (fn,) in con.execute(
+                    "SELECT a.frame_number FROM accept_frames a JOIN frames f USING (frame_number) "
+                    "WHERE a.batch = ? AND f.updated = ?", (batch, t))]
+                for fn in removed:
+                    con.execute("DELETE FROM boxes WHERE frame_number = ?", (fn,))
+                    con.execute("DELETE FROM frames WHERE frame_number = ?", (fn,))
+                    con.execute("INSERT INTO log VALUES (?, ?, ?, ?)",
+                                (now, f"{author} (undo accepted easy scenes, batch {batch})", fn, "null"))
+                con.execute("UPDATE accept_batches SET undone = ? WHERE id = ?", (now, batch))
+        finally:
+            con.close()
+    return {"batch": batch, "removed": len(removed), "kept": len(frames) - len(removed), "frames": removed}
+
+
+def continuity_version(asked=None, want=None):
+    """Tracker of the continuity proposal: 2 for ?proposal=continuity2, else ?continuity= (1 / 2), else the server's
+    default (ANNOTATE_CONTINUITY_VERSION)"""
+    if want == "continuity2":
+        return 2
+    try:
+        asked = int(asked)
+    except (TypeError, ValueError):
+        asked = None
+    return asked if asked in (1, 2) else CONTINUITY_VERSION
+
+
+def frame_payload(state, frame_number, want=None, continuity=None):
     """What /api/annotate/frame/<n> answers (want: its ?proposal=): the saved boxes, else the solver's /
     continuity / idtrackerai's proposal, with the machine rows, fragment events and splits, clock, ...
     Also the frames of the Annotate tab's pre-download (annotate_pack.chunk_data)."""
@@ -1236,6 +1406,7 @@ def frame_payload(state, frame_number, want=None):
             labels, splits = chunk_fragment_labels(con, state["dbfile"], chunk, state["chunksize"], os.path.join(_validation_folder(state["basedir"]), DB_NAME))
         con.close()
     anchor = None
+    version = continuity_version(continuity, want)
 
     def frame_contours():
         try:
@@ -1253,7 +1424,7 @@ def frame_payload(state, frame_number, want=None):
             con = _connect(state["basedir"])
             try:
                 found = continuity_proposal(state, con, frame_number, rows, frame_contours(), labels, splits,
-                                            version=2 if want == "continuity2" else CONTINUITY_VERSION)
+                                            version=version)
             except (sqlite3.Error, ValueError) as exc:
                 logger.warning("No continuity proposal for frame %s: %s", frame_number, exc)
                 found = None
@@ -1262,7 +1433,7 @@ def frame_payload(state, frame_number, want=None):
                     con.close()
             if found is not None:
                 proposal, flags, anchor = found
-                source = "continuity2" if want == "continuity2" else "continuity"
+                source = "continuity2" if version == 2 else "continuity"
         if proposal is None:
             source = "tracking"
             width, height = state["size"]()
@@ -1320,7 +1491,8 @@ def register_box_annotations(app, get_state):
         scenes, source = read_scenes(state["basedir"], state["experiment"], state["n_animals"])
         bundle = source["kind"] == "bundle"
         # scenes the continuity proposal should resolve alone (not for a bundle: no continuity proposal there)
-        easy = easy_scenes_async(state) if source["kind"] == "scene_qc" and state["n_animals"] > 1 else None
+        easy = easy_scenes_async(state, request.args.get("easy")) \
+            if source["kind"] == "scene_qc" and state["n_animals"] > 1 else None
         # the range the proposer looked at (before the chunk boundaries are added: only scene_qc.csv's scenes)
         coverage = None if bundle or source["kind"] != "scene_qc" else \
             scene_coverage(state["basedir"], state["dbfile"], scenes, state["chunksize"])
@@ -1358,6 +1530,11 @@ def register_box_annotations(app, get_state):
             "bundle": bundle,
             "coverage": coverage,
             "easy": easy,
+            # what the client may choose, and the server's defaults
+            "options": {"continuity_default": CONTINUITY_VERSION, "easy_default": easy_method(),
+                        "learned_available": scene_scorer.load_model() is not None},
+            "accept_batches": accept_batches(state),
+            "accepting": _running_job(_accepting.get(to_flat(state["experiment"]))),
         })
 
     @app.route("/api/annotate/queue", methods=["GET"])
@@ -1392,7 +1569,7 @@ def register_box_annotations(app, get_state):
         state, error = state_or_error()
         if error:
             return error
-        return jsonify(frame_payload(state, frame_number, request.args.get("proposal")))
+        return jsonify(frame_payload(state, frame_number, request.args.get("proposal"), request.args.get("continuity")))
 
     @app.route("/api/annotate/frame/<int:frame_number>", methods=["POST"])
     def annotate_save(frame_number):
@@ -1482,6 +1659,80 @@ def register_box_annotations(app, get_state):
                     con.execute("INSERT INTO log VALUES (?, ?, ?, ?)", (now, author, frame_number, "null"))
                 con.close()
         return jsonify({"frame_number": frame_number, "saved": False})
+
+    @app.route("/api/annotate/accept_easy", methods=["POST"])
+    def annotate_accept_easy():
+        """{"experiment", "scenes": [{start, length, score?}], "continuity": 1 | 2, "method": "rules" | "learned"}:
+        job (202) saving the proposals of those scenes' frames nobody saved (accept_scenes), as the person, with
+        the log marked "accepted easy scene, ..., batch N"; 409 while one runs or when another experiment is
+        loaded. The job's result: batch, frames, scenes, skipped {frame: why}, stopped."""
+        state, error = state_or_error()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        if to_flat(body.get("experiment") or "") != to_flat(state["experiment"]):
+            return jsonify({"error": "another experiment is loaded"}), 409
+        if bundle_info(state["basedir"]) is not None:
+            return jsonify({"error": BUNDLE_ERROR}), 400
+        try:
+            scenes = [{"start": int(sc["start"]), "length": int(sc["length"]),
+                       **({"score": float(sc["score"])} if sc.get("score") is not None else {})}
+                      for sc in body.get("scenes") or []]
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "scenes: [{start, length, score?}]"}), 400
+        if not scenes or any(sc["length"] <= 0 or sc["length"] > MAX_SCENE_LENGTH for sc in scenes):
+            return jsonify({"error": "no scenes, or a scene of a bad length"}), 400
+        version = continuity_version(body.get("continuity"))
+        method = easy_method(body.get("method"))
+        author = _author()      # the job's thread has no request (session)
+        flat = to_flat(state["experiment"])
+        with _lock:
+            running = _jobs.get(str(_accepting.get(flat)))
+            if running is not None and running.status == "running":
+                return jsonify({"error": "easy scenes are being accepted", "job": running.to_dict()}), 409
+            stop = threading.Event()
+            _accept_stop[flat] = stop
+
+            def work(job):
+                job.update(0, status="running")
+                result = accept_scenes(state, scenes, version, method, author, get_state=get_state, stop=stop,
+                                       progress=lambda f: job.update(0, progress=min(0.99, f)))
+                job.result = result
+                job.update(0, status="cancelled" if result["stopped"] else "done", progress=1.0)
+
+            frames = sum(sc["length"] for sc in scenes)
+            job = start_job(f"Accept {len(scenes)} easy scenes ({frames} frames) of {flat}", ["frames"], work)
+            _accepting[flat] = job.id
+        return jsonify({"job": job.to_dict()}), 202
+
+    @app.route("/api/annotate/accept_easy/stop", methods=["POST"])
+    def annotate_accept_stop():
+        state, error = state_or_error()
+        if error:
+            return error
+        flat = to_flat(state["experiment"])
+        running = _jobs.get(str(_accepting.get(flat)))
+        if running is None or running.status != "running":
+            return jsonify({"error": "no easy scenes being accepted"}), 409
+        _accept_stop[flat].set()
+        return jsonify({"job": running.to_dict()})
+
+    @app.route("/api/annotate/accept_easy/<int:batch>/undo", methods=["POST"])
+    def annotate_accept_undo(batch):
+        """{"experiment"}: unsave the frames of that batch still as accepted (undo_accept); 409 while accepting"""
+        state, error = state_or_error()
+        if error:
+            return error
+        body = request.get_json(silent=True) or {}
+        if to_flat(body.get("experiment") or "") != to_flat(state["experiment"]):
+            return jsonify({"error": "another experiment is loaded"}), 409
+        running = _jobs.get(str(_accepting.get(to_flat(state["experiment"]))))
+        if running is not None and running.status == "running":
+            return jsonify({"error": "easy scenes are being accepted: stop it first"}), 409
+        try:
+            return jsonify(undo_accept(state, batch))
+        except LookupError as exc:
+            return jsonify({"error": str(exc)}), 404
 
     @app.route("/api/annotate/propose", methods=["POST"])
     def annotate_propose():

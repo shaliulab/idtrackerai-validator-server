@@ -91,6 +91,31 @@ To work on the interface, check out its submodule
 `./build_frontend.sh` (which runs `git submodule update --init --recursive`
 first).
 
+## Annotate tab: proposals, easy scenes and accepting them
+
+Unsaved frames of the scenes open with the **continuity proposal**. The toolbar's
+**Proposal** choice picks its tracker (kept per browser): *Continuity v1* (the default)
+or *Continuity v2* (every undetected fly kept where it was last seen, flies reappearing
+further away paired, idtrackerai fragments followed through crossings: 40 % fewer edits on
+the validated 12X experiments, see `docs/annotate_proposals_2026-11.md`). The **Easy**
+choice says how the easy scenes (◆) are found: *Rules* (the default) or *Learned*, a model
+trained on the frames saved in validated experiments. The learned model is made with
+
+```bash
+FLYHOSTEL_VIDEOS=/flyhostel_data/videos python scripts/train_scene_scorer.py
+```
+
+(every validated experiment with ≥ 500 saved frames; ~5 min; it prints a
+leave-one-experiment-out evaluation and writes `~/.cache/idtrackerai-validator/scene_scorer/model.pkl`,
+`SCENE_SCORER_DIR` moves it). Run it again after more experiments are validated.
+Server-wide defaults: `ANNOTATE_CONTINUITY_VERSION=2`, `ANNOTATE_EASY_METHOD=learned`.
+
+**Accept easy…** (next to the ◆ count) lists the easy scenes not saved yet with
+thumbnails, scores and a preview; untick any, then their proposals are saved in one go
+under your name (frames saved by anyone are skipped), each logged as
+"accepted easy scene, …, batch N". **Undo** on a batch unsaves its frames still as
+accepted.
+
 ## Drive exchange
 
 People who annotate experiments shared through Google Drive (the **Drive exchange**

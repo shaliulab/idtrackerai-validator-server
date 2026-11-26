@@ -837,7 +837,8 @@ def _read_frame(frame_number):
 
 @app.route('/api/frame/<int:frame_number>', methods=['GET'])
 def get_frame(frame_number):
-    """JPEG of `frame_number` (a blank image if it cannot be read)."""
+    """JPEG of `frame_number` (a blank image if it cannot be read); ?w=<px> scales it to that width (thumbnails of
+    the Annotate tab's review of easy scenes)."""
     global frame
 
     if cap is None:
@@ -849,7 +850,11 @@ def get_frame(frame_number):
     else:
         frame = image
 
-    ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 50])
+    width = request.args.get("w", type=int)
+    if width and 16 <= width < image.shape[1]:
+        image = cv2.resize(image, (width, max(1, round(image.shape[0] * width / image.shape[1]))),
+                           interpolation=cv2.INTER_AREA)
+    ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 70 if width else 50])
     if not ok:
         return jsonify({'error': f'Could not encode frame {frame_number}'}), 500
     response = send_file(io.BytesIO(jpeg.tobytes()), mimetype="image/jpeg")

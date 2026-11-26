@@ -141,7 +141,9 @@ class TrackTest(unittest.TestCase):
         X = np.array([[float(f[k]) for k in scene_scorer.FEATURES]] * 30
                      + [[0.0 if k.startswith("f_") or k.startswith("frames_") else float(f[k]) for k in scene_scorer.FEATURES]] * 30)
         y = np.array([0] * 30 + [1] * 30)
-        model = {"model": scene_scorer.new_model().fit(X, y), "features": scene_scorer.FEATURES, "threshold": 0.5}
+        with scene_scorer.limited():
+            fitted = scene_scorer.new_model().fit(X, y)
+        model = {"model": fitted, "features": scene_scorer.FEATURES, "threshold": 0.5}
         out = scene_scorer.score_scenes(self.db, self.scenes, 1000, 2, saved_before, lambda first: None, model=model)
         self.assertFalse(out[30]["easy"])
         self.assertLess(out[30]["p"], 0.5)
