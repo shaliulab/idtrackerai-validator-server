@@ -323,7 +323,8 @@ def detect_install():
     direct = _direct_url(dist) if dist else None
     editable = bool(direct and direct.get("dir_info", {}).get("editable"))
     info = {"root": root, "python": sys.executable, "prefix": sys.prefix, "editable": editable,
-            "platform": sys.platform, "service": systemd_unit(), "reason": None, "user_site": user_site()}
+            "platform": sys.platform, "service": systemd_unit(), "reason": None, "user_site": user_site(),
+            "no_user_site": bool(sys.flags.no_user_site)}
     forced = os.environ.get("VALIDATOR_INSTALL")
     if forced in ("git", "windows", "docker", "pip"):
         info.update(kind=forced, reason="VALIDATOR_INSTALL={}".format(forced))
@@ -342,6 +343,16 @@ def detect_install():
     if info["kind"] == "windows":
         info.setdefault("install_dir", lab_paths.WINDOWS_INSTALL_DIR)
     return info
+
+
+def python_command(python, no_user_site=None):
+    """`python` as the start of a command line, with -s when the server's python ignores the user site
+    (`python -s`, e.g. the systemd unit's ExecStart): pip and the requirement checks must see the
+    distributions the server imports, not the user site's. -s rather than PYTHONNOUSERSITE, which the
+    tools of other envs started by them would inherit. `no_user_site` None = this process's own flag."""
+    if no_user_site is None:
+        no_user_site = bool(sys.flags.no_user_site)
+    return [python, "-s"] if no_user_site else [python]
 
 
 def user_site():
@@ -838,11 +849,13 @@ class GitUpdate(_Update):
         super().__init__(plan)
         self.root = plan["install"]["root"]
         self.python = plan["install"]["python"]
+        self.no_user_site = plan["install"].get("no_user_site")
         self.tag = plan["to"]["tag"]
         self.record = {"moved": [], "reinstalled": [], "frontend_backup": None, "viewer_moved": False}
 
     def pip(self, *args):
-        return _run(self.status, [self.python, "-m", "pip", "--disable-pip-version-check", *args], timeout=3600)
+        return _run(self.status, [*python_command(self.python, self.no_user_site), "-m", "pip",
+                                  "--disable-pip-version-check", *args], timeout=3600)
 
     def fetch(self, path):
         try:
@@ -928,7 +941,8 @@ class GitUpdate(_Update):
             if dep["action"] == "reinstall":
                 self.record["reinstalled"].append(dep)
                 self.pip("install", "--no-deps", "{}/{}/archive/{}.tar.gz".format(lab_paths.LAB_GITHUB, LAB_DEPS[dep["name"]], dep["pin"]))
-        missing = plain_requirements(self.python, [PACKAGE] + [d["name"] for d in self.record["moved"]])
+        missing = plain_requirements(self.python, [PACKAGE] + [d["name"] for d in self.record["moved"]],
+                                     no_user_site=self.no_user_site)
         if missing:
             self.pip("install", *missing)
         else:
@@ -1158,12 +1172,13 @@ def filter_requirements(requirements, installed):
     return out
 
 
-def plain_requirements(python, dists):
+def plain_requirements(python, dists, no_user_site=None):
     """Requirements of these distributions that the server's python is missing (read in a new process:
     the metadata just written by pip)."""
-    out = subprocess.run([python, "-c", _REQUIRES, *dists], capture_output=True, text=True, timeout=120, check=True)
+    out = subprocess.run([*python_command(python, no_user_site), "-c", _REQUIRES, *dists], capture_output=True,
+                         text=True, timeout=120, check=True)
     requirements = json.loads(out.stdout)
-    installed = installed_distributions(python)
+    installed = installed_distributions(python, no_user_site)
     missing = filter_requirements(requirements, {k: v["version"] for k, v in installed.items()})
     shadowed = [text for text in missing if (installed.get(_requirement_name(text)) or {}).get("user_site")]
     if shadowed:
@@ -1191,13 +1206,13 @@ _DISTRIBUTIONS = (
 )
 
 
-def installed_distributions(python):
+def installed_distributions(python, no_user_site=None):
     """canonical name -> {version, location, user_site} of the distributions `python` imports. Order matters:
     importlib.metadata lists them in sys.path order, and the first one is the one imported, so the user site's
     copy (~/.local/lib/pythonX.Y/site-packages, before the env's site-packages) wins over the env's. Keeping the
     last one (as a dict comprehension did) judged requirements on a copy the server never imports."""
-    rows = json.loads(subprocess.run([python, "-c", _DISTRIBUTIONS], capture_output=True, text=True, timeout=120,
-                                     check=True).stdout)
+    rows = json.loads(subprocess.run([*python_command(python, no_user_site), "-c", _DISTRIBUTIONS], capture_output=True,
+                                     text=True, timeout=120, check=True).stdout)
     out = {}
     for name, version, location, user_site in rows:
         out.setdefault(_canon(name), {"version": version, "location": location, "user_site": user_site})
@@ -1531,7 +1546,7 @@ def start_helper(plan, install):
                    "steps": [], "log": ["Starting the update helper"], "message": None, "started": time.time(),
                    "updated": time.time(), "helper_pid": None}, f)
     os.replace(STATUS_FILE + ".tmp", STATUS_FILE)
-    cmd = [sys.executable, "-m", "idtrackerai_validator_server.updater", "run", path]
+    cmd = [*python_command(sys.executable), "-m", "idtrackerai_validator_server.updater", "run", path]
     service = install.get("service")
     log = open(LOG_FILE, "ab")
     if service and service.get("user"):

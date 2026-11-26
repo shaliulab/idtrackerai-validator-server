@@ -5,6 +5,7 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -342,6 +343,27 @@ class UserSite(unittest.TestCase):
     def test_detect_install_reports_it(self):
         info = updater.detect_install()
         self.assertIn("user_site", info)
+        self.assertEqual(info["no_user_site"], bool(sys.flags.no_user_site))
+
+    def test_python_command(self):
+        self.assertEqual(updater.python_command("py", True), ["py", "-s"])
+        self.assertEqual(updater.python_command("py", False), ["py"])
+        self.assertEqual(updater.python_command("py"), ["py", "-s"] if sys.flags.no_user_site else ["py"])
+
+    def test_no_user_site_passed_to_the_checks(self):
+        # a server started with `python -s` (the systemd unit): pip and the requirement checks run the same way
+        calls = []
+
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            return mock.Mock(stdout=json.dumps([]))
+        with mock.patch.object(updater.subprocess, "run", side_effect=run):
+            updater.plain_requirements("py", ["x"], no_user_site=True)
+        self.assertEqual([c[:2] for c in calls], [["py", "-s"], ["py", "-s"]])
+
+    def test_real_python_without_user_site(self):
+        found = updater.installed_distributions(sys.executable, no_user_site=True)
+        self.assertFalse(any(d["user_site"] for d in found.values()))
 
 
 class WebFallback(unittest.TestCase):
