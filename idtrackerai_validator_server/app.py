@@ -69,6 +69,7 @@ from idtrackerai_validator_server.dropbox_files import register_dropbox_files
 from idtrackerai_validator_server.qc import register_qc
 from idtrackerai_validator_server.swaps import register_swaps
 from idtrackerai_validator_server.monitor import register_monitor
+from idtrackerai_validator_server.pipeline_csv import register_pipeline_csv
 from idtrackerai_validator_server.resources import register_resources
 from idtrackerai_validator_server.gpu_queue import register_gpu_queue
 from idtrackerai_validator_server.box_annotations import register_box_annotations
@@ -197,6 +198,7 @@ register_dropbox_files(app)
 register_monitor(app)
 register_resources(app)
 _register(register_data_collector)
+register_pipeline_csv(app)
 
 
 def _qc_state():

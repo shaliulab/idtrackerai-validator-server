@@ -99,6 +99,11 @@ IDTRACKERAI_V4_BIN = _env("IDTRACKERAI_V4_BIN", os.path.join(CONDA_ENVS, "idtrac
 CROP_ARENAS = _env("CROP_ARENAS", os.path.join(CONDA_ENVS, "flyhostel-pipeline", "bin", "imgstore-crop-arenas"))
 # nextflow pipelines shown in the Monitor tab
 NEXTFLOW_PIPELINES = _env("NEXTFLOW_PIPELINES", "/home/vibflysleep/opt/vsc-scripts/nextflow/pipelines")
+# the idtrackerai pipeline's experiment list, edited from the Data collector (pipeline_csv.py), and who may
+# change it besides a browser on the server (comma-separated logins; unset: the login of $VALIDATOR_USERNAME;
+# "*": anyone reaching the app)
+IDTRACKERAI_CSV = _env("IDTRACKERAI_CSV", os.path.join(NEXTFLOW_PIPELINES, "idtrackerai_v3", "idtrackerai.csv"))
+PIPELINE_USERS = os.environ.get("VALIDATOR_PIPELINE_USERS")
 # executables found by name: $VAR, else PATH (rclone / ffmpeg: else the server's conda env, Library\bin on Windows)
 RCLONE = find_tool("rclone", "RCLONE")
 FFMPEG = find_tool("ffmpeg", "FFMPEG")
@@ -184,6 +189,9 @@ EXCHANGE_CACHE = _user_env("EXCHANGE_CACHE", "~/.cache/idtrackerai-validator/exc
 GPU_QUEUE_FILE = _env("GPU_QUEUE_FILE", os.path.join(CACHE_DIR, "gpu_queue.json"))
 # scheduled fetches of the Data collector (.lock and .scheduler next to it)
 COLLECTOR_SCHEDULE_FILE = _env("COLLECTOR_SCHEDULE_FILE", os.path.join(CACHE_DIR, "fetch_schedule.json"))
+# idtrackerai.csv edits (pipeline_csv.py): a copy of the file before each one (last 50) and the audit log
+IDTRACKERAI_CSV_BACKUPS = _env("IDTRACKERAI_CSV_BACKUPS", os.path.join(CACHE_DIR, "idtrackerai_csv_backups"))
+IDTRACKERAI_CSV_LOG = _env("IDTRACKERAI_CSV_LOG", os.path.join(CACHE_DIR, "idtrackerai_csv.jsonl"))
 # logs of DEG label writes, SLEAP label changes and copies of .slp files before their first write
 DEG_LABELS_LOG = _env("DEG_LABELS_LOG", os.path.join(CACHE_DIR, "deg_labels.jsonl"))
 SLEAP_LABELS_LOG = _env("SLEAP_LABELS_LOG", os.path.join(CACHE_DIR, "sleap_labels.jsonl"))
