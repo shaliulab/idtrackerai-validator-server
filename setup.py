@@ -22,7 +22,7 @@ GITHUB = "https://github.com/shaliulab"
 # read it (a git checkout) and warns when it differs from the pin below.
 PINS = {
     # React client, built with npm into idtrackerai_validator_server/frontend (BuildWithFrontend)
-    "idtrackerai-validator-client": "ad5672b6c97df56915e94d3a3a35ab6ddb54fcc9",
+    "idtrackerai-validator-client": "6785dac53d457b41288d28542337ccb47956b2e8",
     "flyhostel": "849e0d247c778e228ddf1bdd7905d184216263e8",
     # flyhostel/libraries/imgstore: flyhostel needs >= 0.4.23, PyPI has 0.4.19
     "flyhostel/libraries/imgstore": "25645ce11993be054e4f4e2d81b0fa25bef5432b",
@@ -191,7 +191,7 @@ class BuildWithFrontend(build_py):
 
 setup(
     name='idtrackerai_validator_server',
-    version='1.7.1',
+    version='1.8.0',
     author='Antonio Ortega',
     author_email='antonio.ortega@kuleuven.be',
     description='An easy to use viewer of flyhostel data',
